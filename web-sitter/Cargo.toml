@@ -1,0 +1,32 @@
+[package]
+name = "web-sitter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tree-sitter.workspace = true
+tree-sitter-c.workspace = true
+tree-sitter-language.workspace = true
+bincode.workspace = true
+serde.workspace = true
+sonic-rs.workspace = true
+sha2.workspace = true
+petgraph.workspace = true
+rustc-hash.workspace = true
+regex.workspace = true
+thiserror.workspace = true
+tree-sitter-cpp.workspace = true
+tree-sitter-go.workspace = true
+tree-sitter-python.workspace = true
+tree-sitter-java.workspace = true
+tree-sitter-javascript.workspace = true
+tree-sitter-typescript.workspace = true
+tree-sitter-rust.workspace = true
+tree-sitter-language-pack.workspace = true
+lz4_flex = { version = "0.11", default-features = false, features = ["frame"] }
+
+[dev-dependencies]
+pretty_assertions = "1.4"
