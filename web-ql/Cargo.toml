@@ -1,0 +1,22 @@
+[package]
+name = "web-ql"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "ScuzzQL — a Datalog-inspired query language over the CPG IR with taint tracking and interprocedural analysis"
+
+[dependencies]
+web-sitter = { path = "../web-sitter" }
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+regex.workspace = true
+logos = { workspace = true }
+roaring = { workspace = true }
+toml = { workspace = true }
+lru = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = "1.4"
