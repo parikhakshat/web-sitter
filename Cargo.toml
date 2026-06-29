@@ -1,6 +1,8 @@
 [workspace]
 members = [
     "web-sitter",
+    "web-ql",
+    "web-profiler",
 ]
 resolver = "2"
 
@@ -32,3 +34,10 @@ tree-sitter-typescript = "0.23.2"
 tree-sitter-rust = "0.24.2"
 rustc-hash = "2.1"
 tree-sitter-language-pack = { version = "1.11.0", default-features = false }
+logos = "0.15"
+roaring = "0.10"
+toml = "0.8"
+lru = "0.12"
+serde_json = "1.0"
+rayon = "1.10"
+num_cpus = "1.16"
