@@ -493,7 +493,12 @@ impl Parser {
     }
 
     fn parse_named_ref(&mut self) -> ParseResult<NamedRef> {
-        let (name, span) = self.expect_name()?;
+        // Accept both bare identifiers and string literals: `user_input` or `"user_input"`
+        let (name, span) = if self.peek_tok() == Some(&Token::StringLit) {
+            self.expect_string_lit()?
+        } else {
+            self.expect_name()?
+        };
         let args = if self.eat(&Token::LParen) {
             let mut args = Vec::new();
             while self.peek_tok() != Some(&Token::RParen) {
@@ -658,21 +663,29 @@ impl Parser {
         })
     }
 
-    /// Parse a call-expression chain: `primary(.method(args))*`
+    /// Parse a call-expression chain: `primary(.method(args))*` or `primary.field`
     fn parse_call_expr(&mut self) -> ParseResult<Expr> {
         let mut expr = self.parse_primary()?;
         while self.eat(&Token::Dot) {
-            let (method, _) = self.expect_ident()?;
-            self.expect(&Token::LParen, "`(`")?;
-            let mut args = Vec::new();
-            while self.peek_tok() != Some(&Token::RParen) {
-                args.push(self.parse_expr()?);
-                if !self.eat(&Token::Comma) {
-                    break;
+            let (method, method_span) = self.expect_ident()?;
+            // Field access `n.name` and method call `n.method(args)` share this path.
+            // If no `(` follows, treat as zero-arg method (field accessor).
+            let args = if self.eat(&Token::LParen) {
+                let mut args = Vec::new();
+                while self.peek_tok() != Some(&Token::RParen) {
+                    args.push(self.parse_expr()?);
+                    if !self.eat(&Token::Comma) {
+                        break;
+                    }
                 }
-            }
-            let end_tok = self.expect(&Token::RParen, "`)`")?;
-            let end = end_tok.span;
+                self.expect(&Token::RParen, "`)`")?;
+                args
+            } else {
+                Vec::new()
+            };
+            let end = self.tokens.get(self.pos.saturating_sub(1))
+                .map(|t| t.span)
+                .unwrap_or(method_span);
             let span = expr.span.merge(end);
             expr = Expr {
                 span,
@@ -958,8 +971,15 @@ impl Parser {
         self.expect(&Token::Pred, "`pred`")?;
         let (name, _) = self.expect_ident()?;
         let params = self.parse_param_list()?;
-        self.expect(&Token::Assign, "`=`")?;
-        let body = self.parse_expr()?;
+        // Support both `= expr` and `{ expr }` body forms.
+        let body = if self.eat(&Token::LBrace) {
+            let body = self.parse_expr()?;
+            self.expect(&Token::RBrace, "`}`")?;
+            body
+        } else {
+            self.expect(&Token::Assign, "`=`")?;
+            self.parse_expr()?
+        };
         let end = body.span;
         Ok(PredicateDef { span: start.merge(end), name, params, body })
     }
@@ -994,22 +1014,86 @@ impl Parser {
         let start = self.current_span();
         self.expect(&Token::Source, "`source`")?;
         let (name, _) = self.expect_ident()?;
-        let params = self.parse_param_list()?;
-        self.expect(&Token::Assign, "`=`")?;
-        let body = self.parse_find_expr_alternatives()?;
+        let body = if self.peek_tok() == Some(&Token::LBrace) {
+            // Attribute block form: source name { kind: Type, name: "str" }
+            vec![self.parse_attr_block_as_find_expr()?]
+        } else {
+            let params = self.parse_param_list()?;
+            let _ = params; // params ignored for now
+            self.expect(&Token::Assign, "`=`")?;
+            self.parse_find_expr_alternatives()?
+        };
         let end = self.tokens.get(self.pos.saturating_sub(1)).map(|t| t.span).unwrap_or(start);
-        Ok(SourceDef { span: start.merge(end), name, params, body })
+        Ok(SourceDef { span: start.merge(end), name, params: vec![], body })
     }
 
     fn parse_sink_def(&mut self) -> ParseResult<SinkDef> {
         let start = self.current_span();
         self.expect(&Token::Sink, "`sink`")?;
         let (name, _) = self.expect_ident()?;
-        let params = self.parse_param_list()?;
-        self.expect(&Token::Assign, "`=`")?;
-        let body = self.parse_find_expr_alternatives()?;
+        let body = if self.peek_tok() == Some(&Token::LBrace) {
+            vec![self.parse_attr_block_as_find_expr()?]
+        } else {
+            let params = self.parse_param_list()?;
+            let _ = params;
+            self.expect(&Token::Assign, "`=`")?;
+            self.parse_find_expr_alternatives()?
+        };
         let end = self.tokens.get(self.pos.saturating_sub(1)).map(|t| t.span).unwrap_or(start);
-        Ok(SinkDef { span: start.merge(end), name, params, body })
+        Ok(SinkDef { span: start.merge(end), name, params: vec![], body })
+    }
+
+    /// Parse `{ kind: Type, name: "str", ... }` and synthesize a `FindExpr`.
+    fn parse_attr_block_as_find_expr(&mut self) -> ParseResult<FindExpr> {
+        let start = self.current_span();
+        self.expect(&Token::LBrace, "`{`")?;
+
+        let mut kind_ty = TypeExpr::Node;
+        let mut name_constraint: Option<String> = None;
+
+        while self.peek_tok() != Some(&Token::RBrace) {
+            let (key, _) = self.expect_ident()?;
+            self.expect(&Token::Colon, "`:`")?;
+            match key.as_str() {
+                "kind" => { kind_ty = self.parse_type_expr()?; }
+                "name" => { name_constraint = Some(self.expect_string_lit()?.0); }
+                _ => { let _ = self.parse_expr()?; } // skip unknown attrs
+            }
+            self.eat(&Token::Comma);
+        }
+        let end = self.expect(&Token::RBrace, "`}`")?.span;
+        let span = start.merge(end);
+
+        // Synthesize: find _n: Kind where _n.name == "str"
+        let var = "_n".to_owned();
+        let binding = Binding {
+            span,
+            name: var.clone(),
+            ty: kind_ty,
+        };
+        let condition = if let Some(name_val) = name_constraint {
+            Expr {
+                span,
+                kind: ExprKind::Compare {
+                    lhs: Box::new(Expr {
+                        span,
+                        kind: ExprKind::MethodCall {
+                            receiver: Box::new(Expr { span, kind: ExprKind::Ident(var) }),
+                            method: "name".to_owned(),
+                            args: vec![],
+                        },
+                    }),
+                    op: CmpOp::Eq,
+                    rhs: Box::new(Expr {
+                        span,
+                        kind: ExprKind::Literal(Literal::Str(name_val)),
+                    }),
+                },
+            }
+        } else {
+            Expr { span, kind: ExprKind::Literal(Literal::Bool(true)) }
+        };
+        Ok(FindExpr { span, bindings: vec![binding], condition })
     }
 
     fn parse_sanitizer_def(&mut self) -> ParseResult<SanitizerDef> {

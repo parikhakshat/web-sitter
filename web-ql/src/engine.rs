@@ -96,15 +96,20 @@ impl<'a> RuleRunner<'a> {
 
     fn eval_search(&self, plan: &SearchPlan) -> Vec<BindingEnv> {
         let mut envs: Vec<BindingEnv> = vec![BindingEnv::new()];
+        let last_idx = plan.root_bindings.len().saturating_sub(1);
 
-        for binding in &plan.root_bindings {
+        for (i, binding) in plan.root_bindings.iter().enumerate() {
+            let is_last = i == last_idx;
             let mut next_envs = Vec::new();
             for env in &envs {
                 let candidates = nodes_of_kinds(self.ctx.cpg, &binding.kinds);
                 for node_id in candidates {
                     let mut child = env.child();
                     child.insert(binding.name.clone(), BindingValue::Node(node_id));
-                    if self.eval_plan(&plan.plan, &child) {
+                    // Only evaluate the predicate once all root bindings are bound.
+                    // Intermediate bindings are collected unconditionally; the plan
+                    // may reference variables that haven't been added yet.
+                    if !is_last || self.eval_plan(&plan.plan, &child) {
                         next_envs.push(child);
                     }
                 }
