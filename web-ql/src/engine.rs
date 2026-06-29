@@ -292,7 +292,7 @@ impl<'a> RuleRunner<'a> {
                             EvalValue::Str(s) => BindingValue::Str(s),
                             EvalValue::Int(n) => BindingValue::Int(n),
                             EvalValue::Bool(b) => BindingValue::Bool(b),
-                            EvalValue::Null => BindingValue::Null,
+                            EvalValue::Null | EvalValue::MetaNode(..) => BindingValue::Null,
                         };
                         child.insert(param_name.to_owned(), binding);
                     }
@@ -531,6 +531,12 @@ impl<'a> RuleRunner<'a> {
         step: &MethodStep,
         env: &BindingEnv,
     ) -> EvalValue {
+        // A MetaNode is the result of `node.cpp_meta` (etc.); the next step accesses
+        // a field on the language-specific metadata side-table.
+        if let EvalValue::MetaNode(meta_id, ref ns) = val {
+            return self.eval_meta_field(meta_id, ns, &step.method);
+        }
+
         let node_id = match val {
             EvalValue::Node(id) => id,
             _ => return EvalValue::Null,
@@ -774,9 +780,15 @@ impl<'a> RuleRunner<'a> {
                     .unwrap_or(EvalValue::Null)
             }
 
-            // ── Language metadata (stub — no metadata fields on IrNode yet) ──
-            "cpp_meta" | "go_meta" | "python_meta" | "java_meta"
-            | "js_meta" | "ts_meta" | "rust_meta" => EvalValue::Null,
+            // ── Language metadata side-table accessors ────────────────────────
+            // Return a MetaNode sentinel; the next chained step resolves the field.
+            "cpp_meta"    => EvalValue::MetaNode(node_id, "cpp".to_owned()),
+            "go_meta"     => EvalValue::MetaNode(node_id, "go".to_owned()),
+            "python_meta" => EvalValue::MetaNode(node_id, "python".to_owned()),
+            "java_meta"   => EvalValue::MetaNode(node_id, "java".to_owned()),
+            "js_meta"     => EvalValue::MetaNode(node_id, "js".to_owned()),
+            "ts_meta"     => EvalValue::MetaNode(node_id, "ts".to_owned()),
+            "rust_meta"   => EvalValue::MetaNode(node_id, "rust".to_owned()),
 
             _ => EvalValue::Null,
         }
@@ -856,6 +868,199 @@ impl<'a> RuleRunner<'a> {
         }
         EvalValue::Null
     }
+
+    /// Resolve a single field from the language-specific metadata side-table for
+    /// `node_id`. Called when `eval_method_step` receives an `EvalValue::MetaNode`.
+    fn eval_meta_field(&self, node_id: NodeId, ns: &str, field: &str) -> EvalValue {
+        match ns {
+            "cpp" => {
+                let Some(m) = self.ctx.cpg.cpp_metadata.get(&node_id) else {
+                    return EvalValue::Null;
+                };
+                match field {
+                    "class_context"      => opt_str(&m.class_context),
+                    "namespace"          => opt_str(&m.namespace),
+                    "visibility"         => opt_str(&m.visibility),
+                    "qualified_name"     => opt_str(&m.qualified_name),
+                    "is_constructor"     => EvalValue::Bool(m.is_constructor.unwrap_or(false)),
+                    "is_destructor"      => EvalValue::Bool(m.is_destructor.unwrap_or(false)),
+                    "is_virtual"         => EvalValue::Bool(m.is_virtual.unwrap_or(false)),
+                    "is_virtual_dispatch" => EvalValue::Bool(m.is_virtual_dispatch),
+                    "template_params"    => first_str(&m.template_params),
+                    "base_classes"       => first_str(&m.base_classes),
+                    _                    => EvalValue::Null,
+                }
+            }
+            "go" => {
+                let Some(m) = self.ctx.cpg.go_metadata.get(&node_id) else {
+                    return EvalValue::Null;
+                };
+                match field {
+                    "package_name"       => opt_str(&m.package_name),
+                    "receiver_type"      => opt_str(&m.receiver_type),
+                    "receiver_name"      => opt_str(&m.receiver_name),
+                    "qualified_name"     => opt_str(&m.qualified_name),
+                    "is_exported"        => EvalValue::Bool(m.is_exported),
+                    "is_variadic"        => EvalValue::Bool(m.is_variadic),
+                    "is_interface"       => EvalValue::Bool(m.is_interface),
+                    "is_goroutine"       => EvalValue::Bool(m.is_goroutine),
+                    "is_deferred"        => EvalValue::Bool(m.is_deferred),
+                    "is_closure"         => EvalValue::Bool(m.is_closure),
+                    "is_init"            => EvalValue::Bool(m.is_init),
+                    "is_alias"           => EvalValue::Bool(m.is_alias),
+                    "is_const"           => EvalValue::Bool(m.is_const),
+                    "embedded_interfaces" => first_str(&m.embedded_interfaces),
+                    "generic_type_params" => first_str(&m.generic_type_params),
+                    _                    => EvalValue::Null,
+                }
+            }
+            "python" => {
+                let Some(m) = self.ctx.cpg.python_metadata.get(&node_id) else {
+                    return EvalValue::Null;
+                };
+                match field {
+                    "is_async"            => EvalValue::Bool(m.is_async),
+                    "is_generator"        => EvalValue::Bool(m.is_generator),
+                    "is_staticmethod"     => EvalValue::Bool(m.is_staticmethod),
+                    "is_classmethod"      => EvalValue::Bool(m.is_classmethod),
+                    "is_property"         => EvalValue::Bool(m.is_property),
+                    "is_abstract"         => EvalValue::Bool(m.is_abstract),
+                    "is_augmented"        => EvalValue::Bool(m.is_augmented),
+                    "is_constructor_call" => EvalValue::Bool(m.is_constructor_call),
+                    "is_super_call"       => EvalValue::Bool(m.is_super_call),
+                    "is_dunder_call"      => EvalValue::Bool(m.is_dunder_call),
+                    "is_yield_from"       => EvalValue::Bool(m.is_yield_from),
+                    "has_star_args"       => EvalValue::Bool(m.has_star_args),
+                    "has_double_star_args" => EvalValue::Bool(m.has_double_star_args),
+                    "is_star_param"       => EvalValue::Bool(m.is_star_param),
+                    "is_double_star_param" => EvalValue::Bool(m.is_double_star_param),
+                    "is_keyword_only"     => EvalValue::Bool(m.is_keyword_only),
+                    "return_annotation"   => opt_str(&m.return_annotation),
+                    "annotation"          => opt_str(&m.annotation),
+                    "metaclass"           => opt_str(&m.metaclass),
+                    "call_receiver_text"  => opt_str(&m.call_receiver_text),
+                    "decorators"          => first_str_vec(&m.decorators),
+                    "closure_vars"        => first_str_vec(&m.closure_vars),
+                    _                     => EvalValue::Null,
+                }
+            }
+            "java" => {
+                let Some(m) = self.ctx.cpg.java_metadata.get(&node_id) else {
+                    return EvalValue::Null;
+                };
+                match field {
+                    "package_name"          => opt_str(&m.package_name),
+                    "fully_qualified_class" => opt_str(&m.fully_qualified_class),
+                    "enclosing_class"       => opt_str(&m.enclosing_class),
+                    "extends_type"          => opt_str(&m.extends_type),
+                    "label_target"          => opt_str(&m.label_target),
+                    "is_interface"          => EvalValue::Bool(m.is_interface),
+                    "is_enum"               => EvalValue::Bool(m.is_enum),
+                    "is_record"             => EvalValue::Bool(m.is_record),
+                    "is_abstract"           => EvalValue::Bool(m.is_abstract),
+                    "is_final"              => EvalValue::Bool(m.is_final),
+                    "is_sealed"             => EvalValue::Bool(m.is_sealed),
+                    "is_anonymous"          => EvalValue::Bool(m.is_anonymous),
+                    "is_static"             => EvalValue::Bool(m.is_static),
+                    "is_synchronized"       => EvalValue::Bool(m.is_synchronized),
+                    "is_native"             => EvalValue::Bool(m.is_native),
+                    "is_varargs"            => EvalValue::Bool(m.is_varargs),
+                    "is_virtual_dispatch"   => EvalValue::Bool(m.is_virtual_dispatch),
+                    "is_this_call"          => EvalValue::Bool(m.is_this_call),
+                    "is_super_call"         => EvalValue::Bool(m.is_super_call),
+                    "is_static_import"      => EvalValue::Bool(m.is_static_import),
+                    "has_finally"           => EvalValue::Bool(m.has_finally),
+                    "access_modifiers"      => first_str_vec(&m.access_modifiers),
+                    "annotations"           => first_str_vec(&m.annotations),
+                    "throws_types"          => first_str_vec(&m.throws_types),
+                    "generic_type_params"   => first_str_vec(&m.generic_type_params),
+                    "implements_types"      => first_str_vec(&m.implements_types),
+                    "catch_types"           => first_str_vec(&m.catch_types),
+                    _                       => EvalValue::Null,
+                }
+            }
+            "js" => {
+                let Some(m) = self.ctx.cpg.js_metadata.get(&node_id) else {
+                    return EvalValue::Null;
+                };
+                match field {
+                    "is_async"       => EvalValue::Bool(m.is_async),
+                    "is_generator"   => EvalValue::Bool(m.is_generator),
+                    "is_arrow"       => EvalValue::Bool(m.is_arrow),
+                    "is_constructor" => EvalValue::Bool(m.is_constructor),
+                    "is_getter"      => EvalValue::Bool(m.is_getter),
+                    "is_setter"      => EvalValue::Bool(m.is_setter),
+                    "is_static"      => EvalValue::Bool(m.is_static),
+                    "is_private"     => EvalValue::Bool(m.is_private),
+                    "is_delegate"    => EvalValue::Bool(m.is_delegate),
+                    "is_for_of"      => EvalValue::Bool(m.is_for_of),
+                    "module_kind"    => opt_str(&m.module_kind),
+                    "scope_kind"     => opt_str(&m.scope_kind),
+                    "class_context"  => opt_str(&m.class_context),
+                    "export_kind"    => opt_str(&m.export_kind),
+                    "import_source"  => opt_str(&m.import_source),
+                    "decorator_names" => first_str_vec(&m.decorator_names),
+                    _                => EvalValue::Null,
+                }
+            }
+            "ts" => {
+                let Some(m) = self.ctx.cpg.ts_metadata.get(&node_id) else {
+                    return EvalValue::Null;
+                };
+                match field {
+                    "is_async"               => EvalValue::Bool(m.is_async),
+                    "is_abstract"            => EvalValue::Bool(m.is_abstract),
+                    "is_readonly"            => EvalValue::Bool(m.is_readonly),
+                    "is_optional"            => EvalValue::Bool(m.is_optional),
+                    "is_definite_assignment" => EvalValue::Bool(m.is_definite_assignment),
+                    "is_ambient"             => EvalValue::Bool(m.is_ambient),
+                    "is_declare"             => EvalValue::Bool(m.is_declare),
+                    "is_override"            => EvalValue::Bool(m.is_override),
+                    "is_using"               => EvalValue::Bool(m.is_using),
+                    "enum_is_const"          => EvalValue::Bool(m.enum_is_const),
+                    "module_is_namespace"    => EvalValue::Bool(m.module_is_namespace),
+                    "access_modifier"        => opt_str(&m.access_modifier),
+                    "type_annotation"        => opt_str(&m.type_annotation),
+                    "extends_type"           => opt_str(&m.extends_type),
+                    "satisfies_type"         => opt_str(&m.satisfies_type),
+                    "decorator_names"        => first_str_vec(&m.decorator_names),
+                    "implements_types"       => first_str_vec(&m.implements_types),
+                    "type_arguments"         => first_str_vec(&m.type_arguments),
+                    "generic_constraints"    => m.generic_constraints.first()
+                        .map(|(n, _)| EvalValue::Str(n.clone()))
+                        .unwrap_or(EvalValue::Null),
+                    _                        => EvalValue::Null,
+                }
+            }
+            "rust" => {
+                let Some(m) = self.ctx.cpg.rust_metadata.get(&node_id) else {
+                    return EvalValue::Null;
+                };
+                match field {
+                    "visibility"        => opt_str(&m.visibility),
+                    "abi"               => opt_str(&m.abi),
+                    "self_type"         => opt_str(&m.self_type),
+                    "trait_type"        => opt_str(&m.trait_type),
+                    "is_async"          => EvalValue::Bool(m.is_async),
+                    "is_unsafe"         => EvalValue::Bool(m.is_unsafe),
+                    "is_const"          => EvalValue::Bool(m.is_const),
+                    "is_extern"         => EvalValue::Bool(m.is_extern),
+                    "is_mut"            => EvalValue::Bool(m.is_mut),
+                    "is_move_closure"   => EvalValue::Bool(m.is_move_closure),
+                    "use_after_move"    => EvalValue::Bool(m.use_after_move),
+                    "is_unsafe_context" => EvalValue::Bool(m.is_unsafe_context),
+                    "is_no_std"         => EvalValue::Bool(m.is_no_std),
+                    "derive_macros"     => first_str_vec(&m.derive_macros),
+                    "lifetimes"         => first_str_vec(&m.lifetimes),
+                    "generic_params"    => first_str_vec(&m.generic_params),
+                    "where_clauses"     => first_str_vec(&m.where_clauses),
+                    "trait_bounds"      => first_str_vec(&m.trait_bounds),
+                    _                   => EvalValue::Null,
+                }
+            }
+            _ => EvalValue::Null,
+        }
+    }
 }
 
 // ── Evaluation values ─────────────────────────────────────────────────────────
@@ -863,6 +1068,11 @@ impl<'a> RuleRunner<'a> {
 #[derive(Debug, Clone)]
 pub enum EvalValue {
     Node(NodeId),
+    /// Intermediate value for language-metadata chains: `node.cpp_meta.is_virtual`.
+    /// Carries the node ID and the metadata namespace tag ("cpp", "go", "python",
+    /// "java", "js", "ts", "rust"). The next `eval_method_step` call resolves the
+    /// actual field from the matching side-table in the CPG.
+    MetaNode(NodeId, String),
     Str(String),
     Int(i64),
     Bool(bool),
@@ -914,6 +1124,18 @@ fn numeric_cmp(a: &EvalValue, b: &EvalValue) -> Option<i64> {
 
 fn eval_as_index(val: EvalValue) -> Option<usize> {
     if let EvalValue::Int(i) = val { Some(i as usize) } else { None }
+}
+
+fn opt_str(s: &Option<String>) -> EvalValue {
+    s.as_deref().map(|v| EvalValue::Str(v.to_owned())).unwrap_or(EvalValue::Null)
+}
+
+fn first_str(v: &Option<Vec<String>>) -> EvalValue {
+    v.as_ref().and_then(|list| list.first()).map(|s| EvalValue::Str(s.clone())).unwrap_or(EvalValue::Null)
+}
+
+fn first_str_vec(v: &[String]) -> EvalValue {
+    v.first().map(|s| EvalValue::Str(s.clone())).unwrap_or(EvalValue::Null)
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
