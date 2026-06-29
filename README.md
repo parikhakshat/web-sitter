@@ -1,8 +1,17 @@
 # web-sitter
 
-**Multi-language Code Property Graph generation for Rust, powered by tree-sitter.**
+**Multi-language Code Property Graph generation and query stack for Rust, powered by tree-sitter.**
 
-web-sitter parses source code into a unified [Code Property Graph (CPG)](https://cpg.joern.io/) — a single structure that combines the abstract syntax tree (AST), control-flow graph (CFG), data-flow graph (DFG), and call graph. Downstream tools can query one graph instead of stitching together separate analyses.
+This workspace provides an end-to-end static analysis pipeline:
+
+| Crate | Role |
+|---|---|
+| [**web-sitter**](#quick-start) | Parse source into a unified [Code Property Graph (CPG)](https://cpg.joern.io/) — AST, CFG, DFG, and call graph in one structure |
+| [**web-ql**](docs/web-ql.md) | Declarative query language (`.wql`) for structural search, CFG/DFG predicates, and interprocedural taint analysis over the CPG |
+| [**web-scan**](#scanning-with-web-scan) | CLI that scans a repository with web-ql rules and emits JSON, SARIF, text, or HTML findings |
+| **web-profiler** | Lightweight profiling hooks used by the query engine |
+
+web-sitter parses source code; web-ql queries it. Downstream tools get one graph and one rule language instead of stitching together separate parsers, IRs, and analysis passes.
 
 Built for security tooling, IDE integrations, and static analysis pipelines that need fast, language-agnostic program structure with enough semantic detail for taint tracking, call resolution, and incremental re-analysis on every keystroke.
 
@@ -17,6 +26,8 @@ Built for security tooling, IDE integrations, and static analysis pipelines that
 | **Incremental rebuilds** | Edit-aware CPG updates with structural key reuse, targeted CFG/DFG refresh, and persistent state (bincode) |
 | **Security-ready metadata** | Built-in taint source/sink/propagator specs for C/POSIX/Windows stdlib; per-language type inference and class hierarchy |
 | **Serde throughout** | `Cpg` and all graph layers serialize for caching, RPC, or offline analysis |
+| **web-ql rule language** | Datalog-inspired `.wql` queries with taint tracking, CFG/DFG reachability, and a 54-rule CWE library |
+| **Repository scanner** | `web-scan` indexes a codebase, runs rules in parallel, and outputs SARIF-ready findings |
 
 ---
 
@@ -59,6 +70,14 @@ Then build from the workspace root:
 
 ```sh
 cargo build --workspace
+```
+
+Add web-ql for querying CPGs:
+
+```toml
+[dependencies]
+web-sitter = { path = "web-sitter" }
+web-ql = { path = "web-ql" }
 ```
 
 ---
@@ -110,6 +129,49 @@ for (fn_id, entry) in cpg.call_graph.iter() {
     }
 }
 ```
+
+---
+
+## Querying with web-ql
+
+web-ql rules live in `.wql` files. A structural rule matches dangerous calls; a taint rule tracks data flow from sources to sinks.
+
+```wql
+rule "dangerous-eval" {
+    severity: high
+    languages: [javascript, python]
+    message: "Use of eval()"
+    find n: Call where n.callee_name() == "eval"
+}
+```
+
+```rust
+use web_ql::{compile_rules, Workspace, builtin_endpoint_registry};
+
+let rule_set = compile_rules(include_str!("rules.wql"))?;
+let mut ws = Workspace::new(builtin_endpoint_registry());
+// ws.upsert_file(path, cpg, content_hash);
+ws.build_cross_file_edges();
+let findings = ws.scan(&rule_set);
+```
+
+See [`docs/web-ql.md`](docs/web-ql.md) for the full language reference (types, methods, CFG/DFG predicates, taint, endpoints). Production CWE rules are in [`web-ql-queries/`](web-ql-queries/).
+
+---
+
+## Scanning with web-scan
+
+Scan a repository with the built-in rule library:
+
+```sh
+cargo run -p web-scan -- scan web-ql-queries/python --repo /path/to/project
+
+# JSON output, exit non-zero when findings exist
+cargo run -p web-scan -- scan web-ql-queries/ --repo . \
+    --format json --output findings.json --exit-code
+```
+
+Supported output formats: `json`, `sarif`, `text`, `html`.
 
 ---
 
@@ -255,9 +317,11 @@ let AnonymizedCpg { cpg, symbol_table } = anonymizer.anonymize(&cpg);
 
 | Document | Contents |
 |---|---|
+| [`docs/web-ql.md`](docs/web-ql.md) | **web-ql language reference** — syntax, types, methods, taint, scanning |
 | [`docs/ir.md`](docs/ir.md) | IR node taxonomy: `IrNodeKind`, sub-kinds, `IrNode` fields |
 | [`docs/graph_schema.md`](docs/graph_schema.md) | Full `Cpg` schema: AST, CFG, DFG, call graph, metadata tables |
 | [`docs/language_support.md`](docs/language_support.md) | Per-language lifter details, metadata structs, unique analysis features |
+| [`web-ql-queries/`](web-ql-queries/) | Production CWE security rules (`.wql`) for all supported languages |
 | [`plans/`](plans/) | Per-language implementation design documents |
 
 ---
@@ -282,22 +346,17 @@ CI runs on every push and pull request to `main` (build + full test suite).
 ### Project layout
 
 ```
-web-sitter/
-  src/
-    lib.rs              — IrNode, Cpg, metadata structs, type enums
-    lifter.rs           — LanguageLifter trait + all 8 lifter impls
-    cpg_generator.rs    — CpgGenerator, GraphBuildOptions, SourceLanguage
-    cfg.rs              — Control-flow graph builder
-    dfg.rs              — Data-flow graph + call graph builder
-    incremental.rs      — Incremental CPG rebuild machinery
-    type_inference.rs   — Language-specific type inference passes
-    call_analysis.rs    — Cross-file call edge resolution
-    function_summary.rs — Interprocedural function summaries
-    security_patterns.rs — Built-in taint sources/sinks/propagators
-    symbol_anonymizer.rs — CPG symbol anonymization
-  tests/                — Integration tests (one file per language + topic)
+web-sitter/             — CPG generation (tree-sitter → IR → CFG/DFG/call graph)
+  src/                  — Lifters, generators, incremental rebuild, security patterns
+  tests/                — Grammar coverage, CFG/DFG correctness, incremental parity
+web-ql/                 — ScuzzQL query language and evaluation engine
+  src/                  — Lexer, parser, planner, engine, taint, workspace
+  tests/                — Parser, engine, CFG/DFG, workspace integration tests
+web-scan/               — CLI repository scanner (web-ql + web-sitter)
+web-ql-queries/         — Production CWE rule library (.wql, per language)
+web-profiler/           — Profiling hooks for query evaluation
 grammars/               — Vendored grammar.json / node-types.json per language
-docs/                   — IR, schema, and language support reference
+docs/                   — IR, schema, language support, and web-ql reference
 plans/                  — Per-language implementation design documents
 ```
 
