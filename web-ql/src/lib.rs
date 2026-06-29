@@ -13,7 +13,6 @@ pub mod dfg;
 pub mod taint;
 pub mod engine;
 pub mod finding;
-pub mod library;
 pub mod workspace;
 pub mod loader;
 
