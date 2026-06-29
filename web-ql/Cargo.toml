@@ -17,6 +17,8 @@ roaring = { workspace = true }
 toml = { workspace = true }
 lru = { workspace = true }
 serde_json = { workspace = true }
+rayon = { workspace = true }
+web-profiler = { path = "../web-profiler" }
 
 [dev-dependencies]
 pretty_assertions = "1.4"

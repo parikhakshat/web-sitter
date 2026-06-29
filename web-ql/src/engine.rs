@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
+use rayon::prelude::*;
 use web_sitter::{Cpg, IrNode, IrNodeKind, LiteralKind, NodeId};
+use web_profiler as prof;
 use crate::ast::{CmpOp, Literal, TypeExpr};
 use crate::cfg::FunctionCfg;
 use crate::dfg::DfgIndex;
@@ -33,46 +35,62 @@ impl<'a> RuleRunner<'a> {
         Self { ctx }
     }
 
-    /// Evaluate all rules against the CPG, collecting findings.
+    /// Evaluate all rules against the CPG in parallel, collecting findings.
+    ///
+    /// Rules are independent — they share only immutable references to the CPG,
+    /// DFG, and CFG caches — so rayon can evaluate them concurrently.
     pub fn run(&self, rule_set: &RuleSet) -> Vec<Finding> {
-        let mut findings = Vec::new();
-        for rule in &rule_set.rules {
-            let lang = self.ctx.cpg.language.as_str();
-            if !rule_applies_to_language(rule, lang) {
-                continue;
-            }
-            for clause in &rule.clauses {
-                match clause {
-                    CompiledClause::Search(plan) => {
-                        let matches = self.eval_search(plan);
-                        for env in matches {
-                            findings.push(finding_from_env(rule, &env, self.ctx.cpg));
+        let _span = prof::span("query.rule_eval_total");
+        let lang = self.ctx.cpg.language.as_str();
+
+        let findings: Vec<Finding> = rule_set
+            .rules
+            .par_iter()
+            .filter(|rule| rule_applies_to_language(rule, lang))
+            .flat_map(|rule| {
+                let _span = prof::span("query.rule_eval");
+                prof::count("rules_applied", 1);
+                let mut rule_findings = Vec::new();
+
+                for clause in &rule.clauses {
+                    match clause {
+                        CompiledClause::Search(plan) => {
+                            let _s = prof::span("query.search_eval");
+                            let matches = self.eval_search(plan);
+                            prof::count("nodes_evaluated", matches.len() as u64);
+                            for env in matches {
+                                rule_findings.push(finding_from_env(rule, &env, self.ctx.cpg));
+                            }
                         }
-                    }
-                    CompiledClause::Taint(spec) => {
-                        let engine = TaintEngine::new(
-                            self.ctx.registry,
-                            self.ctx.dfg,
-                            self.ctx.cpg,
-                            self.ctx.summaries,
-                        );
-                        let taint_findings = engine.run(spec);
-                        for tf in taint_findings {
-                            findings.push(Finding {
-                                rule_id: rule.id.clone(),
-                                severity: rule.severity,
-                                message: rule.message.clone().unwrap_or_default(),
-                                tags: rule.tags.clone(),
-                                location: node_location(tf.source_node, self.ctx.cpg),
-                                matched_nodes: tf.path,
-                            });
+                        CompiledClause::Taint(spec) => {
+                            let _s = prof::span("query.taint_check");
+                            prof::count("taint_checks", 1);
+                            let engine = TaintEngine::new(
+                                self.ctx.registry,
+                                self.ctx.dfg,
+                                self.ctx.cpg,
+                                self.ctx.summaries,
+                            );
+                            let taint_findings = engine.run(spec);
+                            for tf in taint_findings {
+                                rule_findings.push(Finding {
+                                    rule_id: rule.id.clone(),
+                                    severity: rule.severity,
+                                    message: rule.message.clone().unwrap_or_default(),
+                                    tags: rule.tags.clone(),
+                                    location: node_location(tf.source_node, self.ctx.cpg),
+                                    matched_nodes: tf.path,
+                                });
+                            }
                         }
-                    }
                 }
             }
-        }
-        findings
-    }
+            rule_findings
+        })
+        .collect();
+
+    findings
+}
 
     // ── Search clause evaluation ──────────────────────────────────────────────
 

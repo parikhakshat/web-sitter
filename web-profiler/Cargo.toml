@@ -1,0 +1,13 @@
+[package]
+name = "web-profiler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "In-depth profiling of threads, efficiency, and caching across the web-sitter/web-ql pipeline"
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+rayon.workspace = true
+num_cpus.workspace = true

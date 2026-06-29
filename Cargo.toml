@@ -2,6 +2,7 @@
 members = [
     "web-sitter",
     "web-ql",
+    "web-profiler",
 ]
 resolver = "2"
 
@@ -38,3 +39,5 @@ roaring = "0.10"
 toml = "0.8"
 lru = "0.12"
 serde_json = "1.0"
+rayon = "1.10"
+num_cpus = "1.16"
