@@ -1,0 +1,14 @@
+// CWE-78: OS Command Injection — C / POSIX
+// Tainted user input flows to a shell/exec function.
+
+rule "cwe-78-c-command-injection" {
+    severity: critical
+    languages: [c]
+    message: "OS command injection: tainted input reaches command execution"
+    tags: ["command-injection", "injection", "cwe-78"]
+    taint {
+        sources: ["c.io_sources"]
+        sinks:   ["c.exec_ops"]
+        sanitizers: ["c.command_sanitizers"]
+    }
+}

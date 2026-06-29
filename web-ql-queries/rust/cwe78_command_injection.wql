@@ -1,0 +1,22 @@
+// CWE-78: OS Command Injection — Rust
+
+rule "cwe-78-rust-command-injection" {
+    severity: critical
+    languages: [rust]
+    message: "OS command injection: user input flows to Command::new or process::Command"
+    tags: ["command-injection", "injection", "cwe-78"]
+    taint {
+        sources: ["rust.env_sources", "rust.io_sources"]
+        sinks:   ["rust.exec_sinks"]
+    }
+}
+
+rule "cwe-78-rust-command-non-literal" {
+    severity: critical
+    languages: [rust]
+    message: "OS command injection: Command::new called with non-literal"
+    tags: ["command-injection", "cwe-78"]
+    find n: Call where
+        n.callee_name() in ["Command::new", "new", "arg", "args"]
+        and not n.arg(0) matches Literal { lit_kind: "String" }
+}

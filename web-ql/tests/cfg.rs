@@ -240,3 +240,48 @@ fn function_cfg_branching_entry_reaches_all() {
     assert!(cfg.node_reaches(31, 33)); // else node
     assert!(cfg.node_reaches(31, 34)); // merge node
 }
+
+// ── loop_has_no_exit ──────────────────────────────────────────────────────────
+
+#[test]
+fn loop_has_no_exit_returns_false_for_loop_with_exit() {
+    let (cpg, fn_id, header, body, _exit) = loop_with_exit_cpg();
+    let cfg = FunctionCfg::build_for_function(&cpg, fn_id);
+    // The loop has an exit edge from the header, so this should be false
+    assert!(!cfg.node_loop_has_no_exit(header));
+    assert!(!cfg.node_loop_has_no_exit(body));
+}
+
+#[test]
+fn loop_has_no_exit_returns_true_for_infinite_loop_header() {
+    let (cpg, fn_id, header, _body) = loop_no_exit_cpg();
+    let cfg = FunctionCfg::build_for_function(&cpg, fn_id);
+    assert!(cfg.node_loop_has_no_exit(header));
+}
+
+#[test]
+fn loop_has_no_exit_returns_true_for_infinite_loop_body() {
+    let (cpg, fn_id, _header, body) = loop_no_exit_cpg();
+    let cfg = FunctionCfg::build_for_function(&cpg, fn_id);
+    assert!(cfg.node_loop_has_no_exit(body));
+}
+
+#[test]
+fn loop_has_no_exit_returns_false_for_node_not_in_loop() {
+    let (cpg, fn_id) = linear_cfg_cpg();
+    let cfg = FunctionCfg::build_for_function(&cpg, fn_id);
+    // Node 21 is in a linear CFG with no loops
+    assert!(!cfg.node_loop_has_no_exit(21));
+}
+
+#[test]
+fn in_loop_detects_back_edge_for_finite_loop() {
+    let (cpg, fn_id, header, body, exit) = loop_with_exit_cpg();
+    let cfg = FunctionCfg::build_for_function(&cpg, fn_id);
+    // in_loop checks whether a block has a successor that dominates it (back edge outgoing).
+    // The body block (bb2) has the back edge to the header, so it returns true.
+    // The header block (bb1) is the back-edge target, not the source, so it returns false.
+    assert!(cfg.node_in_loop(body));
+    assert!(!cfg.node_in_loop(header));
+    assert!(!cfg.node_in_loop(exit));
+}

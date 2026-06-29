@@ -1,0 +1,43 @@
+// CWE-476: Null Pointer Dereference — Java
+
+// ── Predicate: no null check guards this dereference ─────────────────────────
+
+pred null_checked(src: Call, deref: Node) =
+    exists(nc: Conditional |
+        src.dfg_reaches(nc)
+        and nc.dominates(deref))
+
+// ── Nullable return value (Map.get, Optional) dereferenced without check ──────
+
+rule "cwe-476-java-nullable-unchecked-deref" {
+    severity: high
+    languages: [java]
+    message: "Null dereference: nullable return value used without null check on all paths"
+    tags: ["null-dereference", "cwe-476"]
+    find src: Call, deref: MemberAccess where
+        src.callee_name() in ["get", "getOrDefault", "find", "findFirst",
+                              "getProperty", "getParameter", "getenv",
+                              "getHeader", "getAttribute", "poll", "peek",
+                              "orElse", "getNullable"]
+        and src.cfg_reaches(deref)
+        and not null_checked(src, deref)
+}
+
+// ── Taint: HTTP parameter used as object without null check ───────────────────
+
+source java_web_input = find n: Call where
+    n.callee_name() in ["getParameter", "getHeader", "getAttribute", "getProperty"]
+
+sink java_method_call = find n: MemberAccess where
+    n.raw_kind() in ["method_invocation", "field_access"]
+
+rule "cwe-476-java-tainted-null-deref" {
+    severity: high
+    languages: [java]
+    message: "Null dereference: HTTP parameter used as object without null check"
+    tags: ["null-dereference", "cwe-476"]
+    taint {
+        sources: ["java_web_input"]
+        sinks:   ["java_method_call"]
+    }
+}

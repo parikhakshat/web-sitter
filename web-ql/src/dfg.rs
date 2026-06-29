@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use roaring::RoaringBitmap;
+use std::sync::RwLock;
 use web_sitter::{Cpg, IrNodeKind, NodeId};
 
 // ── DFG index ─────────────────────────────────────────────────────────────────
@@ -12,6 +12,20 @@ pub struct DfgIndex {
     pub backward: HashMap<NodeId, Vec<NodeId>>,
     /// Variable-named edges: variable_name → vec of (source, dest)
     pub var_edges: HashMap<String, Vec<(NodeId, NodeId)>>,
+    /// Memoized forward-reachability sets (computed on demand, reused across queries).
+    /// Keyed by source NodeId → set of all nodes reachable from it.
+    reach_cache: RwLock<HashMap<NodeId, HashSet<NodeId>>>,
+}
+
+impl Clone for DfgIndex {
+    fn clone(&self) -> Self {
+        Self {
+            forward: self.forward.clone(),
+            backward: self.backward.clone(),
+            var_edges: self.var_edges.clone(),
+            reach_cache: RwLock::new(HashMap::new()),
+        }
+    }
 }
 
 impl DfgIndex {
@@ -30,7 +44,7 @@ impl DfgIndex {
                 .push((edge.source, edge.destination));
         }
 
-        Self { forward, backward, var_edges }
+        Self { forward, backward, var_edges, reach_cache: RwLock::new(HashMap::new()) }
     }
 
     /// True if `node` is a definition site for `var_name` (it is a source of a DFG edge for that variable).
@@ -53,13 +67,20 @@ impl DfgIndex {
     }
 
     /// BFS forward reachability: returns all nodes reachable from `source`
-    /// (including `source` itself).
+    /// (including `source` itself). Results are memoized in `reach_cache`.
     pub fn reachable_from(&self, source: NodeId) -> HashSet<NodeId> {
+        // Fast path: already cached
+        if let Ok(cache) = self.reach_cache.read() {
+            if let Some(set) = cache.get(&source) {
+                return set.clone();
+            }
+        }
+
+        // Compute via BFS
         let mut visited = HashSet::new();
         let mut queue = VecDeque::new();
         queue.push_back(source);
         visited.insert(source);
-
         while let Some(node) = queue.pop_front() {
             if let Some(succs) = self.forward.get(&node) {
                 for &s in succs {
@@ -68,6 +89,11 @@ impl DfgIndex {
                     }
                 }
             }
+        }
+
+        // Store in cache (best-effort; ignore poison)
+        if let Ok(mut cache) = self.reach_cache.write() {
+            cache.insert(source, visited.clone());
         }
         visited
     }
@@ -92,13 +118,12 @@ impl DfgIndex {
     }
 
     /// True if `from` can reach `to` via the dataflow graph.
+    /// Uses cached forward reachability for amortized O(1) repeated queries from the same source.
     pub fn reaches(&self, from: NodeId, to: NodeId) -> bool {
         if from == to {
             return true;
         }
-        // Use backward BFS from `to` for potentially smaller set
-        let back = self.reaches_to(to);
-        back.contains(&from)
+        self.reachable_from(from).contains(&to)
     }
 
     /// True if `from` can reach `to` without passing through any node whose

@@ -1,0 +1,32 @@
+// CWE-362: Race Condition (TOCTOU) — C
+
+// ── TOCTOU: check call reaches use call on the same CFG path ─────────────────
+
+rule "cwe-362-c-toctou-file" {
+    severity: high
+    languages: [c]
+    message: "TOCTOU race: file checked then used on the same execution path — state may change"
+    tags: ["race-condition", "toctou", "cwe-362"]
+    find check: Call, use: Call where
+        check.callee_name() in ["access", "stat", "lstat", "fstat", "faccessat"]
+        and use.callee_name() in ["open", "fopen", "unlink", "rename", "chmod",
+                                  "chown", "execve", "mkdir", "rmdir", "link"]
+        and check.cfg_reaches(use)
+        // NOTE: suppressing locked regions (a CFG path with a mutex lock between
+        // check and use) requires alias(lock.arg, shared_var) — see missing-features.md.
+}
+
+// ── Double-checked locking without memory barriers ───────────────────────────
+
+rule "cwe-362-c-double-checked-locking" {
+    severity: medium
+    languages: [c]
+    message: "Double-checked locking is broken without memory barriers"
+    tags: ["race-condition", "double-checked-locking", "cwe-362"]
+    find outer: Conditional, inner: Conditional where
+        outer.has_descendant(inner.id())
+        and exists(lock: Call | lock.has_ancestor(outer.id())
+                               and lock.callee_name() in ["pthread_mutex_lock",
+                                                          "pthread_spin_lock",
+                                                          "EnterCriticalSection"])
+}

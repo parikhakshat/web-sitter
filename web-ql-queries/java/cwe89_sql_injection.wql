@@ -1,0 +1,27 @@
+// CWE-89: SQL Injection — Java (JDBC, JPA, Spring Data)
+
+rule "cwe-89-java-sql-injection" {
+    severity: critical
+    languages: [java]
+    message: "SQL injection: HTTP request parameter flows to SQL execution"
+    tags: ["sql-injection", "injection", "cwe-89"]
+    taint {
+        sources: ["java.http_sources"]
+        sinks:   ["java.sql_sinks"]
+        require_interprocedural: true
+        max_call_depth: 5
+    }
+}
+
+// String concatenation in SQL (structural, no taint required)
+rule "cwe-89-java-string-concat-sql" {
+    severity: high
+    languages: [java]
+    message: "SQL injection risk: string concatenation used to build SQL query"
+    tags: ["sql-injection", "cwe-89"]
+    find n: Call where
+        n.callee_name() in ["executeQuery", "executeUpdate", "execute",
+                            "prepareStatement", "prepareCall", "createQuery",
+                            "createNativeQuery", "nativeQuery"]
+        and not n.arg(0) matches Literal { lit_kind: "String" }
+}

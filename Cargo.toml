@@ -3,6 +3,7 @@ members = [
     "web-sitter",
     "web-ql",
     "web-profiler",
+    "web-scan",
 ]
 resolver = "2"
 
@@ -41,3 +42,7 @@ lru = "0.12"
 serde_json = "1.0"
 rayon = "1.10"
 num_cpus = "1.16"
+clap = { version = "4.5", features = ["derive"] }
+indicatif = { version = "0.17", features = ["rayon"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -1,6 +1,7 @@
 use web_ql::loader::compile_rules;
 use web_ql::parser::parse_rule_file;
 use web_ql::ast::{Severity, Language, TopLevelItem};
+use web_ql::ir::{CfgPredicate, CompiledClause, DfgPredicate, QueryPlan, SearchPlan};
 
 // ── Minimal rule ──────────────────────────────────────────────────────────────
 
@@ -339,4 +340,182 @@ fn compile_preserves_tags() {
     let src = r#"rule "tagged" { tags: ["cwe-79"] severity: low }"#;
     let rs = compile_rules(src).expect("compile");
     assert!(rs.rules[0].tags.contains(&"cwe-79".to_owned()));
+}
+
+// ── Relational predicate compilation ─────────────────────────────────────────
+
+fn extract_search_plan(rs: &web_ql::ir::RuleSet) -> &SearchPlan {
+    let CompiledClause::Search(plan) = &rs.rules[0].clauses[0] else {
+        panic!("expected Search clause");
+    };
+    plan
+}
+
+#[test]
+fn compile_cfg_reaches_emits_cfg_predicate() {
+    let src = r#"
+rule "test" {
+    find a: Call, b: Call where
+        a.cfg_reaches(b)
+}
+"#;
+    let rs = compile_rules(src).expect("compile");
+    let plan = extract_search_plan(&rs);
+    assert_eq!(plan.root_bindings.len(), 2);
+    assert!(
+        matches!(&plan.plan, QueryPlan::CfgPredicate(CfgPredicate::CfgReaches { a, b })
+            if a == "a" && b == "b"),
+        "cfg_reaches should compile to CfgPredicate::CfgReaches, got {:?}", plan.plan
+    );
+}
+
+#[test]
+fn compile_dominates_emits_cfg_predicate() {
+    let src = r#"
+rule "test" {
+    find a: Conditional, b: Call where
+        a.dominates(b)
+}
+"#;
+    let rs = compile_rules(src).expect("compile");
+    let plan = extract_search_plan(&rs);
+    assert!(
+        matches!(&plan.plan, QueryPlan::CfgPredicate(CfgPredicate::Dominates { a, b })
+            if a == "a" && b == "b"),
+        "dominates should compile to CfgPredicate::Dominates, got {:?}", plan.plan
+    );
+}
+
+#[test]
+fn compile_dfg_reaches_emits_dfg_predicate() {
+    let src = r#"
+rule "test" {
+    find a: Call, b: Call where
+        a.dfg_reaches(b)
+}
+"#;
+    let rs = compile_rules(src).expect("compile");
+    let plan = extract_search_plan(&rs);
+    assert!(
+        matches!(&plan.plan, QueryPlan::DfgPredicate(DfgPredicate::ReachesFlow { from, to })
+            if from == "a" && to == "b"),
+        "dfg_reaches should compile to DfgPredicate::ReachesFlow, got {:?}", plan.plan
+    );
+}
+
+#[test]
+fn compile_dfg_flows_to_emits_dfg_predicate() {
+    let src = r#"
+rule "test" {
+    find a: Call, b: Call where
+        a.dfg_flows_to(b)
+}
+"#;
+    let rs = compile_rules(src).expect("compile");
+    let plan = extract_search_plan(&rs);
+    assert!(
+        matches!(&plan.plan, QueryPlan::DfgPredicate(DfgPredicate::DirectFlow { from, to })
+            if from == "a" && to == "b"),
+        "dfg_flows_to should compile to DfgPredicate::DirectFlow, got {:?}", plan.plan
+    );
+}
+
+#[test]
+fn compile_cfg_reaches_without_emits_cfg_predicate() {
+    let src = r#"
+rule "test" {
+    find a: Call, b: Call, barrier: Call where
+        a.cfg_reaches_without(b, barrier)
+}
+"#;
+    let rs = compile_rules(src).expect("compile");
+    let plan = extract_search_plan(&rs);
+    assert_eq!(plan.root_bindings.len(), 3);
+    assert!(
+        matches!(&plan.plan, QueryPlan::CfgPredicate(CfgPredicate::CfgReachableWithout {
+            from, to, barrier
+        }) if from == "a" && to == "b" && barrier == "barrier"),
+        "cfg_reaches_without should compile to CfgReachableWithout, got {:?}", plan.plan
+    );
+}
+
+#[test]
+fn compile_in_loop_emits_cfg_predicate() {
+    let src = r#"
+rule "test" {
+    find n: Loop where n.in_loop()
+}
+"#;
+    let rs = compile_rules(src).expect("compile");
+    let plan = extract_search_plan(&rs);
+    assert!(
+        matches!(&plan.plan, QueryPlan::CfgPredicate(CfgPredicate::InLoop { node })
+            if node == "n"),
+        "in_loop() should compile to CfgPredicate::InLoop, got {:?}", plan.plan
+    );
+}
+
+#[test]
+fn compile_same_function_emits_cfg_predicate() {
+    let src = r#"
+rule "test" {
+    find a: Call, b: Call where a.same_function(b)
+}
+"#;
+    let rs = compile_rules(src).expect("compile");
+    let plan = extract_search_plan(&rs);
+    assert!(
+        matches!(&plan.plan, QueryPlan::CfgPredicate(CfgPredicate::SameFunction { a, b })
+            if a == "a" && b == "b"),
+        "same_function should compile to CfgPredicate::SameFunction, got {:?}", plan.plan
+    );
+}
+
+#[test]
+fn non_relational_method_still_compiles_as_ast_constraint() {
+    // callee_name() is not a relational predicate — should still compile fine as boolean
+    let src = r#"
+rule "test" {
+    find n: Call where n.callee_name() == "exec"
+}
+"#;
+    let rs = compile_rules(src).expect("compile");
+    let plan = extract_search_plan(&rs);
+    assert!(
+        matches!(&plan.plan, QueryPlan::AstConstraint(_)),
+        "callee_name() comparison should stay as AstConstraint, got {:?}", plan.plan
+    );
+}
+
+// ── Validate web-ql-queries directory ────────────────────────────────────────
+
+#[test]
+fn wql_query_files_parse() {
+    let dir = std::path::Path::new("../web-ql-queries");
+    if !dir.exists() {
+        return; // skip if not present
+    }
+    fn collect_wql(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_wql(&path, out);
+            } else if path.extension().map_or(false, |x| x == "wql") {
+                out.push(path);
+            }
+        }
+    }
+    let mut wql_files = Vec::new();
+    collect_wql(dir, &mut wql_files);
+    let mut failures = Vec::new();
+    for path in &wql_files {
+        let src = std::fs::read_to_string(path).expect("read wql file");
+        if let Err(e) = compile_rules(&src) {
+            failures.push(format!("{}: {}", path.display(), e));
+        }
+    }
+    if !failures.is_empty() {
+        panic!("WQL parse failures:\n{}", failures.join("\n"));
+    }
 }

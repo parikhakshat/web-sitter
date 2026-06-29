@@ -204,7 +204,7 @@ pub(crate) fn enrich_call_graph_python(cpg: &mut Cpg) {
 pub(crate) fn enrich_call_graph_cpp(cpg: &mut Cpg) {
     // Mark calls via pointer/reference on a class receiver as virtual dispatch candidates
     // when the receiver type is in the class hierarchy as a base class.
-    let subtype_names: std::collections::HashSet<String> = cpg.class_hierarchy.keys().cloned().collect();
+    let subtype_names: std::collections::HashSet<String> = cpg.workspace.class_hierarchy.keys().cloned().collect();
     let call_ids: Vec<NodeId> = cpg.ast.iter()
         .filter(|(_, n)| n.is_call() && n.class_context.is_some())
         .filter(|(id, _)| {
@@ -574,7 +574,7 @@ pub fn build_interprocedural_dfg(cpg: &mut Cpg) {
         let _ = &uses_in_fn;
 
         if !summary.param_effects.is_empty() {
-            cpg.function_summaries.insert(func_id, summary);
+            cpg.workspace.function_summaries.insert(func_id, summary);
         }
     }
 
@@ -607,7 +607,7 @@ pub fn build_interprocedural_dfg(cpg: &mut Cpg) {
     let _ = defs_by_fn; // summaries are the primary output; defs_by_fn was used for summary building
     let mut new_edges: Vec<crate::DataflowEdge> = Vec::new();
     for (caller_id, callee_id, args) in &call_sites {
-        if let Some(summary) = cpg.function_summaries.get(callee_id) {
+        if let Some(summary) = cpg.workspace.function_summaries.get(callee_id) {
             for effect in &summary.param_effects.clone() {
                 if let crate::ParamEffect::TaintReturn(param_idx) = effect {
                     if let Some(&arg_node_id) = args.get(*param_idx) {

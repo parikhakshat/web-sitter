@@ -15,7 +15,7 @@ fn empty_registry() -> EndpointRegistry {
 }
 
 fn empty_rule_set() -> RuleSet {
-    RuleSet { rules: vec![], global_seed_hints: vec![] }
+    RuleSet::new(vec![])
 }
 
 fn always_true_rule_set() -> RuleSet {
@@ -274,7 +274,7 @@ fn upsert_file_merges_function_summaries() {
     let mut ws = Workspace::new(empty_registry());
 
     let mut cpg = Cpg { language: "python".to_owned(), ..Cpg::default() };
-    cpg.function_summaries.insert(
+    cpg.workspace.function_summaries.insert(
         1,
         FunctionSummary {
             name: "my_func".to_owned(),

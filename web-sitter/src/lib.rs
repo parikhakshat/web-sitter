@@ -933,27 +933,10 @@ pub struct Cpg {
     /// Source comments collected during parsing, used for suppression directives.
     #[serde(default)]
     pub comments: Vec<SourceComment>,
-    /// Preprocessor function-like macro aliases extracted via `gcc -dM -E`.
-    /// Maps macro name → wrapped function name (e.g. "SQLITE_MALLOC" → "malloc").
-    /// Populated during CPG construction; absent in older serialized CPGs.
+    /// C/C++ preprocessor metadata: macro aliases, macro bodies, custom allocators.
+    /// Empty for all other languages.
     #[serde(default)]
-    pub macro_aliases: BTreeMap<String, String>,
-    /// Preprocessor macro definitions for expression evaluation.
-    /// Maps macro name → `MacroBody` (params + body text).
-    /// Used by the size tracker to expand macro arguments before evaluation.
-    #[serde(default)]
-    pub macro_bodies: BTreeMap<String, MacroBody>,
-    /// Custom allocator functions detected via `__attribute__((malloc))` or
-    /// `__attribute__((alloc_size(...)))`.  Maps function name → size argument
-    /// index (0-based; -1 means "implicit size" like strdup).  These are merged
-    /// with `HEAP_ALLOCATORS` during alias analysis.
-    #[serde(default)]
-    pub custom_allocators: BTreeMap<String, i32>,
-    /// Calls to functions whose definitions live in other files.
-    /// Populated during CPG construction; resolved by the workspace layer
-    /// into cross-file interprocedural DFG edges after all CPGs are built.
-    #[serde(default)]
-    pub cross_file_calls: Vec<CrossFileCallEdge>,
+    pub c_file: CFileMetadata,
     /// C++-specific per-node metadata stored in a sparse side-table.
     /// Only function_definition, declaration, and class_specifier nodes have entries.
     /// Kept separate from AstNode to avoid paying ~150 bytes per node on C code.
@@ -971,15 +954,10 @@ pub struct Cpg {
     pub ts_metadata: BTreeMap<NodeId, TsNodeMetadata>,
     #[serde(default)]
     pub rust_metadata: BTreeMap<NodeId, RustNodeMetadata>,
-    /// Class / interface hierarchy extracted from the source.
-    /// Maps a type name to its declared direct supertypes (extends + implements).
-    /// Populated by `build_class_hierarchy` after lifting.
+    /// Engine-level workspace state produced during single-file analysis but consumed
+    /// at the workspace/codebase layer (cross-file edges, hierarchy, summaries).
     #[serde(default)]
-    pub class_hierarchy: BTreeMap<String, Vec<String>>,
-    /// Per-function summaries for interprocedural DFG propagation.
-    /// Maps `MethodDef` NodeId → summary of which params flow to which return positions.
-    #[serde(default)]
-    pub function_summaries: BTreeMap<NodeId, FunctionSummary>,
+    pub workspace: WorkspaceIndex,
 }
 
 /// C++-specific metadata for a single AST node, stored in `Cpg::cpp_metadata`.
@@ -1285,6 +1263,47 @@ pub struct RustNodeMetadata {
 pub struct MacroBody {
     pub params: Vec<String>,
     pub body: String,
+}
+
+/// C/C++ preprocessor metadata stored at the file level (not per-node).
+/// Populated during CPG construction via `gcc -dM -E` output and attribute parsing.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CFileMetadata {
+    /// Function-like macro aliases: maps macro name → wrapped function name
+    /// (e.g. `"SQLITE_MALLOC"` → `"malloc"`).
+    #[serde(default)]
+    pub macro_aliases: BTreeMap<String, String>,
+    /// Macro definitions for expression evaluation.  Maps macro name → `MacroBody`
+    /// (params + body text).  Used by the size tracker to expand macro arguments.
+    #[serde(default)]
+    pub macro_bodies: BTreeMap<String, MacroBody>,
+    /// Custom allocator functions detected via `__attribute__((malloc))` or
+    /// `__attribute__((alloc_size(...)))`.  Maps function name → size argument
+    /// index (0-based; -1 means "implicit size" like `strdup`).  Merged with
+    /// `HEAP_ALLOCATORS` during alias analysis.
+    #[serde(default)]
+    pub custom_allocators: BTreeMap<String, i32>,
+}
+
+/// Engine-level data produced during single-file analysis but consumed at the
+/// workspace/codebase layer.  Stored on `Cpg` as a staging area; the workspace
+/// layer moves or resolves these fields once all files are indexed.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct WorkspaceIndex {
+    /// Calls to functions whose definitions live in other files.
+    /// Resolved by the workspace layer into cross-file interprocedural DFG edges
+    /// after all CPGs are built.
+    #[serde(default)]
+    pub cross_file_calls: Vec<CrossFileCallEdge>,
+    /// Class / interface / trait hierarchy: maps a type name to its declared
+    /// direct supertypes (extends + implements).
+    /// Populated by `build_class_hierarchy` after lifting.
+    #[serde(default)]
+    pub class_hierarchy: BTreeMap<String, Vec<String>>,
+    /// Per-function summaries for interprocedural DFG propagation.
+    /// Maps `MethodDef` NodeId → summary of which params flow to which return positions.
+    #[serde(default)]
+    pub function_summaries: BTreeMap<NodeId, FunctionSummary>,
 }
 
 fn default_language() -> String {

@@ -1,0 +1,24 @@
+// CWE-78: OS Command Injection — Go
+
+rule "cwe-78-go-command-injection" {
+    severity: critical
+    languages: [go]
+    message: "OS command injection: HTTP request data flows to exec.Command"
+    tags: ["command-injection", "injection", "cwe-78"]
+    taint {
+        sources: ["go.http_request_sources", "go.env_sources"]
+        sinks:   ["go.exec_sinks"]
+    }
+}
+
+// exec.Command with non-literal first arg
+rule "cwe-78-go-exec-non-literal" {
+    severity: critical
+    languages: [go]
+    message: "OS command injection: exec.Command called with non-literal argument"
+    tags: ["command-injection", "cwe-78"]
+    find n: Call where
+        n.callee_name() in ["Command", "CommandContext", "exec.Command",
+                            "exec.CommandContext", "LookPath"]
+        and not n.arg(0) matches Literal { lit_kind: "String" }
+}

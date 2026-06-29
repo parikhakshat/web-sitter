@@ -1,0 +1,55 @@
+// CWE-327: Weak Crypto / CWE-798: Hardcoded Credentials / CWE-369: Divide by Zero — Rust
+
+// ── CWE-327: Weak hash ────────────────────────────────────────────────────────
+
+rule "cwe-327-rust-weak-hash" {
+    severity: high
+    languages: [rust]
+    message: "Weak hash: MD5 or SHA-1 used (md5, sha1 crates)"
+    tags: ["weak-crypto", "cwe-327"]
+    find n: Call where
+        n.callee_name() in ["Md5::new", "Sha1::new", "md5::compute",
+                            "Md5::digest", "sha1::Sha1::new",
+                            "compute", "digest"]
+        and n.namespace() in ["md5", "sha1", "sha-1"]
+}
+
+rule "cwe-327-rust-weak-cipher" {
+    severity: critical
+    languages: [rust]
+    message: "Weak cipher: DES or RC4 used"
+    tags: ["weak-crypto", "cwe-327"]
+    find n: Call where
+        n.callee_name() in ["Des::new", "TripleDes::new", "Rc4::new",
+                            "des::Des::new", "des::TdesEee3::new"]
+}
+
+// ── CWE-798: Hardcoded credentials ───────────────────────────────────────────
+
+rule "cwe-798-rust-hardcoded-var" {
+    severity: critical
+    languages: [rust]
+    message: "Hardcoded credential in Rust variable"
+    tags: ["hardcoded-credentials", "cwe-798"]
+    find n: LocalDef where
+        n.name in ["password", "passwd", "secret", "api_key", "apikey",
+                   "private_key", "token", "auth_token", "access_token",
+                   "db_password", "secret_key", "client_secret"]
+        and exists(lit: Literal | lit.has_ancestor(n.id()))
+}
+
+// ── CWE-369: Divide by zero with tainted divisor ─────────────────────────────
+
+rule "cwe-369-rust-tainted-divisor" {
+    severity: medium
+    languages: [rust]
+    message: "Divide by zero: user-controlled value used as divisor"
+    tags: ["divide-by-zero", "cwe-369"]
+    taint {
+        sources: ["rust.io_sources", "rust.env_sources"]
+        sinks:   ["rust_div_sinks"]
+    }
+}
+
+sink rust_div_sinks = find n: BinaryOp where
+    n.raw_kind() in ["binary_expression", "div_assign", "rem_assign"]

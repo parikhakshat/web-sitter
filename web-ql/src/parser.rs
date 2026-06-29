@@ -611,18 +611,45 @@ impl Parser {
 
     fn parse_not_expr(&mut self) -> ParseResult<Expr> {
         if let Some(st) = self.peek().cloned() {
-            if st.token == Token::Not {
-                let start = st.span;
-                self.pos += 1;
-                let inner = self.parse_not_expr()?;
-                let end = inner.span;
-                return Ok(Expr {
-                    span: start.merge(end),
-                    kind: ExprKind::Not(Box::new(inner)),
-                });
+            match st.token {
+                Token::Not => {
+                    let start = st.span;
+                    self.pos += 1;
+                    let inner = self.parse_not_expr()?;
+                    let end = inner.span;
+                    return Ok(Expr {
+                        span: start.merge(end),
+                        kind: ExprKind::Not(Box::new(inner)),
+                    });
+                }
+                Token::Let => return self.parse_let_expr(),
+                _ => {}
             }
         }
         self.parse_compare_expr()
+    }
+
+    /// Parse `let var = call_expr in body_expr`.
+    ///
+    /// The RHS is intentionally limited to `parse_call_expr` (method chains,
+    /// no comparison operators) to avoid ambiguity with the `in` keyword.
+    fn parse_let_expr(&mut self) -> ParseResult<Expr> {
+        let start = self.current_span();
+        self.expect(&Token::Let, "`let`")?;
+        let (var, _) = self.expect_ident()?;
+        self.expect(&Token::Assign, "`=`")?;
+        let binding = self.parse_call_expr()?;
+        self.expect(&Token::In, "`in`")?;
+        let body = self.parse_expr()?;
+        let end = body.span;
+        Ok(Expr {
+            span: start.merge(end),
+            kind: ExprKind::Let {
+                var,
+                binding: Box::new(binding),
+                body: Box::new(body),
+            },
+        })
     }
 
     fn parse_compare_expr(&mut self) -> ParseResult<Expr> {
@@ -1018,8 +1045,10 @@ impl Parser {
             // Attribute block form: source name { kind: Type, name: "str" }
             vec![self.parse_attr_block_as_find_expr()?]
         } else {
-            let params = self.parse_param_list()?;
-            let _ = params; // params ignored for now
+            if self.peek_tok() == Some(&Token::LParen) {
+                let params = self.parse_param_list()?;
+                let _ = params; // params ignored for now
+            }
             self.expect(&Token::Assign, "`=`")?;
             self.parse_find_expr_alternatives()?
         };
@@ -1034,8 +1063,10 @@ impl Parser {
         let body = if self.peek_tok() == Some(&Token::LBrace) {
             vec![self.parse_attr_block_as_find_expr()?]
         } else {
-            let params = self.parse_param_list()?;
-            let _ = params;
+            if self.peek_tok() == Some(&Token::LParen) {
+                let params = self.parse_param_list()?;
+                let _ = params;
+            }
             self.expect(&Token::Assign, "`=`")?;
             self.parse_find_expr_alternatives()?
         };
@@ -1100,10 +1131,14 @@ impl Parser {
         let start = self.current_span();
         self.expect(&Token::Sanitizer, "`sanitizer`")?;
         let (name, _) = self.expect_ident()?;
-        let params = self.parse_param_list()?;
+        let params = if self.peek_tok() == Some(&Token::LParen) {
+            self.parse_param_list()?
+        } else {
+            vec![]
+        };
         self.expect(&Token::Assign, "`=`")?;
-        let body = self.parse_expr()?;
-        let end = body.span;
+        let body = self.parse_find_expr_alternatives()?;
+        let end = self.tokens.get(self.pos.saturating_sub(1)).map(|t| t.span).unwrap_or(start);
         Ok(SanitizerDef { span: start.merge(end), name, params, body })
     }
 

@@ -1,0 +1,30 @@
+// CWE-22: Path Traversal — JavaScript / Node.js
+
+source js_req_input = find n: Call where
+    n.callee_name() in ["req.query", "req.params", "req.body",
+                        "req.headers", "process.env"]
+
+sink js_file_sinks = find n: Call where
+    n.callee_name() in ["readFile", "readFileSync", "writeFile", "writeFileSync",
+                        "appendFile", "appendFileSync", "createReadStream",
+                        "createWriteStream", "open", "openSync",
+                        "unlink", "unlinkSync", "rmdir", "rmdirSync",
+                        "mkdir", "mkdirSync", "rename", "renameSync",
+                        "copyFile", "copyFileSync", "path.join"]
+
+sanitizer js_path_san = find n: Call where
+    n.callee_name() in ["path.resolve", "path.normalize", "realpath",
+                        "realpathSync", "path.relative"]
+
+rule "cwe-22-js-path-traversal" {
+    severity: high
+    languages: [javascript]
+    message: "Path traversal: request parameter used in file system operation"
+    tags: ["path-traversal", "cwe-22"]
+    taint {
+        sources: ["js_req_input"]
+        sinks:   ["js_file_sinks", "js.file_write_sinks"]
+        sanitizers: ["js_path_san"]
+        require_interprocedural: true
+    }
+}

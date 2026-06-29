@@ -1,0 +1,45 @@
+// CWE-209: Information Leak / CWE-476: Nil Deref — Go
+
+// ── CWE-209: Error details in HTTP response ───────────────────────────────────
+
+rule "cwe-209-go-error-in-response" {
+    severity: medium
+    languages: [go]
+    message: "Information leak: error message written to HTTP response"
+    tags: ["information-leak", "cwe-209"]
+    find n: Call where
+        n.callee_name() in ["http.Error", "fmt.Fprintf", "w.Write", "json.NewEncoder"]
+        and exists(err: Identifier |
+            err.name in ["err", "error", "e", "ex"]
+            and err.has_ancestor(n.id()))
+}
+
+// ── CWE-476: Nil pointer from error-returning call used without check ─────────
+
+rule "cwe-476-go-unchecked-error-return" {
+    severity: high
+    languages: [go]
+    message: "Nil dereference: return value from error-returning function used without nil check"
+    tags: ["nil-dereference", "cwe-476"]
+    find n: Call where
+        n.callee_name() in ["os.Open", "os.Create", "http.Get", "sql.Open",
+                            "net.Dial", "json.Unmarshal", "strconv.Atoi",
+                            "ParseFloat", "ParseInt", "ParseBool"]
+        and not exists(cond: Conditional |
+            cond.has_ancestor(n.function_id()))
+}
+
+// ── CWE-362: TOCTOU — Go (goroutine shared state) ────────────────────────────
+
+rule "cwe-362-go-shared-state-no-mutex" {
+    severity: high
+    languages: [go]
+    message: "Race condition: goroutine accesses shared variable without mutex"
+    tags: ["race-condition", "cwe-362"]
+    find n: GoStmt where
+        exists(assign: Assign |
+            assign.has_ancestor(n.function_id())
+            and not exists(lock: Call |
+                lock.callee_name() in ["Lock", "RLock", "TryLock", "sync.Mutex.Lock"]
+                and lock.same_function(assign)))
+}

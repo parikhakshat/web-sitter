@@ -42,6 +42,8 @@ pub enum Token {
     Propagator,
     #[token("pred")]
     Pred,
+    #[token("let")]
+    Let,
     #[token("exists")]
     Exists,
     #[token("forall")]

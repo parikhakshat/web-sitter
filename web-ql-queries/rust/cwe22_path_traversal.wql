@@ -1,0 +1,30 @@
+// CWE-22: Path Traversal — Rust
+
+source rust_user_input = find n: Call where
+    n.callee_name() in ["read_line", "stdin", "from_str",
+                        "env::var", "var", "args", "std::env::args",
+                        "from_utf8", "from_bytes"]
+
+sink rust_file_sinks = find n: Call where
+    n.callee_name() in ["open", "File::open", "File::create",
+                        "create", "read_to_string", "write",
+                        "write_all", "remove_file", "rename",
+                        "create_dir", "create_dir_all", "remove_dir_all",
+                        "copy", "hard_link", "read_dir",
+                        "PathBuf::from", "Path::new"]
+
+sanitizer rust_path_san = find n: Call where
+    n.callee_name() in ["canonicalize", "normalize", "clean",
+                        "strip_prefix", "components"]
+
+rule "cwe-22-rust-path-traversal" {
+    severity: high
+    languages: [rust]
+    message: "Path traversal: user input used in file operation without path validation"
+    tags: ["path-traversal", "cwe-22"]
+    taint {
+        sources: ["rust_user_input"]
+        sinks:   ["rust_file_sinks", "rust.file_sinks"]
+        sanitizers: ["rust_path_san"]
+    }
+}

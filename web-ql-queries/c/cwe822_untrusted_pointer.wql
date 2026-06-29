@@ -1,0 +1,16 @@
+// CWE-822: Untrusted Pointer Dereference — C
+// Pointer value from external input used without validation.
+
+sink c_ptr_sink = find n: MemberAccess where
+    n.raw_kind() in ["pointer_expression", "subscript_expression"]
+
+rule "cwe-822-c-tainted-pointer-deref" {
+    severity: critical
+    languages: [c]
+    message: "Untrusted pointer: externally sourced value used as pointer"
+    tags: ["untrusted-pointer", "memory-safety", "cwe-822"]
+    taint {
+        sources: ["c.io_sources"]
+        sinks:   ["c_ptr_sink"]
+    }
+}

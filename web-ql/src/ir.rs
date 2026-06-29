@@ -121,6 +121,15 @@ pub enum QueryPlan {
         args: Vec<PlanExpr>,
     },
 
+    /// Bind a derived node to `var`, then evaluate `body` with it in scope.
+    /// `expr` must evaluate to a `Node`; if it evaluates to anything else the
+    /// predicate is false (the binding is optional / may not exist).
+    LetNode {
+        var: String,
+        expr: PlanExpr,
+        body: Box<QueryPlan>,
+    },
+
     /// Trivially true / false (used after constant folding)
     Literal(bool),
 }
@@ -188,6 +197,8 @@ pub enum CfgPredicate {
     CfgReachableWithout { from: String, to: String, barrier: String },
     /// `a` and `b` are in the same function (share the same function_id)
     SameFunction { a: String, b: String },
+    /// `node` is inside a loop whose SCC has no exit edge to outside the loop
+    LoopHasNoExit { node: String },
 }
 
 // ── DFG predicates ────────────────────────────────────────────────────────────
@@ -345,6 +356,18 @@ pub struct RuleSet {
     pub rules: Vec<CompiledRule>,
     /// Pre-computed union of all seed hints across all rules.
     pub global_seed_hints: Vec<SeedHint>,
+    /// Compiled predicate bodies keyed by name, for `PredicateCall` resolution.
+    pub predicate_plans: HashMap<String, QueryPlan>,
+    /// Ordered parameter names for each user-defined predicate, used to bind
+    /// positional call arguments into the evaluation environment.
+    pub predicate_params: HashMap<String, Vec<String>>,
+    /// Compiled source definitions: name → SearchPlan that yields source nodes.
+    /// These are evaluated per-CPG at scan time and merged with the EndpointRegistry.
+    pub source_plans: HashMap<String, SearchPlan>,
+    /// Compiled sink definitions: name → SearchPlan that yields sink nodes.
+    pub sink_plans: HashMap<String, SearchPlan>,
+    /// Compiled sanitizer definitions: name → SearchPlan that yields sanitizer nodes.
+    pub sanitizer_plans: HashMap<String, SearchPlan>,
 }
 
 impl RuleSet {
@@ -353,7 +376,40 @@ impl RuleSet {
             .iter()
             .flat_map(|r| r.seed_hints.iter().cloned())
             .collect();
-        Self { rules, global_seed_hints }
+        Self {
+            rules,
+            global_seed_hints,
+            predicate_plans: HashMap::new(),
+            predicate_params: HashMap::new(),
+            source_plans: HashMap::new(),
+            sink_plans: HashMap::new(),
+            sanitizer_plans: HashMap::new(),
+        }
+    }
+
+    pub fn with_predicate_plans(mut self, plans: HashMap<String, QueryPlan>) -> Self {
+        self.predicate_plans = plans;
+        self
+    }
+
+    pub fn with_predicate_params(mut self, params: HashMap<String, Vec<String>>) -> Self {
+        self.predicate_params = params;
+        self
+    }
+
+    pub fn with_source_plans(mut self, plans: HashMap<String, SearchPlan>) -> Self {
+        self.source_plans = plans;
+        self
+    }
+
+    pub fn with_sink_plans(mut self, plans: HashMap<String, SearchPlan>) -> Self {
+        self.sink_plans = plans;
+        self
+    }
+
+    pub fn with_sanitizer_plans(mut self, plans: HashMap<String, SearchPlan>) -> Self {
+        self.sanitizer_plans = plans;
+        self
     }
 
     pub fn rules_for_language(&self, lang: Language) -> impl Iterator<Item = &CompiledRule> {

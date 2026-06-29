@@ -1,0 +1,35 @@
+// CWE-209: Information Leak / CWE-1333: Regex DoS — Java
+
+// ── CWE-209: Stack trace or exception message exposed to HTTP response ─────────
+
+rule "cwe-209-java-stacktrace-response" {
+    severity: high
+    languages: [java]
+    message: "Information leak: exception or stack trace exposed in HTTP response"
+    tags: ["information-leak", "cwe-209"]
+    find n: Call where
+        n.callee_name() in ["printStackTrace", "toString", "getMessage",
+                            "getLocalizedMessage", "getCause"]
+        and exists(resp: Call |
+            resp.callee_name() in ["println", "print", "write", "getWriter",
+                                   "getOutputStream", "sendError"]
+            and n.same_function(resp))
+}
+
+// ── CWE-1333: ReDoS — Java (user-controlled regex) ───────────────────────────
+
+rule "cwe-1333-java-redos-user-regex" {
+    severity: high
+    languages: [java]
+    message: "Regex DoS: user-controlled pattern used in regex compilation"
+    tags: ["redos", "dos", "cwe-1333"]
+    taint {
+        sources: ["java.http_sources"]
+        sinks:   ["java_regex_sinks"]
+    }
+}
+
+sink java_regex_sinks = find n: Call where
+    n.callee_name() in ["compile", "matches", "replaceAll", "replaceFirst",
+                        "split", "Pattern.compile", "match", "find"]
+    and n.arg(0).raw_kind() != "string_literal"

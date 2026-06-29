@@ -1,0 +1,54 @@
+// CWE-1333: Regex DoS / CWE-209: Info Leak — Python
+
+// ── CWE-1333: User-controlled regex pattern (ReDoS) ──────────────────────────
+
+source py_web_input = find n: Call where
+    n.callee_name() in ["request.args.get", "request.form.get",
+                        "request.json.get", "request.GET.get",
+                        "input", "raw_input", "sys.argv"]
+
+sink py_regex_sinks = find n: Call where
+    n.callee_name() in ["re.compile", "re.match", "re.search",
+                        "re.findall", "re.sub", "re.split",
+                        "compile", "match", "search", "fullmatch"]
+
+rule "cwe-1333-python-redos" {
+    severity: high
+    languages: [python]
+    message: "ReDoS: user-controlled pattern used in regex"
+    tags: ["redos", "dos", "cwe-1333"]
+    taint {
+        sources: ["py_web_input"]
+        sinks:   ["py_regex_sinks"]
+    }
+}
+
+// ── CWE-209: Exception detail exposed in response ─────────────────────────────
+
+rule "cwe-209-python-exception-leak" {
+    severity: medium
+    languages: [python]
+    message: "Information leak: exception message included in HTTP response"
+    tags: ["information-leak", "cwe-209"]
+    find n: Call where
+        n.callee_name() in ["str", "repr", "format"]
+        and exists(exc: Identifier |
+            exc.name in ["Exception", "Error", "e", "ex", "err", "exc"]
+            and exc.has_ancestor(n.id()))
+}
+
+// ── CWE-674: Uncontrolled recursion ──────────────────────────────────────────
+
+rule "cwe-674-python-recursive-no-base" {
+    severity: high
+    languages: [python]
+    message: "Uncontrolled recursion: recursive function with no apparent depth limit"
+    tags: ["uncontrolled-recursion", "dos", "cwe-674"]
+    find n: MethodDef where
+        exists(call: Call |
+            call.callee_name() == n.name
+            and call.has_ancestor(n.id()))
+        and not exists(cond: Conditional |
+            cond.has_ancestor(n.id())
+            and exists(ret: Return | ret.has_ancestor(cond.id())))
+}

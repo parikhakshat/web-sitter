@@ -1,0 +1,31 @@
+// CWE-327: Weak Crypto — Java (JCA/JCE)
+
+rule "cwe-327-java-weak-hash-instance" {
+    severity: high
+    languages: [java]
+    message: "Weak hash: MD5 or SHA-1 via MessageDigest.getInstance"
+    tags: ["weak-crypto", "cwe-327"]
+    find n: Call where
+        n.callee_name() in ["getInstance", "getMessageDigest"]
+        and (n.arg(0) matches Literal { lit_kind: "String" })
+}
+
+rule "cwe-327-java-weak-cipher-instance" {
+    severity: critical
+    languages: [java]
+    message: "Weak cipher (DES/RC4/ECB mode) used"
+    tags: ["weak-crypto", "cwe-327"]
+    find n: Call where
+        n.callee_name() == "getInstance"
+        and n.arg(0) matches Literal { lit_kind: "String" }
+}
+
+rule "cwe-327-java-rsa-small-key" {
+    severity: high
+    languages: [java]
+    message: "Weak RSA key size (< 2048 bits)"
+    tags: ["weak-crypto", "cwe-327"]
+    find n: Call where
+        n.callee_name() in ["generateKeyPair", "initialize"]
+        and n.arg(0) matches Literal { lit_kind: "Integer" }
+}

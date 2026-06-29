@@ -1,0 +1,30 @@
+// CWE-134: Uncontrolled Format String — C / POSIX
+// The format argument to printf-family is not a string literal (user-controlled).
+
+// ── Direct check: format arg is not a literal ─────────────────────────────────
+
+rule "cwe-134-c-nonliteral-format" {
+    severity: critical
+    languages: [c]
+    message: "Format string injection: format argument is not a string literal"
+    tags: ["format-string", "cwe-134"]
+    find n: Call where
+        n.callee_name() in ["printf", "fprintf", "sprintf", "snprintf",
+                            "vprintf", "vfprintf", "vsprintf", "vsnprintf",
+                            "syslog", "err", "warn", "errx", "warnx"]
+        and not (n.arg(0) matches Literal { lit_kind: "String" }
+                 or n.arg(1) matches Literal { lit_kind: "String" })
+}
+
+// ── Taint flow: external input reaches format position ────────────────────────
+
+rule "cwe-134-c-tainted-format" {
+    severity: critical
+    languages: [c]
+    message: "Format string injection: tainted data reaches format argument"
+    tags: ["format-string", "cwe-134"]
+    taint {
+        sources: ["c.io_sources"]
+        sinks:   ["cpp.format_sinks"]
+    }
+}

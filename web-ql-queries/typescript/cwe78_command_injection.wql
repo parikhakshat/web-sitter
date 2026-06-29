@@ -1,0 +1,18 @@
+// CWE-78: OS Command Injection — TypeScript / Node.js
+
+source ts_request_input = find n: Call where
+    n.callee_name() in ["req.query", "req.params", "req.body",
+                        "req.headers", "process.env",
+                        "getParam", "getQuery", "getBody"]
+    or n.callee_name() in ["ts.nestjs_sources"]
+
+rule "cwe-78-ts-command-injection" {
+    severity: critical
+    languages: [typescript]
+    message: "OS command injection: request data reaches exec/spawn"
+    tags: ["command-injection", "injection", "cwe-78"]
+    taint {
+        sources: ["ts_request_input", "ts.nestjs_sources"]
+        sinks:   ["js.exec_sinks"]
+    }
+}

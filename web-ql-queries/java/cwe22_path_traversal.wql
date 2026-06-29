@@ -1,0 +1,29 @@
+// CWE-22: Path Traversal — Java
+
+source java_web_input = find n: Call where
+    n.callee_name() in ["getParameter", "getHeader", "getQueryString",
+                        "getPathInfo", "getCookies", "getInputStream",
+                        "getReader", "getServletPath", "getRequestURI"]
+
+sink java_file_sinks = find n: Call where
+    n.callee_name() in ["new File", "File", "open", "FileInputStream",
+                        "FileOutputStream", "FileReader", "FileWriter",
+                        "Files.readAllBytes", "Files.write", "readFile",
+                        "openStream", "openConnection"]
+
+sanitizer java_path_san = find n: Call where
+    n.callee_name() in ["getCanonicalPath", "normalize", "toRealPath",
+                        "Paths.get", "relativize"]
+
+rule "cwe-22-java-path-traversal" {
+    severity: high
+    languages: [java]
+    message: "Path traversal: request parameter used in file operation"
+    tags: ["path-traversal", "cwe-22"]
+    taint {
+        sources: ["java_web_input"]
+        sinks:   ["java_file_sinks"]
+        sanitizers: ["java_path_san"]
+        require_interprocedural: true
+    }
+}

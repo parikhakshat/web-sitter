@@ -1,0 +1,18 @@
+// CWE-617: Reachable Assertion — C
+// Assertions that can be triggered by external input (DoS).
+
+rule "cwe-617-c-tainted-assert" {
+    severity: medium
+    languages: [c]
+    message: "Reachable assertion: tainted input can trigger assert(), causing abort"
+    tags: ["reachable-assertion", "dos", "cwe-617"]
+    taint {
+        sources: ["c.io_sources"]
+        sinks:   ["c_assert_sinks"]
+    }
+}
+
+sink c_assert_sinks = find n: Call where
+    n.callee_name() in ["assert", "__assert", "__assert_fail",
+                        "g_assert", "g_assert_not_reached",
+                        "g_return_if_fail", "g_return_val_if_fail"]

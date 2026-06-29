@@ -1,0 +1,37 @@
+// CWE-89: SQL Injection — TypeScript (TypeORM, Prisma, Sequelize, Knex)
+
+rule "cwe-89-ts-typeorm-raw-sql" {
+    severity: critical
+    languages: [typescript]
+    message: "SQL injection: user input flows to TypeORM raw query"
+    tags: ["sql-injection", "cwe-89"]
+    taint {
+        sources: ["ts.nestjs_sources"]
+        sinks:   ["ts.typeorm_sinks"]
+        require_interprocedural: true
+        max_call_depth: 5
+    }
+}
+
+rule "cwe-89-ts-prisma-raw-sql" {
+    severity: critical
+    languages: [typescript]
+    message: "SQL injection: user input flows to Prisma raw query"
+    tags: ["sql-injection", "cwe-89"]
+    taint {
+        sources: ["ts.nestjs_sources"]
+        sinks:   ["ts.prisma_raw_sinks"]
+    }
+}
+
+// Template literal in SQL (structural)
+rule "cwe-89-ts-template-sql" {
+    severity: high
+    languages: [typescript]
+    message: "SQL injection risk: template literal used as SQL query"
+    tags: ["sql-injection", "cwe-89"]
+    find n: Call where
+        n.callee_name() in ["query", "raw", "execute", "rawQuery",
+                            "knex.raw", "sequelize.query"]
+        and n.arg(0) matches TemplateStr { }
+}

@@ -1,0 +1,40 @@
+// CWE-121: Stack Buffer Overflow / CWE-787: OOB Write — C
+// Unsafe string/memory functions that write without bounds checks.
+
+// ── Direct use of unbounded string functions ──────────────────────────────────
+
+rule "cwe-121-c-unbounded-string-copy" {
+    severity: critical
+    languages: [c]
+    message: "Buffer overflow: unbounded string copy into fixed-size destination"
+    tags: ["buffer-overflow", "stack-overflow", "cwe-121", "cwe-787"]
+    find n: Call where
+        n.callee_name() in ["gets", "strcpy", "strcat", "sprintf", "vsprintf",
+                            "wcscpy", "wcscat"]
+}
+
+// ── Tainted size to bounded-but-unsafe copy ───────────────────────────────────
+
+rule "cwe-787-c-tainted-copy-size" {
+    severity: critical
+    languages: [c]
+    message: "OOB write: tainted size used in memory copy"
+    tags: ["oob-write", "buffer-overflow", "cwe-787"]
+    taint {
+        sources: ["c.io_sources"]
+        sinks:   ["c.string_copy_ops"]
+    }
+}
+
+// ── Tainted size to allocation (integer overflow → small alloc → heap overflow) ─
+
+rule "cwe-787-c-tainted-alloc-size" {
+    severity: critical
+    languages: [c]
+    message: "OOB write: tainted value used as allocation size (potential integer overflow)"
+    tags: ["oob-write", "integer-overflow", "cwe-787", "cwe-190"]
+    taint {
+        sources: ["c.io_sources"]
+        sinks:   ["c.alloc_ops"]
+    }
+}

@@ -1,0 +1,18 @@
+// CWE-209: Information Exposure Through Error Messages — C
+
+sink c_output_sinks = find n: Call where
+    n.callee_name() in ["printf", "fprintf", "sprintf", "snprintf",
+                        "perror", "strerror", "send", "sendto",
+                        "write", "fwrite", "syslog"]
+
+rule "cwe-209-c-internal-info-leak" {
+    severity: medium
+    languages: [c]
+    message: "Information leak: internal state or errno exposed to output"
+    tags: ["information-leak", "cwe-209"]
+    find n: Call where
+        n.callee_name() in ["printf", "fprintf", "perror"]
+        and exists(err: Call |
+            err.callee_name() in ["strerror", "errno", "__errno_location"]
+            and err.has_ancestor(n.id()))
+}

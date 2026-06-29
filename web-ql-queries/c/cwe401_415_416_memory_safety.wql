@@ -1,0 +1,45 @@
+// CWE-401: Memory Leak / CWE-415: Double Free / CWE-416: Use After Free — C
+
+// ── CWE-415: Double free — ordered by CFG, same pointer via DFG ──────────────
+
+rule "cwe-415-c-double-free" {
+    severity: critical
+    languages: [c]
+    message: "Double free: free() called twice on the same pointer on a reachable path"
+    tags: ["double-free", "memory-safety", "cwe-415"]
+    find f1: Call, f2: Call where
+        f1.callee_name() in ["free", "cfree", "kfree", "g_free"]
+        and f2.callee_name() in ["free", "cfree", "kfree", "g_free"]
+        and f1.id() != f2.id()
+        and f1.cfg_reaches(f2)
+        and let a1 = f1.arg(0) in
+            let a2 = f2.arg(0) in
+            a1.dfg_reaches(a2)
+}
+
+// ── CWE-416: Use after free — ordered by CFG reachability ────────────────────
+
+rule "cwe-416-c-use-after-free" {
+    severity: critical
+    languages: [c]
+    message: "Use after free: pointer dereferenced after free() on a reachable path"
+    tags: ["use-after-free", "memory-safety", "cwe-416"]
+    find free_call: Call, use_node: MemberAccess where
+        free_call.callee_name() in ["free", "cfree", "kfree", "zfree", "g_free",
+                                    "av_free", "av_freep", "OPENSSL_free"]
+        and free_call.cfg_reaches(use_node)
+}
+
+// ── CWE-401: Allocation not assigned — memory discarded ──────────────────────
+
+rule "cwe-401-c-alloc-discarded" {
+    severity: high
+    languages: [c]
+    message: "Memory leak: allocation result discarded (not assigned to a variable)"
+    tags: ["memory-leak", "cwe-401"]
+    find n: Call where
+        n.callee_name() in ["malloc", "calloc", "strdup", "strndup", "realloc"]
+        and not (n.parent() matches Assign { }
+                 or n.parent() matches LocalDef { }
+                 or n.parent() matches Return { })
+}

@@ -2186,7 +2186,7 @@ pub fn enrich_cpg_with_flow(cpg: &mut Cpg) {
     cpg.call_graph = build_call_graph(&cpg.ast, Some(&maps), None);
     let (dataflow, xfile) = build_dataflow(&cpg.ast, Some(&cpg.basic_blocks), Some(&maps), None);
     cpg.dataflow = dataflow;
-    cpg.cross_file_calls = xfile;
+    cpg.workspace.cross_file_calls = xfile;
 }
 
 #[derive(Clone)]

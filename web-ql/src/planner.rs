@@ -6,9 +6,9 @@ use crate::ast::{
     SourceDef, TaintClause, TopLevelItem, TypeExpr,
 };
 use crate::ir::{
-    AstConstraint, BindingValue, CompiledClause, CompiledRule, FieldConstraint, MethodStep,
-    PlanExpr, QueryPlan, RootBinding, RuleSet, SearchPlan, SeedHint, StringMatcher,
-    TaintEndpointRef, TaintSpec,
+    AstConstraint, BindingValue, CfgPredicate, CompiledClause, CompiledRule, DfgPredicate,
+    FieldConstraint, MethodStep, PlanExpr, QueryPlan, RootBinding, RuleSet, SearchPlan,
+    SeedHint, StringMatcher, TaintEndpointRef, TaintSpec,
 };
 use crate::types::{check_method_on_type, expand_type};
 
@@ -110,7 +110,50 @@ impl Planner {
             }
         }
 
-        Ok(RuleSet::new(compiled))
+        // Third pass: compile predicate bodies for PredicateCall resolution.
+        let mut predicate_plans = HashMap::new();
+        let mut predicate_params: HashMap<String, Vec<String>> = HashMap::new();
+        let mut source_plans = HashMap::new();
+        let mut sink_plans = HashMap::new();
+        let mut sanitizer_plans = HashMap::new();
+        for (name, def) in &self.defs {
+            match def {
+                DefKind::Predicate(p) => {
+                    let mut scope = Scope::default();
+                    let param_names: Vec<String> = p.params.iter().map(|p| p.name.clone()).collect();
+                    for param in &p.params {
+                        scope.vars.insert(param.name.clone(), param.ty.clone());
+                    }
+                    if let Ok(plan) = self.compile_expr(&p.body, &scope) {
+                        predicate_plans.insert(name.clone(), plan);
+                        predicate_params.insert(name.clone(), param_names);
+                    }
+                }
+                DefKind::Source(s) => {
+                    if let Ok(plan) = self.compile_find_expr_alternatives(&s.body) {
+                        source_plans.insert(name.clone(), plan);
+                    }
+                }
+                DefKind::Sink(s) => {
+                    if let Ok(plan) = self.compile_find_expr_alternatives(&s.body) {
+                        sink_plans.insert(name.clone(), plan);
+                    }
+                }
+                DefKind::Sanitizer(s) => {
+                    if let Ok(plan) = self.compile_find_expr_alternatives(&s.body) {
+                        sanitizer_plans.insert(name.clone(), plan);
+                    }
+                }
+                DefKind::Propagator(_) => {}
+            }
+        }
+
+        Ok(RuleSet::new(compiled)
+            .with_predicate_plans(predicate_plans)
+            .with_predicate_params(predicate_params)
+            .with_source_plans(source_plans)
+            .with_sink_plans(sink_plans)
+            .with_sanitizer_plans(sanitizer_plans))
     }
 
     fn compile_rule(&self, rule: &crate::ast::Rule) -> PlanResult<CompiledRule> {
@@ -171,6 +214,40 @@ impl Planner {
             SearchPlan { root_bindings, plan, report_vars },
             hints,
         ))
+    }
+
+    /// Compile a list of `FindExpr` alternatives (from a source/sink def body) into a
+    /// single `SearchPlan`. Multiple alternatives are combined with `OrAny` over
+    /// their node sets; all bindings from each alternative are treated as candidates.
+    fn compile_find_expr_alternatives(&self, alts: &[FindExpr]) -> PlanResult<SearchPlan> {
+        if alts.is_empty() {
+            return Ok(SearchPlan {
+                root_bindings: vec![],
+                plan: QueryPlan::Literal(false),
+                report_vars: vec![],
+            });
+        }
+        if alts.len() == 1 {
+            let (sp, _) = self.compile_find_expr(&alts[0])?;
+            return Ok(sp);
+        }
+        // Multiple alternatives: compile each, then merge root bindings and combine
+        // plans with OrAny. All alternatives must share a compatible first binding name.
+        let plans: Vec<SearchPlan> = alts
+            .iter()
+            .map(|fe| self.compile_find_expr(fe).map(|(sp, _)| sp))
+            .collect::<PlanResult<_>>()?;
+
+        // Use the first alternative's root bindings as the canonical binding set.
+        let root_bindings = plans[0].root_bindings.clone();
+        let report_vars = plans[0].report_vars.clone();
+        let combined = QueryPlan::OrAny(plans.into_iter().map(|sp| sp.plan).collect());
+        Ok(SearchPlan { root_bindings, plan: combined, report_vars })
+    }
+
+    fn compile_find_expr(&self, fe: &FindExpr) -> PlanResult<(SearchPlan, Vec<SeedHint>)> {
+        let sc = SearchClause { span: fe.span, bindings: fe.bindings.clone(), condition: fe.condition.clone() };
+        self.compile_search_clause(&sc)
     }
 
     fn compile_taint_clause(&self, tc: &TaintClause) -> PlanResult<TaintSpec> {
@@ -299,8 +376,23 @@ impl Planner {
 
             ExprKind::Paren(inner) => self.compile_expr(inner, scope),
 
-            ExprKind::MethodCall { .. } => {
-                // A bare method call used as a boolean predicate
+            ExprKind::Let { var, binding, body } => {
+                let binding_pe = self.compile_plan_expr(binding, scope)?;
+                let child_scope = scope.child_with(var, TypeExpr::Node);
+                let body_plan = self.compile_expr(body, &child_scope)?;
+                Ok(QueryPlan::LetNode {
+                    var: var.clone(),
+                    expr: binding_pe,
+                    body: Box::new(body_plan),
+                })
+            }
+
+            ExprKind::MethodCall { receiver, method, args } => {
+                // Try to compile as a relational CFG/DFG predicate first.
+                if let Some(plan) = self.try_compile_relational(receiver, method, args, scope)? {
+                    return Ok(plan);
+                }
+                // Fallback: bare method call used as a boolean predicate.
                 let pe = self.compile_plan_expr(expr, scope)?;
                 Ok(QueryPlan::AstConstraint(AstConstraint {
                     lhs: pe,
@@ -309,6 +401,107 @@ impl Planner {
                 }))
             }
         }
+    }
+
+    /// Attempts to compile `receiver.method(args)` as a `CfgPredicate` or `DfgPredicate`.
+    /// Returns `Ok(None)` when the method name is not a relational predicate, so the
+    /// caller can fall through to the normal boolean-method handling.
+    fn try_compile_relational(
+        &self,
+        receiver: &Expr,
+        method: &str,
+        args: &[Expr],
+        scope: &Scope,
+    ) -> PlanResult<Option<QueryPlan>> {
+        // Receiver must be a bare scope-bound identifier.
+        let recv = match &receiver.kind {
+            ExprKind::Ident(n) => n.clone(),
+            _ => return Ok(None),
+        };
+        if scope.lookup(&recv).is_none() {
+            return Ok(None);
+        }
+
+        // Extract a scope-bound identifier from an argument expression.
+        let get_var = |expr: &Expr, label: &str| -> PlanResult<String> {
+            match &expr.kind {
+                ExprKind::Ident(n) if scope.lookup(n).is_some() => Ok(n.clone()),
+                _ => Err(PlanError::Unsupported(
+                    format!("`{method}`: argument `{label}` must be a bound variable"),
+                )),
+            }
+        };
+
+        // Extract a string literal (for DFG variable-name predicates).
+        let get_str = |expr: &Expr| -> PlanResult<String> {
+            match &expr.kind {
+                ExprKind::Literal(Literal::Str(s)) => Ok(s.clone()),
+                ExprKind::Ident(n) => Ok(n.clone()), // bare ident as var name
+                _ => Err(PlanError::Unsupported(
+                    format!("`{method}`: argument must be a string literal or identifier"),
+                )),
+            }
+        };
+
+        let plan = match (method, args.len()) {
+            // ── CFG predicates ────────────────────────────────────────────────
+            ("cfg_reaches", 1) => QueryPlan::CfgPredicate(CfgPredicate::CfgReaches {
+                a: recv,
+                b: get_var(&args[0], "to")?,
+            }),
+            ("dominates", 1) => QueryPlan::CfgPredicate(CfgPredicate::Dominates {
+                a: recv,
+                b: get_var(&args[0], "dominated")?,
+            }),
+            ("post_dominates", 1) => QueryPlan::CfgPredicate(CfgPredicate::PostDominates {
+                a: recv,
+                b: get_var(&args[0], "post_dominated")?,
+            }),
+            ("same_function", 1) => QueryPlan::CfgPredicate(CfgPredicate::SameFunction {
+                a: recv,
+                b: get_var(&args[0], "other")?,
+            }),
+            ("same_block", 1) => QueryPlan::CfgPredicate(CfgPredicate::SameBlock {
+                a: recv,
+                b: get_var(&args[0], "other")?,
+            }),
+            ("cfg_reaches_without", 2) => {
+                QueryPlan::CfgPredicate(CfgPredicate::CfgReachableWithout {
+                    from: recv,
+                    to: get_var(&args[0], "to")?,
+                    barrier: get_var(&args[1], "barrier")?,
+                })
+            }
+            ("in_loop", 0) => QueryPlan::CfgPredicate(CfgPredicate::InLoop { node: recv }),
+            ("loop_has_no_exit", 0) => {
+                QueryPlan::CfgPredicate(CfgPredicate::LoopHasNoExit { node: recv })
+            }
+            ("in_exception_path", 0) => {
+                QueryPlan::CfgPredicate(CfgPredicate::InExceptionPath { node: recv })
+            }
+
+            // ── DFG predicates ────────────────────────────────────────────────
+            ("dfg_reaches", 1) => QueryPlan::DfgPredicate(DfgPredicate::ReachesFlow {
+                from: recv,
+                to: get_var(&args[0], "to")?,
+            }),
+            ("dfg_flows_to", 1) => QueryPlan::DfgPredicate(DfgPredicate::DirectFlow {
+                from: recv,
+                to: get_var(&args[0], "to")?,
+            }),
+            ("dfg_def", 1) => QueryPlan::DfgPredicate(DfgPredicate::DfgDef {
+                var_name: get_str(&args[0])?,
+                node: recv,
+            }),
+            ("dfg_use", 1) => QueryPlan::DfgPredicate(DfgPredicate::DfgUse {
+                var_name: get_str(&args[0])?,
+                node: recv,
+            }),
+
+            _ => return Ok(None),
+        };
+
+        Ok(Some(plan))
     }
 
     fn compile_matches_pattern(

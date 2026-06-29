@@ -1,0 +1,34 @@
+// CWE-674: Uncontrolled Recursion / CWE-770: Allocation Without Limits — C
+
+// ── CWE-674: Tainted recursion depth ─────────────────────────────────────────
+
+rule "cwe-674-c-tainted-recursive-call" {
+    severity: high
+    languages: [c]
+    message: "Uncontrolled recursion: tainted value may control recursion depth"
+    tags: ["uncontrolled-recursion", "dos", "cwe-674"]
+    find n: MethodDef where
+        exists(call: Call |
+            call.callee_name() == n.name
+            and call.has_ancestor(n.id()))
+        and exists(param: ParamDef |
+            param.has_ancestor(n.id()))
+}
+
+// ── CWE-770: Allocation size from external input without limit ────────────────
+
+rule "cwe-770-c-unlimited-alloc" {
+    severity: high
+    languages: [c]
+    message: "Resource exhaustion: allocation size derived from external input without upper bound"
+    tags: ["resource-exhaustion", "dos", "cwe-770"]
+    taint {
+        sources: ["c.io_sources"]
+        sinks:   ["c.alloc_ops", "c.resource_openers"]
+        sanitizers: ["c_overflow_checks"]
+    }
+}
+
+sanitizer c_overflow_checks = find n: Call where
+    n.callee_name() in ["clamp", "min", "max", "assert", "MIN", "MAX",
+                        "__builtin_mul_overflow", "__builtin_add_overflow"]

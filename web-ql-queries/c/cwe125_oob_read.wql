@@ -1,0 +1,17 @@
+// CWE-125: Out-of-Bounds Read — C
+// Tainted index/size used in memory read operations.
+
+rule "cwe-125-c-tainted-read-size" {
+    severity: high
+    languages: [c]
+    message: "OOB read: tainted value controls read size or index"
+    tags: ["oob-read", "cwe-125"]
+    taint {
+        sources: ["c.io_sources"]
+        sinks:   ["c.bounded_copy_ops"]
+    }
+}
+
+// Subscript with tainted index is caught by the taint rule above when the
+// memory read functions are involved. Direct array[tainted_index] patterns
+// require alias-aware DFG that the engine provides via the above taint flow.

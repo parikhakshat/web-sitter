@@ -1,0 +1,33 @@
+// CWE-327: Weak Crypto — Python (hashlib, cryptography, PyCrypto)
+
+rule "cwe-327-python-weak-hash" {
+    severity: high
+    languages: [python]
+    message: "Weak hash: MD5 or SHA-1 used for security-sensitive operation"
+    tags: ["weak-crypto", "cwe-327"]
+    find n: Call where
+        n.callee_name() in ["md5", "sha1", "hashlib.md5", "hashlib.sha1",
+                            "MD5", "SHA1", "new"]
+        and n.arg(0) matches Literal { lit_kind: "String" }
+}
+
+rule "cwe-327-python-hardcoded-iv" {
+    severity: high
+    languages: [python]
+    message: "Hardcoded IV or key reduces cryptographic security"
+    tags: ["weak-crypto", "cwe-327"]
+    find n: Call where
+        n.callee_name() in ["AES.new", "DES.new", "DES3.new", "Blowfish.new",
+                            "Cipher.new", "encrypt", "decrypt"]
+        and n.arg(1) matches Literal { lit_kind: "String" }
+}
+
+rule "cwe-327-python-weak-cipher" {
+    severity: critical
+    languages: [python]
+    message: "Weak cipher: DES or RC4 used"
+    tags: ["weak-crypto", "cwe-327"]
+    find n: Call where
+        n.callee_name() in ["DES.new", "ARC4.new", "Blowfish.new",
+                            "RC4", "RC2.new"]
+}

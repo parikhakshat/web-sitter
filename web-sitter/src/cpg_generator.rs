@@ -192,8 +192,8 @@ impl CpgGenerator {
             })
             .collect();
         let mut cpg = self.generate_from_source_with_options(&source, options)?;
-        cpg.macro_aliases = orig_case_macro_aliases;
-        cpg.macro_bodies = macro_bodies;
+        cpg.c_file.macro_aliases = orig_case_macro_aliases;
+        cpg.c_file.macro_bodies = macro_bodies;
         cpg.source_file = Some(
             path.canonicalize()
                 .unwrap_or_else(|_| path.to_path_buf())
@@ -657,10 +657,7 @@ pub(crate) fn get_node_graph_artifacts(
         source_file: None,
         language: "c".to_string(),
         comments,
-        macro_aliases: BTreeMap::new(),
-        macro_bodies: BTreeMap::new(),
-        custom_allocators: BTreeMap::new(),
-        cross_file_calls: Vec::new(),
+        c_file: crate::CFileMetadata::default(),
         cpp_metadata: BTreeMap::new(),
         go_metadata: BTreeMap::new(),
         python_metadata: BTreeMap::new(),
@@ -668,11 +665,10 @@ pub(crate) fn get_node_graph_artifacts(
         js_metadata: BTreeMap::new(),
         ts_metadata: BTreeMap::new(),
         rust_metadata: BTreeMap::new(),
-        class_hierarchy: BTreeMap::new(),
-        function_summaries: BTreeMap::new(),
+        workspace: crate::WorkspaceIndex::default(),
     };
 
-    cpg.custom_allocators = collect_custom_allocators(&cpg.ast, source);
+    cpg.c_file.custom_allocators = collect_custom_allocators(&cpg.ast, source);
 
     // ── C++ metadata enrichment ───────────────────────────────────────────────
     // Populates class_context/namespace/is_constructor etc. on AstNode (backward
@@ -715,7 +711,7 @@ pub(crate) fn get_node_graph_artifacts(
             )
         };
         cpg.dataflow = dataflow;
-        cpg.cross_file_calls = xfile;
+        cpg.workspace.cross_file_calls = xfile;
     }
 
     // ── Type inference passes (after DFG so type info can use dataflow) ───────
@@ -4145,7 +4141,7 @@ mod tests {
         let source = "class Animal {}\nclass Dog extends Animal {}\n";
         let mut cpg_gen = CpgGenerator::new_for_language(SourceLanguage::Java).expect("gen");
         let cpg = cpg_gen.generate_from_source_with_options(source.as_bytes(), GraphBuildOptions::default()).expect("cpg");
-        let parents = cpg.class_hierarchy.get("Dog");
+        let parents = cpg.workspace.class_hierarchy.get("Dog");
         assert!(
             parents.map(|p| p.iter().any(|s| s == "Animal")).unwrap_or(false),
             "expected Dog → Animal in class hierarchy"
@@ -4157,7 +4153,7 @@ mod tests {
         let source = "int main(){return 0;}";
         let cpg = generate_cpg_from_code(source).expect("cpg");
         // class_hierarchy field should exist (may be empty for plain C)
-        let _ = &cpg.class_hierarchy;
+        let _ = &cpg.workspace.class_hierarchy;
     }
 
     // ── Phase 0: SehLeave lifter ────────────────────────────────────────────
@@ -4218,7 +4214,7 @@ mod tests {
         let source = "int pass(int x) { return x; }\nint main() { int v = pass(42); return v; }";
         let cpg = generate_cpg_from_code(source).expect("cpg");
         // After interprocedural analysis, pass() should have a TaintReturn summary
-        let has_summary = cpg.function_summaries.values().any(|s| {
+        let has_summary = cpg.workspace.function_summaries.values().any(|s| {
             s.param_effects.iter().any(|e| matches!(e, crate::ParamEffect::TaintReturn(_)))
         });
         assert!(has_summary, "expected interprocedural TaintReturn summary for pass()");

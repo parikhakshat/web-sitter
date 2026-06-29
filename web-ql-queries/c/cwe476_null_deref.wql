@@ -1,0 +1,53 @@
+// CWE-476: NULL Pointer Dereference — C
+
+// ── Predicate: no null check guards this dereference ─────────────────────────
+// True when there is no Conditional that (a) sees the alloc value via DFG and
+// (b) dominates the dereference — i.e., the deref is reachable without a null check.
+
+pred null_checked(alloc: Call, deref: Node) =
+    exists(nc: Conditional |
+        alloc.dfg_reaches(nc)
+        and nc.dominates(deref))
+
+// ── Allocation result dereferenced without null check on all paths ────────────
+
+rule "cwe-476-c-alloc-unchecked-deref" {
+    severity: high
+    languages: [c]
+    message: "NULL dereference: allocation result used without null check on all paths"
+    tags: ["null-dereference", "cwe-476"]
+    find alloc: Call, deref: MemberAccess where
+        alloc.callee_name() in ["malloc", "calloc", "realloc", "strdup", "strndup",
+                                "getenv", "fopen", "realpath", "strtok"]
+        and alloc.cfg_reaches(deref)
+        and not null_checked(alloc, deref)
+}
+
+// ── Allocation result immediately subscripted (alloc(...)[0]) ─────────────────
+
+rule "cwe-476-c-malloc-immediate-subscript" {
+    severity: high
+    languages: [c]
+    message: "NULL dereference: allocation result subscripted immediately without null check"
+    tags: ["null-dereference", "cwe-476"]
+    find alloc: Call, sub: Subscript where
+        alloc.callee_name() in ["malloc", "calloc", "realloc", "strdup"]
+        and alloc.cfg_reaches(sub)
+        and not null_checked(alloc, sub)
+}
+
+// ── Taint: externally controlled value flowing to pointer dereference ─────────
+
+sink c_ptr_deref_sinks = find n: MemberAccess where
+    n.raw_kind() in ["field_expression", "pointer_expression"]
+
+rule "cwe-476-c-tainted-null-deref" {
+    severity: high
+    languages: [c]
+    message: "NULL dereference: tainted value may be NULL when dereferenced"
+    tags: ["null-dereference", "cwe-476"]
+    taint {
+        sources: ["c.io_sources"]
+        sinks:   ["c_ptr_deref_sinks"]
+    }
+}

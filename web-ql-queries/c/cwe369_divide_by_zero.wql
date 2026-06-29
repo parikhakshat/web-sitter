@@ -1,0 +1,26 @@
+// CWE-369: Divide by Zero — C
+// Tainted value flows to divisor position.
+
+sink c_divisor = find n: BinaryOp where
+    n.raw_kind() in ["binary_expression", "/", "%"]
+
+rule "cwe-369-c-tainted-divisor" {
+    severity: medium
+    languages: [c]
+    message: "Divide by zero: tainted value used as divisor without zero check"
+    tags: ["divide-by-zero", "cwe-369"]
+    taint {
+        sources: ["c.io_sources"]
+        sinks:   ["c_divisor"]
+    }
+}
+
+// Direct zero literal as divisor (compile-time, less common in real bugs)
+rule "cwe-369-c-literal-zero-divisor" {
+    severity: low
+    languages: [c]
+    message: "Division by zero literal"
+    tags: ["divide-by-zero", "cwe-369"]
+    find n: Call where
+        n.arg(1) matches Literal { lit_kind: "Integer" }
+}

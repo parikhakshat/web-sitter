@@ -1,0 +1,35 @@
+// CWE-89: SQL Injection — Go (database/sql, GORM, sqlx)
+
+source go_http_input = find n: Call where
+    n.callee_name() in ["FormValue", "PostFormValue", "QueryParam",
+                        "Param", "Header", "Cookie", "URL.Query().Get",
+                        "r.URL.Query", "r.FormValue", "Getenv", "os.Getenv"]
+
+sanitizer go_sql_sanitizers = find n: Call where
+    n.callee_name() in ["db.Prepare", "sqlx.PrepareNamed", "NamedQuery",
+                        "sqlx.Named", "db.NamedExec", "sq.Eq"]
+
+rule "cwe-89-go-sql-injection" {
+    severity: critical
+    languages: [go]
+    message: "SQL injection: HTTP request data flows to SQL query"
+    tags: ["sql-injection", "injection", "cwe-89"]
+    taint {
+        sources: ["go_http_input"]
+        sinks:   ["go.sql_sinks"]
+        sanitizers: ["go_sql_sanitizers"]
+        require_interprocedural: true
+    }
+}
+
+// Fmt.Sprintf used to build SQL (structural)
+rule "cwe-89-go-sprintf-sql" {
+    severity: high
+    languages: [go]
+    message: "SQL injection risk: fmt.Sprintf used to build SQL string"
+    tags: ["sql-injection", "cwe-89"]
+    find n: Call where
+        n.callee_name() in ["Query", "QueryRow", "Exec", "QueryContext",
+                            "QueryRowContext", "ExecContext", "Raw", "Where"]
+        and not n.arg(0) matches Literal { lit_kind: "String" }
+}

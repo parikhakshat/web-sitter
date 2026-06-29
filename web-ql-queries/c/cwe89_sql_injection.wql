@@ -1,0 +1,39 @@
+// CWE-89: SQL Injection — C (embedded SQL via libpq, MySQL C API, SQLite)
+
+source c_sql_sources = find n: Call where
+    n.callee_name() in ["read", "fgets", "gets", "scanf", "getenv",
+                        "recv", "recvfrom", "getline"]
+
+sink c_sql_sinks = find n: Call where
+    n.callee_name() in ["mysql_query", "mysql_real_query", "PQexec", "PQexecParams",
+                        "sqlite3_exec", "sqlite3_prepare", "sqlite3_prepare_v2",
+                        "db_query", "sql_exec", "execute_sql"]
+
+sanitizer c_sql_san = find n: Call where
+    n.callee_name() in ["mysql_real_escape_string", "mysql_escape_string",
+                        "PQescapeLiteral", "PQescapeStringConn",
+                        "sqlite3_mprintf"]
+
+rule "cwe-89-c-sql-injection" {
+    severity: critical
+    languages: [c]
+    message: "SQL injection: tainted input flows to SQL execution"
+    tags: ["sql-injection", "injection", "cwe-89"]
+    taint {
+        sources: ["c_sql_sources"]
+        sinks:   ["c_sql_sinks"]
+        sanitizers: ["c_sql_san"]
+    }
+}
+
+// Parameter-level check: function parameter used directly in sprintf-then-sql pattern.
+// (Full composite rule requires CFG ordering — see missing-features.md)
+rule "cwe-89-c-sprintf-param" {
+    severity: high
+    languages: [c]
+    message: "SQL injection risk: function parameter passed to sprintf for SQL construction"
+    tags: ["sql-injection", "cwe-89"]
+    find n: Call where
+        n.callee_name() in ["sprintf", "snprintf"]
+        and exists(p: ParamDef | p.has_ancestor(n.function_id()))
+}

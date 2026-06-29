@@ -1,0 +1,29 @@
+// CWE-22: Path Traversal — TypeScript
+
+source ts_request_input = find n: Call where
+    n.callee_name() in ["req.query", "req.params", "req.body",
+                        "getParam", "getQuery", "getBody",
+                        "process.env", "ctx.params", "ctx.query"]
+
+sink ts_file_sinks = find n: Call where
+    n.callee_name() in ["readFile", "readFileSync", "writeFile", "writeFileSync",
+                        "createReadStream", "createWriteStream",
+                        "open", "openSync", "unlink", "unlinkSync",
+                        "join", "resolve", "sendFile", "download"]
+
+sanitizer ts_path_san = find n: Call where
+    n.callee_name() in ["path.resolve", "path.normalize", "realpath",
+                        "realpathSync", "sanitize", "sanitizePath"]
+
+rule "cwe-22-ts-path-traversal" {
+    severity: high
+    languages: [typescript]
+    message: "Path traversal: request data used in file system operation"
+    tags: ["path-traversal", "cwe-22"]
+    taint {
+        sources: ["ts_request_input"]
+        sinks:   ["ts_file_sinks"]
+        sanitizers: ["ts_path_san"]
+        require_interprocedural: true
+    }
+}

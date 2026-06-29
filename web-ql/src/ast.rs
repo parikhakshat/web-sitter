@@ -255,6 +255,13 @@ pub enum ExprKind {
         expr: Box<Expr>,
         pattern: NodePattern,
     },
+    // Let binding: bind a derived node to a name, then evaluate body with it in scope.
+    // Syntax: `let var = method_chain in body`
+    Let {
+        var: String,
+        binding: Box<Expr>, // must evaluate to a node (method chain)
+        body: Box<Expr>,
+    },
     // Primary atoms
     Ident(String),
     Literal(Literal),
@@ -335,7 +342,7 @@ pub struct SanitizerDef {
     pub span: Span,
     pub name: String,
     pub params: Vec<Param>,
-    pub body: Expr,
+    pub body: Vec<FindExpr>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

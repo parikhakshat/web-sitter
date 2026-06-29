@@ -1,0 +1,57 @@
+// CWE-835: Infinite Loop / CWE-843: Type Confusion — C
+
+// CFG-based: the loop's SCC has no exit edge to outside the loop body.
+// `in_loop()` finds any node inside a loop; `loop_has_no_exit()` confirms
+// that every block in the loop's SCC only has successors also inside the SCC.
+rule "cwe-835-c-cfg-no-exit-loop" {
+    severity: high
+    languages: [c]
+    message: "Infinite loop: CFG analysis shows the loop body has no reachable exit"
+    tags: ["infinite-loop", "dos", "cwe-835"]
+    find n: Loop where
+        n.in_loop()
+        and n.loop_has_no_exit()
+}
+
+// AST fallback: literal-true loop with no break/return/exit call descendant.
+rule "cwe-835-c-unconditional-loop" {
+    severity: medium
+    languages: [c]
+    message: "Infinite loop: loop has no apparent exit condition (literal true)"
+    tags: ["infinite-loop", "dos", "cwe-835"]
+    find n: Loop where
+        n.raw_kind() in ["while_statement", "for_statement", "do_statement"]
+        and not exists(brk: Stmt | brk.raw_kind() == "break_statement" and brk.has_ancestor(n.id()))
+        and not exists(ret: Return | ret.has_ancestor(n.id()))
+        and not exists(call: Call |
+            call.callee_name() in ["exit", "abort", "_exit", "longjmp"]
+            and call.has_ancestor(n.id()))
+}
+
+// ── CWE-843: Type Confusion — C (void* cast without type check) ───────────────
+
+rule "cwe-843-c-void-ptr-cast" {
+    severity: high
+    languages: [c]
+    message: "Type confusion: void pointer cast to concrete type without size/alignment check"
+    tags: ["type-confusion", "cwe-843"]
+    find n: Cast where
+        exists(p: MemberAccess | p.raw_kind() == "type_cast"
+               and p.has_ancestor(n.id()))
+        and n.parent() matches Call { }
+}
+
+// Tainted data cast to function pointer (arbitrary code execution risk)
+rule "cwe-843-c-tainted-funcptr-cast" {
+    severity: critical
+    languages: [c]
+    message: "Type confusion: tainted value cast to function pointer"
+    tags: ["type-confusion", "cwe-843"]
+    taint {
+        sources: ["c.io_sources"]
+        sinks:   ["c_funcptr_cast_sinks"]
+    }
+}
+
+sink c_funcptr_cast_sinks = find n: Cast where
+    n.raw_kind() in ["type_cast", "cast_expression"]

@@ -253,3 +253,58 @@ pub fn branching_cfg_cpg() -> (Cpg, NodeId) {
     );
     (cpg, FN_ID)
 }
+
+/// A CPG with a loop that has an exit edge (a normal finite loop).
+/// Layout: bb0(entry) → bb1(header) → bb2(body) → bb1 (back), bb1 → bb3(exit)
+/// Returns (cpg, fn_id, header_node_id, body_node_id, exit_node_id)
+pub fn loop_with_exit_cpg() -> (Cpg, NodeId, NodeId, NodeId, NodeId) {
+    const FN_ID: NodeId = 50;
+    const N_ENTRY: NodeId = 51;
+    const N_HEADER: NodeId = 52;
+    const N_BODY: NodeId = 53;
+    const N_EXIT: NodeId = 54;
+
+    let fn_node = make_node(FN_ID, IrNodeKind::MethodDef, Some("loop_with_exit_fn"));
+    let n_entry = make_node_in_fn(N_ENTRY, IrNodeKind::Assign, Some("init"), FN_ID);
+    let n_header = make_node_in_fn(N_HEADER, IrNodeKind::Conditional, None, FN_ID);
+    let n_body = make_node_in_fn(N_BODY, IrNodeKind::Assign, Some("body"), FN_ID);
+    let n_exit = make_node_in_fn(N_EXIT, IrNodeKind::Return, None, FN_ID);
+
+    let cpg = make_cpg_with_blocks(
+        vec![(FN_ID, fn_node), (N_ENTRY, n_entry), (N_HEADER, n_header), (N_BODY, n_body), (N_EXIT, n_exit)],
+        FN_ID,
+        vec![
+            ("bb0", vec![N_ENTRY],  vec!["bb1"]),
+            ("bb1", vec![N_HEADER], vec!["bb2", "bb3"]), // header → body or exit
+            ("bb2", vec![N_BODY],   vec!["bb1"]),         // back edge
+            ("bb3", vec![N_EXIT],   vec![]),
+        ],
+    );
+    (cpg, FN_ID, N_HEADER, N_BODY, N_EXIT)
+}
+
+/// A CPG with an infinite loop — no exit edge out of the loop SCC.
+/// Layout: bb0(entry) → bb1(header) → bb2(body) → bb1 (back edge only)
+/// Returns (cpg, fn_id, header_node_id, body_node_id)
+pub fn loop_no_exit_cpg() -> (Cpg, NodeId, NodeId, NodeId) {
+    const FN_ID: NodeId = 60;
+    const N_ENTRY: NodeId = 61;
+    const N_HEADER: NodeId = 62;
+    const N_BODY: NodeId = 63;
+
+    let fn_node = make_node(FN_ID, IrNodeKind::MethodDef, Some("loop_no_exit_fn"));
+    let n_entry = make_node_in_fn(N_ENTRY, IrNodeKind::Assign, Some("init"), FN_ID);
+    let n_header = make_node_in_fn(N_HEADER, IrNodeKind::Conditional, None, FN_ID);
+    let n_body = make_node_in_fn(N_BODY, IrNodeKind::Assign, Some("body"), FN_ID);
+
+    let cpg = make_cpg_with_blocks(
+        vec![(FN_ID, fn_node), (N_ENTRY, n_entry), (N_HEADER, n_header), (N_BODY, n_body)],
+        FN_ID,
+        vec![
+            ("bb0", vec![N_ENTRY],  vec!["bb1"]),
+            ("bb1", vec![N_HEADER], vec!["bb2"]), // header → body only (no exit)
+            ("bb2", vec![N_BODY],   vec!["bb1"]), // back edge
+        ],
+    );
+    (cpg, FN_ID, N_HEADER, N_BODY)
+}

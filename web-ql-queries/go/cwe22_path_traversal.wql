@@ -1,0 +1,32 @@
+// CWE-22: Path Traversal — Go
+
+source go_http_input = find n: Call where
+    n.callee_name() in ["FormValue", "QueryParam", "Param",
+                        "r.FormValue", "r.URL.Query", "Header",
+                        "Getenv", "os.Getenv"]
+
+sink go_file_sinks = find n: Call where
+    n.callee_name() in ["os.Open", "os.OpenFile", "os.Create",
+                        "os.Remove", "os.Rename", "ioutil.ReadFile",
+                        "ioutil.WriteFile", "ioutil.ReadDir",
+                        "os.ReadFile", "os.WriteFile",
+                        "filepath.Join", "http.ServeFile",
+                        "zip.OpenReader", "tar.NewReader"]
+
+sanitizer go_path_san = find n: Call where
+    n.callee_name() in ["filepath.Clean", "filepath.Abs",
+                        "path.Clean", "filepath.EvalSymlinks",
+                        "path.Base", "filepath.Base"]
+
+rule "cwe-22-go-path-traversal" {
+    severity: high
+    languages: [go]
+    message: "Path traversal: HTTP request data used in file operation"
+    tags: ["path-traversal", "cwe-22"]
+    taint {
+        sources: ["go_http_input"]
+        sinks:   ["go_file_sinks", "go.file_sinks"]
+        sanitizers: ["go_path_san"]
+        require_interprocedural: true
+    }
+}

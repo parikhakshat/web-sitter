@@ -1,0 +1,31 @@
+// CWE-89: SQL Injection — JavaScript / Node.js
+
+source js_req_input = find n: Call where
+    n.callee_name() in ["req.query", "req.params", "req.body",
+                        "req.headers", "req.cookies",
+                        "req.query.get", "URLSearchParams.get"]
+
+rule "cwe-89-js-sql-injection" {
+    severity: critical
+    languages: [javascript]
+    message: "SQL injection: HTTP request data flows to database query"
+    tags: ["sql-injection", "injection", "cwe-89"]
+    taint {
+        sources: ["js_req_input"]
+        sinks:   ["js.db_sinks"]
+        require_interprocedural: true
+        max_call_depth: 5
+    }
+}
+
+// Template literal in SQL call (structural)
+rule "cwe-89-js-template-literal-sql" {
+    severity: high
+    languages: [javascript]
+    message: "SQL injection risk: template literal used as SQL argument"
+    tags: ["sql-injection", "cwe-89"]
+    find n: Call where
+        n.callee_name() in ["query", "execute", "run", "get", "all",
+                            "rawQuery", "exec", "raw"]
+        and n.arg(0) matches TemplateStr { }
+}

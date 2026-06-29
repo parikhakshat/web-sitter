@@ -13,6 +13,7 @@ use web_ql::{
     cfg::FunctionCfg,
     taint::EndpointRegistry,
     finding::Finding,
+    loader::compile_rules,
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -52,6 +53,7 @@ fn run_rule(rule: CompiledRule, cpg: &web_sitter::Cpg) -> Vec<Finding> {
     let summaries: HashMap<String, web_sitter::FunctionSummary> = HashMap::new();
     let registry = empty_registry();
     let predicate_plans: HashMap<String, QueryPlan> = HashMap::new();
+    let predicate_params: HashMap<String, Vec<String>> = HashMap::new();
     let ctx = EvalContext {
         cpg,
         dfg: &dfg,
@@ -59,6 +61,8 @@ fn run_rule(rule: CompiledRule, cpg: &web_sitter::Cpg) -> Vec<Finding> {
         summaries: &summaries,
         registry: &registry,
         predicate_plans: &predicate_plans,
+        predicate_params: &predicate_params,
+        cross_file: None,
     };
     let runner = RuleRunner::new(ctx);
     let rule_set = RuleSet::new(vec![rule]);
@@ -347,6 +351,101 @@ fn dfg_predicate_direct_flow() {
     assert!(has_src_mid, "direct edge from source (10) to mid (11) should be found");
 }
 
+// ── let binding ──────────────────────────────────────────────────────────────
+
+#[test]
+fn let_node_binds_derived_node_for_relational_predicate() {
+    // CPG: call_outer (id=30) has arg call_arg (id=31); call_arg has DFG edge to sink (id=32).
+    // Rule: find n: Call where let arg = n.arg(0) in arg.dfg_flows_to(sink_node)
+    // with a second root binding sink_node: Call. Expect to find the pair.
+    const OUTER: u32 = 30;
+    const ARG: u32 = 31;
+    const SINK: u32 = 32;
+
+    let outer = make_call_node(OUTER, "free", vec![ARG]);
+    let arg = make_call_node(ARG, "get_ptr", vec![]);
+    let sink_node = make_call_node(SINK, "use_ptr", vec![]);
+
+    let cpg = make_cpg_with_dfg(
+        vec![(OUTER, outer), (ARG, arg), (SINK, sink_node)],
+        vec![(ARG, SINK, "ptr")],
+    );
+
+    // Hand-build the plan: find n: Call, m: Call where let arg = n.arg(0) in arg.dfg_flows_to(m)
+    let plan = QueryPlan::LetNode {
+        var: "arg".to_owned(),
+        expr: PlanExpr::MethodChain {
+            receiver: Box::new(PlanExpr::Var("n".to_owned())),
+            steps: vec![MethodStep {
+                method: "arg".to_owned(),
+                args: vec![PlanExpr::Lit(Literal::Int(0))],
+            }],
+        },
+        body: Box::new(QueryPlan::DfgPredicate(DfgPredicate::DirectFlow {
+            from: "arg".to_owned(),
+            to: "m".to_owned(),
+        })),
+    };
+
+    let rule = CompiledRule {
+        id: "let-dfg".to_owned(),
+        severity: Some(Severity::High),
+        message: Some("let binding test".to_owned()),
+        tags: vec![],
+        languages: None,
+        seed_hints: vec![],
+        clauses: vec![CompiledClause::Search(SearchPlan {
+            root_bindings: vec![
+                root_binding("n", vec![IrNodeKind::Call]),
+                root_binding("m", vec![IrNodeKind::Call]),
+            ],
+            plan,
+            report_vars: vec!["n".to_owned(), "m".to_owned()],
+        })],
+    };
+
+    let findings = run_rule(rule, &cpg);
+    assert!(!findings.is_empty(), "let binding should enable arg-to-sink DFG check");
+    let has_outer_sink = findings.iter().any(|f| {
+        f.matched_nodes.contains(&OUTER) && f.matched_nodes.contains(&SINK)
+    });
+    assert!(has_outer_sink, "outer call (30) and sink (32) should be matched via let arg = n.arg(0)");
+}
+
+#[test]
+fn let_node_false_when_binding_resolves_to_non_node() {
+    // Binding resolves to a string (callee_name), not a node — should return false.
+    let (cpg, call_id) = simple_call_cpg();
+    let plan = QueryPlan::LetNode {
+        var: "x".to_owned(),
+        expr: PlanExpr::MethodChain {
+            receiver: Box::new(PlanExpr::Var("n".to_owned())),
+            steps: vec![MethodStep { method: "callee_name".to_owned(), args: vec![] }],
+        },
+        body: Box::new(QueryPlan::Literal(true)),
+    };
+    let rule = search_rule("let-non-node", vec![IrNodeKind::Call], plan);
+    let findings = run_rule(rule, &cpg);
+    assert!(findings.is_empty(), "let binding to a string (callee_name) should not match");
+    let _ = call_id;
+}
+
+#[test]
+fn let_node_compiles_from_wql() {
+    // Verify the full parser → planner pipeline for let syntax.
+    let src = r#"
+rule "let-test" {
+    severity: high
+    find n: Call, m: Call where
+        n.callee_name() == "free"
+        and let arg = n.arg(0) in arg.dfg_reaches(m)
+}
+"#;
+    let rs = compile_rules(src).expect("let syntax should compile");
+    assert_eq!(rs.rules.len(), 1);
+    assert!(!rs.rules[0].clauses.is_empty());
+}
+
 // ── Language filter ───────────────────────────────────────────────────────────
 
 #[test]
@@ -439,6 +538,7 @@ fn run_multiple_rules_all_findings_collected() {
     let summaries = HashMap::new();
     let registry = empty_registry();
     let predicate_plans = HashMap::new();
+    let predicate_params: HashMap<String, Vec<String>> = HashMap::new();
     let ctx = EvalContext {
         cpg: &cpg,
         dfg: &dfg,
@@ -446,6 +546,8 @@ fn run_multiple_rules_all_findings_collected() {
         summaries: &summaries,
         registry: &registry,
         predicate_plans: &predicate_plans,
+        predicate_params: &predicate_params,
+        cross_file: None,
     };
     let runner = RuleRunner::new(ctx);
     let rule_set = RuleSet::new(vec![
@@ -467,6 +569,7 @@ fn empty_rule_set_returns_no_findings() {
     let summaries = HashMap::new();
     let registry = empty_registry();
     let predicate_plans = HashMap::new();
+    let predicate_params: HashMap<String, Vec<String>> = HashMap::new();
     let ctx = EvalContext {
         cpg: &cpg,
         dfg: &dfg,
@@ -474,6 +577,8 @@ fn empty_rule_set_returns_no_findings() {
         summaries: &summaries,
         registry: &registry,
         predicate_plans: &predicate_plans,
+        predicate_params: &predicate_params,
+        cross_file: None,
     };
     let runner = RuleRunner::new(ctx);
     let rule_set = RuleSet::new(vec![]);
@@ -490,6 +595,7 @@ fn run_rule_with_cfg(rule: CompiledRule, cpg: &web_sitter::Cpg, fn_id: u32) -> V
     let summaries: HashMap<String, web_sitter::FunctionSummary> = HashMap::new();
     let registry = EndpointRegistry::new();
     let predicate_plans: HashMap<String, QueryPlan> = HashMap::new();
+    let predicate_params: HashMap<String, Vec<String>> = HashMap::new();
     let ctx = EvalContext {
         cpg,
         dfg: &dfg,
@@ -497,6 +603,8 @@ fn run_rule_with_cfg(rule: CompiledRule, cpg: &web_sitter::Cpg, fn_id: u32) -> V
         summaries: &summaries,
         registry: &registry,
         predicate_plans: &predicate_plans,
+        predicate_params: &predicate_params,
+        cross_file: None,
     };
     let runner = RuleRunner::new(ctx);
     let rule_set = RuleSet::new(vec![rule]);
@@ -731,6 +839,7 @@ fn cfg_reachable_without_blocked_single_path() {
     let summaries: HashMap<String, web_sitter::FunctionSummary> = HashMap::new();
     let registry = EndpointRegistry::new();
     let predicate_plans: HashMap<String, QueryPlan> = HashMap::new();
+    let predicate_params: HashMap<String, Vec<String>> = HashMap::new();
     let ctx = EvalContext {
         cpg: &cpg,
         dfg: &dfg,
@@ -738,6 +847,8 @@ fn cfg_reachable_without_blocked_single_path() {
         summaries: &summaries,
         registry: &registry,
         predicate_plans: &predicate_plans,
+        predicate_params: &predicate_params,
+        cross_file: None,
     };
 
     // When we block the Assign (barrier) node, Call cannot reach Return.

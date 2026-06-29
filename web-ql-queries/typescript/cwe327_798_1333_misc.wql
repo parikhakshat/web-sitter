@@ -1,0 +1,60 @@
+// CWE-327: Weak Crypto / CWE-798: Hardcoded Credentials / CWE-1333: ReDoS — TypeScript
+
+// ── CWE-327: Angular unsafe bypass (XSS via DOM) ─────────────────────────────
+
+rule "cwe-327-ts-angular-bypass" {
+    severity: critical
+    languages: [typescript]
+    message: "Angular security bypass: unsafe DOM sanitization"
+    tags: ["xss", "dom-xss", "cwe-327"]
+    find n: Call where
+        n.callee_name() in ["bypassSecurityTrustHtml", "bypassSecurityTrustScript",
+                            "bypassSecurityTrustStyle", "bypassSecurityTrustUrl",
+                            "bypassSecurityTrustResourceUrl"]
+}
+
+// ── CWE-798: Hardcoded credentials in TypeScript ──────────────────────────────
+
+rule "cwe-798-ts-hardcoded-credential" {
+    severity: critical
+    languages: [typescript]
+    message: "Hardcoded credential in TypeScript variable or field"
+    tags: ["hardcoded-credentials", "cwe-798"]
+    find n: LocalDef where
+        n.name in ["password", "passwd", "secret", "apiKey", "api_key",
+                   "privateKey", "token", "authToken", "accessToken",
+                   "jwtSecret", "jwtKey", "secretKey", "clientSecret"]
+        and exists(lit: Literal | lit.has_ancestor(n.id()))
+}
+
+rule "cwe-798-ts-hardcoded-field" {
+    severity: critical
+    languages: [typescript]
+    message: "Hardcoded credential in class field"
+    tags: ["hardcoded-credentials", "cwe-798"]
+    find n: FieldDef where
+        n.name in ["password", "secret", "apiKey", "privateKey",
+                   "authToken", "jwtSecret", "clientSecret"]
+        and exists(lit: Literal | lit.has_ancestor(n.id()))
+}
+
+// ── CWE-1333: ReDoS ──────────────────────────────────────────────────────────
+
+source ts_req_input = find n: Call where
+    n.callee_name() in ["req.query", "req.params", "req.body",
+                        "getParam", "getQuery", "ctx.query"]
+
+sink ts_regex_sinks = find n: Call where
+    n.callee_name() in ["test", "exec", "match", "matchAll",
+                        "replace", "replaceAll", "search", "split"]
+
+rule "cwe-1333-ts-redos" {
+    severity: high
+    languages: [typescript]
+    message: "ReDoS: user-controlled input used in regex operation"
+    tags: ["redos", "dos", "cwe-1333"]
+    taint {
+        sources: ["ts_req_input"]
+        sinks:   ["ts_regex_sinks"]
+    }
+}

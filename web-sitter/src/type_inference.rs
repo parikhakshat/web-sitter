@@ -770,7 +770,7 @@ pub(crate) fn build_class_hierarchy(cpg: &mut Cpg) {
     }
 
     for (child, parents) in pairs {
-        cpg.class_hierarchy.entry(child).or_default().extend(parents);
+        cpg.workspace.class_hierarchy.entry(child).or_default().extend(parents);
     }
 }
 
@@ -787,7 +787,7 @@ pub(crate) fn build_class_hierarchy_rust(cpg: &mut Cpg) {
         let self_type = cpg.rust_metadata.get(&id).and_then(|m| m.self_type.clone());
         let trait_type = cpg.rust_metadata.get(&id).and_then(|m| m.trait_type.clone());
         if let (Some(self_t), Some(trait_t)) = (self_type, trait_type) {
-            cpg.class_hierarchy.entry(self_t).or_default().push(trait_t);
+            cpg.workspace.class_hierarchy.entry(self_t).or_default().push(trait_t);
         }
     }
 
@@ -812,7 +812,7 @@ pub(crate) fn build_class_hierarchy_rust(cpg: &mut Cpg) {
             parents.extend(meta.implements_types.iter().cloned());
         }
         if !parents.is_empty() {
-            cpg.class_hierarchy.entry(name).or_default().extend(parents);
+            cpg.workspace.class_hierarchy.entry(name).or_default().extend(parents);
         }
     }
 }

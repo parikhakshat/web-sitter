@@ -1,0 +1,17 @@
+// CWE-22: Path Traversal — C / POSIX
+
+sanitizer c_path_san = find n: Call where
+    n.callee_name() in ["realpath", "canonicalize_file_name",
+                        "pathconf", "basename", "dirname"]
+
+rule "cwe-22-c-path-traversal" {
+    severity: high
+    languages: [c]
+    message: "Path traversal: user-controlled input used in file operation without sanitization"
+    tags: ["path-traversal", "cwe-22"]
+    taint {
+        sources: ["c.io_sources"]
+        sinks:   ["c.file_ops"]
+        sanitizers: ["c_path_san", "c.path_sanitizers"]
+    }
+}

@@ -1,0 +1,23 @@
+// CWE-78: OS Command Injection — Java
+
+rule "cwe-78-java-command-injection" {
+    severity: critical
+    languages: [java]
+    message: "OS command injection: HTTP request data reaches Runtime.exec or ProcessBuilder"
+    tags: ["command-injection", "injection", "cwe-78"]
+    taint {
+        sources: ["java.http_sources"]
+        sinks:   ["java.exec_sinks"]
+    }
+}
+
+// Varargs exec with tainted array
+rule "cwe-78-java-runtime-exec" {
+    severity: critical
+    languages: [java]
+    message: "OS command injection: direct use of Runtime.exec with non-literal argument"
+    tags: ["command-injection", "cwe-78"]
+    find n: Call where
+        n.callee_name() in ["exec", "start"]
+        and not n.arg(0) matches Literal { lit_kind: "String" }
+}

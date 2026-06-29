@@ -1,0 +1,73 @@
+// CWE-327: Weak Crypto / CWE-798: Hardcoded Credentials / CWE-1333: ReDoS — JavaScript
+
+// ── CWE-327: Weak hash or cipher ─────────────────────────────────────────────
+
+rule "cwe-327-js-weak-hash" {
+    severity: high
+    languages: [javascript]
+    message: "Weak hash: MD5 or SHA-1 used via crypto.createHash"
+    tags: ["weak-crypto", "cwe-327"]
+    find n: Call where
+        n.callee_name() in ["createHash", "createHmac"]
+        and n.arg(0) matches Literal { lit_kind: "String" }
+}
+
+rule "cwe-327-js-webcrypto-weak-algo" {
+    severity: high
+    languages: [javascript]
+    message: "Weak algorithm specified in Web Crypto API"
+    tags: ["weak-crypto", "cwe-327"]
+    find n: Call where
+        n.callee_name() in ["subtle.digest", "subtle.encrypt",
+                            "subtle.decrypt", "subtle.sign", "subtle.verify",
+                            "digest", "encrypt", "decrypt"]
+        and n.arg(0) matches Literal { lit_kind: "String" }
+}
+
+// ── CWE-798: Hardcoded credentials ───────────────────────────────────────────
+
+rule "cwe-798-js-hardcoded-var" {
+    severity: critical
+    languages: [javascript]
+    message: "Hardcoded credential in variable"
+    tags: ["hardcoded-credentials", "cwe-798"]
+    find n: LocalDef where
+        n.name in ["password", "passwd", "secret", "apiKey", "api_key",
+                   "privateKey", "token", "authToken", "accessToken",
+                   "dbPassword", "secretKey", "clientSecret"]
+        and exists(lit: Literal | lit.has_ancestor(n.id()))
+}
+
+// ── CWE-1333: ReDoS ──────────────────────────────────────────────────────────
+
+source js_input = find n: Call where
+    n.callee_name() in ["req.query", "req.params", "req.body",
+                        "req.headers", "process.env",
+                        "readline.question", "prompt"]
+
+sink js_regex_sinks = find n: Call where
+    n.callee_name() in ["test", "exec", "match", "matchAll",
+                        "replace", "replaceAll", "search", "split"]
+
+rule "cwe-1333-js-redos" {
+    severity: high
+    languages: [javascript]
+    message: "ReDoS: user-controlled input used in regex operation"
+    tags: ["redos", "dos", "cwe-1333"]
+    taint {
+        sources: ["js_input"]
+        sinks:   ["js_regex_sinks"]
+    }
+}
+
+// eval with user input
+rule "cwe-95-js-eval-injection" {
+    severity: critical
+    languages: [javascript]
+    message: "Code injection: user input passed to eval()"
+    tags: ["code-injection", "eval", "cwe-95"]
+    taint {
+        sources: ["js_input"]
+        sinks:   ["js.eval_sinks"]
+    }
+}

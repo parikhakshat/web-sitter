@@ -343,6 +343,51 @@ impl FunctionCfg {
         false
     }
 
+    /// Walk up the dominator chain from `block` to find the innermost enclosing
+    /// loop header — a block that has a predecessor it dominates (back edge).
+    fn find_loop_header(&self, block: BlockId) -> Option<BlockId> {
+        let mut current = block;
+        loop {
+            for &pred in &self.preds[current as usize] {
+                if self.dom.dominates(current, pred) {
+                    return Some(current);
+                }
+            }
+            let idom = self.dom.idom[current as usize];
+            if idom == current {
+                break;
+            }
+            current = idom;
+        }
+        None
+    }
+
+    /// True if `node` is inside a loop whose strongly-connected component has
+    /// no exit edge to outside the loop body (i.e., infinite loop with no break/return).
+    pub fn node_loop_has_no_exit(&self, node: NodeId) -> bool {
+        let Some(&block) = self.node_to_block.get(&node) else { return false };
+        let n = self.succs.len();
+        let Some(header) = self.find_loop_header(block) else { return false };
+        // Loop SCC: blocks that can reach header AND are reachable from header
+        let in_scc = |b: u32| -> bool {
+            (b as usize) < n
+                && self.reach.can_reach(header, b)
+                && self.reach.can_reach(b, header)
+        };
+        // If any block in the SCC has a normal successor outside the SCC, the loop has an exit
+        for b in 0..n as u32 {
+            if !in_scc(b) {
+                continue;
+            }
+            for &succ in &self.succs[b as usize] {
+                if !in_scc(succ) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     /// True if `node` is on an exception-handling path.
     pub fn node_in_exception_path(&self, node: NodeId) -> bool {
         let Some(&block) = self.node_to_block.get(&node) else { return false };

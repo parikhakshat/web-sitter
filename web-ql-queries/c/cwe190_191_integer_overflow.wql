@@ -1,0 +1,48 @@
+// CWE-190: Integer Overflow / CWE-191: Integer Underflow — C
+
+// ── Tainted value used as allocation size (classic wraparound → heap overflow) ─
+
+rule "cwe-190-c-tainted-alloc-size" {
+    severity: critical
+    languages: [c]
+    message: "Integer overflow: tainted value flows to allocation size"
+    tags: ["integer-overflow", "cwe-190"]
+    taint {
+        sources: ["c.io_sources"]
+        sinks:   ["c.alloc_ops"]
+        sanitizers: ["c_overflow_checks"]
+    }
+}
+
+sanitizer c_overflow_checks = find n: Call where
+    n.callee_name() in ["__builtin_mul_overflow", "__builtin_add_overflow",
+                        "__builtin_umul_overflow", "__builtin_uadd_overflow",
+                        "checked_mul", "checked_add", "clamp", "assert",
+                        "safe_mult", "overflow_check"]
+
+// ── Tainted value used as memcpy length (overflow → buffer copy overflow) ──────
+
+rule "cwe-190-c-tainted-copy-len" {
+    severity: critical
+    languages: [c]
+    message: "Integer overflow: tainted length used in copy operation"
+    tags: ["integer-overflow", "buffer-overflow", "cwe-190"]
+    taint {
+        sources: ["c.io_sources"]
+        sinks:   ["c.string_copy_ops", "c.bounded_copy_ops"]
+        sanitizers: ["c_overflow_checks"]
+    }
+}
+
+// ── String-to-integer conversion from external input ─────────────────────────
+
+rule "cwe-190-c-string-to-int-taint" {
+    severity: high
+    languages: [c]
+    message: "Integer overflow risk: external string converted to integer without range check"
+    tags: ["integer-overflow", "cwe-190"]
+    taint {
+        sources: ["c.io_sources"]
+        sinks:   ["c.string_to_int"]
+    }
+}

@@ -1,0 +1,44 @@
+// CWE-78: OS Command Injection — Python
+
+source py_user_input = find n: Call where
+    n.callee_name() in ["input", "raw_input", "sys.argv", "request.args.get",
+                        "request.form.get", "request.json.get", "request.get_json",
+                        "os.environ.get", "environ.get"]
+
+sink py_exec_sinks = find n: Call where
+    n.callee_name() in ["os.system", "system", "os.popen", "popen",
+                        "subprocess.call", "subprocess.run", "subprocess.Popen",
+                        "Popen", "check_call", "check_output",
+                        "commands.getoutput", "commands.getstatusoutput",
+                        "pty.spawn", "execv", "execve"]
+
+sanitizer py_shell_false = find n: Call where
+    n.callee_name() in ["subprocess.run", "subprocess.call",
+                        "subprocess.Popen", "Popen"]
+    and n.arg(1) matches Literal { lit_kind: "Bool" }
+
+rule "cwe-78-python-command-injection" {
+    severity: critical
+    languages: [python]
+    message: "OS command injection: user input reaches shell execution"
+    tags: ["command-injection", "injection", "cwe-78"]
+    taint {
+        sources: ["py_user_input"]
+        sinks:   ["py_exec_sinks"]
+        sanitizers: ["py_shell_false"]
+        require_interprocedural: true
+        max_call_depth: 5
+    }
+}
+
+// shell=True with any non-literal command
+rule "cwe-78-python-shell-true" {
+    severity: critical
+    languages: [python]
+    message: "OS command injection: subprocess called with shell=True"
+    tags: ["command-injection", "cwe-78"]
+    find n: Call where
+        n.callee_name() in ["subprocess.run", "subprocess.call",
+                            "subprocess.Popen", "Popen", "check_call", "check_output"]
+        and not n.arg(0) matches Literal { lit_kind: "String" }
+}

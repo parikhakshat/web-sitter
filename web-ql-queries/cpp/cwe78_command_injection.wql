@@ -1,0 +1,25 @@
+// CWE-78: OS Command Injection — C++
+
+rule "cwe-78-cpp-command-injection" {
+    severity: critical
+    languages: [cpp]
+    message: "OS command injection: tainted input reaches command execution"
+    tags: ["command-injection", "cwe-78"]
+    taint {
+        sources: ["c.io_sources"]
+        sinks:   ["c.exec_ops", "cpp.exec_ops"]
+        sanitizers: ["c.command_sanitizers"]
+    }
+}
+
+// std::system with tainted string argument
+rule "cwe-78-cpp-system-taint" {
+    severity: critical
+    languages: [cpp]
+    message: "OS command injection via std::system"
+    tags: ["command-injection", "cwe-78"]
+    find n: Call where
+        n.callee_name() in ["system", "popen", "ShellExecute",
+                            "ShellExecuteEx", "WinExec", "CreateProcess"]
+        and not n.arg(0) matches Literal { lit_kind: "String" }
+}

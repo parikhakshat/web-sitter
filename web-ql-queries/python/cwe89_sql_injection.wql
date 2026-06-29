@@ -1,0 +1,40 @@
+// CWE-89: SQL Injection — Python (sqlite3, psycopg2, SQLAlchemy, Django ORM)
+
+source py_request_input = find n: Call where
+    n.callee_name() in ["input", "raw_input",
+                        "request.args.get", "request.form.get",
+                        "request.json.get", "request.GET.get", "request.POST.get",
+                        "os.environ.get"]
+
+sink py_sql_sinks = find n: Call where
+    n.callee_name() in ["execute", "executemany", "executescript",
+                        "raw", "extra", "RawSQL", "cursor.execute",
+                        "engine.execute", "session.execute"]
+
+sanitizer py_sql_params = find n: Call where
+    n.callee_name() in ["text", "bindparam", "quote_ident"]
+
+rule "cwe-89-python-sql-injection" {
+    severity: critical
+    languages: [python]
+    message: "SQL injection: user input flows to SQL execute call"
+    tags: ["sql-injection", "injection", "cwe-89"]
+    taint {
+        sources: ["py_request_input"]
+        sinks:   ["py_sql_sinks"]
+        sanitizers: ["py_sql_params"]
+        require_interprocedural: true
+        max_call_depth: 5
+    }
+}
+
+// f-string or %-format in execute argument (structural)
+rule "cwe-89-python-format-sql" {
+    severity: high
+    languages: [python]
+    message: "SQL injection risk: string formatting in SQL execute argument"
+    tags: ["sql-injection", "cwe-89"]
+    find n: Call where
+        n.callee_name() in ["execute", "executemany"]
+        and not n.arg(0) matches Literal { lit_kind: "String" }
+}

@@ -1,0 +1,29 @@
+// CWE-78: OS Command Injection — JavaScript / Node.js
+
+source js_user_input = find n: Call where
+    n.callee_name() in ["req.query", "req.params", "req.body",
+                        "req.headers", "req.cookies",
+                        "process.env", "argv", "readFileSync",
+                        "readline.createInterface"]
+
+rule "cwe-78-js-command-injection" {
+    severity: critical
+    languages: [javascript]
+    message: "OS command injection: request data flows to exec/spawn"
+    tags: ["command-injection", "injection", "cwe-78"]
+    taint {
+        sources: ["js_user_input"]
+        sinks:   ["js.exec_sinks"]
+    }
+}
+
+rule "cwe-78-js-exec-non-literal" {
+    severity: critical
+    languages: [javascript]
+    message: "OS command injection: exec/spawn called with non-literal argument"
+    tags: ["command-injection", "cwe-78"]
+    find n: Call where
+        n.callee_name() in ["exec", "execSync", "spawn", "spawnSync",
+                            "execFile", "execFileSync", "fork"]
+        and not n.arg(0) matches Literal { lit_kind: "String" }
+}

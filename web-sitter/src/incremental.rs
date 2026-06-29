@@ -411,10 +411,10 @@ impl IncrementalCpgGenerator {
         // Merge newly discovered cross-file calls, deduplicating by call_node.
         {
             let existing: rustc_hash::FxHashSet<u32> =
-                cpg.cross_file_calls.iter().map(|e| e.call_node).collect();
+                cpg.workspace.cross_file_calls.iter().map(|e| e.call_node).collect();
             for edge in new_xfile {
                 if !existing.contains(&edge.call_node) {
-                    cpg.cross_file_calls.push(edge);
+                    cpg.workspace.cross_file_calls.push(edge);
                 }
             }
         }
@@ -1086,10 +1086,11 @@ impl IncrementalCpgGenerator {
             source_file: self.state.source_file.clone(),
             language: old_cpg.language.clone(),
             comments: updated_comments,
-            macro_aliases: cpg_macro_aliases,
-            macro_bodies: cpg_macro_bodies,
-            custom_allocators: old_cpg.custom_allocators.clone(),
-            cross_file_calls: Vec::new(),
+            c_file: crate::CFileMetadata {
+                macro_aliases: cpg_macro_aliases,
+                macro_bodies: cpg_macro_bodies,
+                custom_allocators: old_cpg.c_file.custom_allocators.clone(),
+            },
             cpp_metadata: old_cpg.cpp_metadata.clone(),
             go_metadata: old_cpg.go_metadata.clone(),
             python_metadata: old_cpg.python_metadata.clone(),
@@ -1097,8 +1098,11 @@ impl IncrementalCpgGenerator {
             js_metadata: old_cpg.js_metadata.clone(),
             ts_metadata: old_cpg.ts_metadata.clone(),
             rust_metadata: old_cpg.rust_metadata.clone(),
-            class_hierarchy: old_cpg.class_hierarchy.clone(),
-            function_summaries: old_cpg.function_summaries.clone(),
+            workspace: crate::WorkspaceIndex {
+                cross_file_calls: Vec::new(),
+                class_hierarchy: old_cpg.workspace.class_hierarchy.clone(),
+                function_summaries: old_cpg.workspace.function_summaries.clone(),
+            },
         };
         clear_basic_block_annotations(&mut cpg.ast, Some(&affected_function_ids));
         if !affected_function_ids.is_empty() {
@@ -1165,9 +1169,9 @@ impl IncrementalCpgGenerator {
         // Replace cross-file calls for affected functions; keep others.
         // Filter new_xfile to only include edges from actual incremental targets
         // (add_interprocedural_edges may emit edges for non-target functions too).
-        cpg.cross_file_calls
+        cpg.workspace.cross_file_calls
             .retain(|e| !incremental_targets.contains(&e.caller_fn));
-        cpg.cross_file_calls.extend(
+        cpg.workspace.cross_file_calls.extend(
             new_xfile
                 .into_iter()
                 .filter(|e| incremental_targets.contains(&e.caller_fn)),
@@ -3058,10 +3062,7 @@ fn extract_subtree_cpg(cpg: &Cpg, root_id: u32) -> Cpg {
         source_file: cpg.source_file.clone(),
         language: cpg.language.clone(),
         comments: cpg.comments.clone(),
-        macro_aliases: cpg.macro_aliases.clone(),
-        macro_bodies: cpg.macro_bodies.clone(),
-        custom_allocators: cpg.custom_allocators.clone(),
-        cross_file_calls: Vec::new(),
+        c_file: cpg.c_file.clone(),
         cpp_metadata: cpg.cpp_metadata.clone(),
         go_metadata: cpg.go_metadata.clone(),
         python_metadata: cpg.python_metadata.clone(),
@@ -3069,8 +3070,11 @@ fn extract_subtree_cpg(cpg: &Cpg, root_id: u32) -> Cpg {
         js_metadata: cpg.js_metadata.clone(),
         ts_metadata: cpg.ts_metadata.clone(),
         rust_metadata: cpg.rust_metadata.clone(),
-        class_hierarchy: cpg.class_hierarchy.clone(),
-        function_summaries: cpg.function_summaries.clone(),
+        workspace: crate::WorkspaceIndex {
+            cross_file_calls: Vec::new(),
+            class_hierarchy: cpg.workspace.class_hierarchy.clone(),
+            function_summaries: cpg.workspace.function_summaries.clone(),
+        },
     }
 }
 

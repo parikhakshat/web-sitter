@@ -1,0 +1,34 @@
+// CWE-22: Path Traversal — Python
+
+source py_web_input = find n: Call where
+    n.callee_name() in ["request.args.get", "request.form.get",
+                        "request.json.get", "request.GET.get",
+                        "request.POST.get", "input", "raw_input",
+                        "os.environ.get", "sys.argv"]
+
+sink py_file_sinks = find n: Call where
+    n.callee_name() in ["open", "file", "io.open",
+                        "os.open", "os.path.join",
+                        "pathlib.Path", "Path",
+                        "shutil.copy", "shutil.move", "shutil.rmtree",
+                        "os.remove", "os.rename", "os.makedirs",
+                        "zipfile.ZipFile", "tarfile.open"]
+
+sanitizer py_path_san = find n: Call where
+    n.callee_name() in ["os.path.realpath", "os.path.abspath",
+                        "pathlib.Path.resolve", "resolve",
+                        "os.path.basename", "basename",
+                        "secure_filename"]
+
+rule "cwe-22-python-path-traversal" {
+    severity: high
+    languages: [python]
+    message: "Path traversal: user input used in file operation without sanitization"
+    tags: ["path-traversal", "cwe-22"]
+    taint {
+        sources: ["py_web_input"]
+        sinks:   ["py_file_sinks"]
+        sanitizers: ["py_path_san"]
+        require_interprocedural: true
+    }
+}
