@@ -10,6 +10,8 @@ pub struct DfgIndex {
     pub forward: HashMap<NodeId, Vec<NodeId>>,
     /// Backward edges: to → set of froms
     pub backward: HashMap<NodeId, Vec<NodeId>>,
+    /// Variable-named edges: variable_name → vec of (source, dest)
+    pub var_edges: HashMap<String, Vec<(NodeId, NodeId)>>,
 }
 
 impl DfgIndex {
@@ -17,13 +19,32 @@ impl DfgIndex {
     pub fn build(cpg: &Cpg) -> Self {
         let mut forward: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
         let mut backward: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+        let mut var_edges: HashMap<String, Vec<(NodeId, NodeId)>> = HashMap::new();
 
         for edge in &cpg.dataflow.edges {
             forward.entry(edge.source).or_default().push(edge.destination);
             backward.entry(edge.destination).or_default().push(edge.source);
+            var_edges
+                .entry(edge.variable.clone())
+                .or_default()
+                .push((edge.source, edge.destination));
         }
 
-        Self { forward, backward }
+        Self { forward, backward, var_edges }
+    }
+
+    /// True if `node` is a definition site for `var_name` (it is a source of a DFG edge for that variable).
+    pub fn defines_var(&self, node: NodeId, var_name: &str) -> bool {
+        self.var_edges
+            .get(var_name)
+            .map_or(false, |edges| edges.iter().any(|(src, _)| *src == node))
+    }
+
+    /// True if `node` is a use site for `var_name` (it is a destination of a DFG edge for that variable).
+    pub fn uses_var(&self, node: NodeId, var_name: &str) -> bool {
+        self.var_edges
+            .get(var_name)
+            .map_or(false, |edges| edges.iter().any(|(_, dst)| *dst == node))
     }
 
     /// True if there is a direct dataflow edge from `a` to `b`.

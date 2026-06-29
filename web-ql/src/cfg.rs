@@ -1,11 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use roaring::RoaringBitmap;
 use web_sitter::{BasicBlock, Cpg, NodeId};
 
 /// Unique identifier for a basic block within a function.
 pub type BlockId = u32;
 
-// ── Dominance tree (Lengauer-Tarjan) ─────────────────────────────────────────
+// ── Dominance tree (Cooper et al. iterative algorithm) ────────────────────────
 
 /// Pre-computed dominance information for a single function's CFG.
 pub struct DomTree {
@@ -20,7 +20,7 @@ pub struct DomTree {
 
 impl DomTree {
     /// Compute the dominator tree using a simplified Lengauer-Tarjan algorithm.
-    /// `succs[i]` gives the successors of block i; entry block is 0.
+    /// `succs[i]` gives the successors of block i; entry block is `entry`.
     pub fn compute(succs: &[Vec<BlockId>], entry: BlockId) -> Self {
         let n = succs.len();
         if n == 0 {
@@ -94,6 +94,9 @@ impl DomTree {
 
     /// Returns true if `dominator` dominates `dominated` (reflexive).
     pub fn dominates(&self, dominator: BlockId, mut dominated: BlockId) -> bool {
+        if (dominator as usize) >= self.n || (dominated as usize) >= self.n {
+            return false;
+        }
         loop {
             if dominated == dominator {
                 return true;
@@ -180,11 +183,18 @@ impl CfgReachability {
 pub struct FunctionCfg {
     /// Block successors (indices into the ordered block vec)
     pub succs: Vec<Vec<BlockId>>,
+    /// Block predecessors
+    pub preds: Vec<Vec<BlockId>>,
     /// Which block each IrNode lives in (NodeId → BlockId)
     pub node_to_block: HashMap<NodeId, BlockId>,
+    /// Forward dominance tree
     pub dom: DomTree,
+    /// Post-dominance tree (dominance in the reversed CFG with virtual exit)
+    pub post_dom: DomTree,
     pub reach: CfgReachability,
     pub entry: BlockId,
+    /// Blocks reachable via exception_successors edges (propagated transitively)
+    pub exception_blocks: HashSet<BlockId>,
 }
 
 impl FunctionCfg {
@@ -202,6 +212,20 @@ impl FunctionCfg {
         fn_blocks.sort_by_key(|(id, _)| id.as_str());
 
         let n = fn_blocks.len();
+
+        if n == 0 {
+            return Self {
+                succs: vec![],
+                preds: vec![],
+                node_to_block: HashMap::new(),
+                dom: DomTree { idom: vec![], df: vec![], n: 0 },
+                post_dom: DomTree { idom: vec![], df: vec![], n: 0 },
+                reach: CfgReachability { reach: vec![], n: 0 },
+                entry: 0,
+                exception_blocks: HashSet::new(),
+            };
+        }
+
         // Map block string ID → index
         let block_index: HashMap<&str, BlockId> = fn_blocks
             .iter()
@@ -223,17 +247,70 @@ impl FunctionCfg {
             }
         }
 
+        // Build predecessor lists from succs
+        let mut preds: Vec<Vec<BlockId>> = vec![vec![]; n];
+        for (b, bs) in succs.iter().enumerate() {
+            for &s in bs {
+                if (s as usize) < n {
+                    preds[s as usize].push(b as BlockId);
+                }
+            }
+        }
+
+        // Find exit blocks (no outgoing regular edges)
+        let exit_blocks: Vec<BlockId> = (0..n)
+            .filter(|&b| succs[b].is_empty())
+            .map(|b| b as BlockId)
+            .collect();
+
+        // Build reversed graph for post-dominance.
+        // In the reversed CFG: edges are flipped, so rev_succs[i] = preds[i] (original preds
+        // become reversed successors). A virtual exit node (index n) links to all original
+        // exit blocks, serving as the single root of the post-dominator tree.
+        let virtual_exit = n as BlockId;
+        let mut rev_succs: Vec<Vec<BlockId>> = preds.clone();
+        rev_succs.push(exit_blocks); // virtual exit → all original exit blocks
+
         let entry: BlockId = 0;
         let dom = DomTree::compute(&succs, entry);
+        let post_dom = DomTree::compute(&rev_succs, virtual_exit);
         let reach = CfgReachability::compute(&succs);
 
-        Self { succs, node_to_block, dom, reach, entry }
+        // Find exception blocks: blocks reachable via exception_successors, propagated.
+        let mut exception_blocks = HashSet::new();
+        let mut exc_queue = VecDeque::new();
+        for (_, block) in fn_blocks.iter() {
+            for exc_succ in &block.exception_successors {
+                if let Some(&exc_idx) = block_index.get(exc_succ.as_str()) {
+                    if exception_blocks.insert(exc_idx) {
+                        exc_queue.push_back(exc_idx);
+                    }
+                }
+            }
+        }
+        while let Some(b) = exc_queue.pop_front() {
+            for &s in &succs[b as usize] {
+                if exception_blocks.insert(s) {
+                    exc_queue.push_back(s);
+                }
+            }
+        }
+
+        Self { succs, preds, node_to_block, dom, post_dom, reach, entry, exception_blocks }
     }
 
     /// True if node `a` dominates node `b` in this function's CFG.
     pub fn node_dominates(&self, a: NodeId, b: NodeId) -> bool {
         match (self.node_to_block.get(&a), self.node_to_block.get(&b)) {
             (Some(&ba), Some(&bb)) => self.dom.dominates(ba, bb),
+            _ => false,
+        }
+    }
+
+    /// True if node `a` post-dominates node `b` (every path from b to exit goes through a).
+    pub fn node_post_dominates(&self, a: NodeId, b: NodeId) -> bool {
+        match (self.node_to_block.get(&a), self.node_to_block.get(&b)) {
+            (Some(&ba), Some(&bb)) => self.post_dom.dominates(ba, bb),
             _ => false,
         }
     }
@@ -252,6 +329,67 @@ impl FunctionCfg {
             (Some(&ba), Some(&bb)) => ba == bb,
             _ => false,
         }
+    }
+
+    /// True if `node` is inside a loop (its block has a back-edge to a dominating block).
+    pub fn node_in_loop(&self, node: NodeId) -> bool {
+        let Some(&block) = self.node_to_block.get(&node) else { return false };
+        for &succ in &self.succs[block as usize] {
+            // A back edge is one where the target dominates the source
+            if self.dom.dominates(succ, block) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// True if `node` is on an exception-handling path.
+    pub fn node_in_exception_path(&self, node: NodeId) -> bool {
+        let Some(&block) = self.node_to_block.get(&node) else { return false };
+        self.exception_blocks.contains(&block)
+    }
+
+    /// True if there exists a CFG path from `from` to `to` that avoids `barrier`.
+    pub fn node_cfg_reaches_without(&self, from: NodeId, to: NodeId, barrier: NodeId) -> bool {
+        let (Some(&bf), Some(&bt)) = (self.node_to_block.get(&from), self.node_to_block.get(&to))
+        else {
+            return false;
+        };
+        let barrier_block = self.node_to_block.get(&barrier).copied();
+
+        let mut visited = HashSet::new();
+        let mut queue = VecDeque::new();
+        queue.push_back(bf);
+        visited.insert(bf);
+
+        while let Some(b) = queue.pop_front() {
+            if b == bt {
+                return true;
+            }
+            for &s in &self.succs[b as usize] {
+                if !visited.contains(&s) && Some(s) != barrier_block {
+                    visited.insert(s);
+                    queue.push_back(s);
+                }
+            }
+        }
+        false
+    }
+
+    /// True if both nodes belong to this function's CFG (same function).
+    pub fn contains_node(&self, node: NodeId) -> bool {
+        self.node_to_block.contains_key(&node)
+    }
+
+    /// Returns the block ID string index for `node`, if present.
+    pub fn block_id_for_node(&self, node: NodeId) -> Option<BlockId> {
+        self.node_to_block.get(&node).copied()
+    }
+
+    /// Returns the dominance frontier of the block containing `node`.
+    pub fn dominance_frontier_for_node(&self, node: NodeId) -> Vec<BlockId> {
+        let Some(&block) = self.node_to_block.get(&node) else { return vec![] };
+        self.dom.frontier(block).iter().collect()
     }
 }
 

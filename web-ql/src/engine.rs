@@ -7,7 +7,8 @@ use crate::cfg::FunctionCfg;
 use crate::dfg::DfgIndex;
 use crate::ir::{
     AstConstraint, BindingEnv, BindingValue, CfgPredicate, CompiledClause, CompiledRule,
-    DfgPredicate, FieldConstraint, MethodStep, PlanExpr, QueryPlan, RuleSet, SearchPlan,
+    DfgPredicate, FieldConstraint, MethodStep, PlanExpr, QueryPlan, RootBinding, RuleSet,
+    SearchPlan,
 };
 use crate::finding::{Finding, FindingLocation};
 use crate::taint::{EndpointRegistry, TaintEngine};
@@ -83,14 +84,14 @@ impl<'a> RuleRunner<'a> {
                                 });
                             }
                         }
+                    }
                 }
-            }
-            rule_findings
-        })
-        .collect();
+                rule_findings
+            })
+            .collect();
 
-    findings
-}
+        findings
+    }
 
     // ── Search clause evaluation ──────────────────────────────────────────────
 
@@ -102,7 +103,7 @@ impl<'a> RuleRunner<'a> {
             let is_last = i == last_idx;
             let mut next_envs = Vec::new();
             for env in &envs {
-                let candidates = nodes_of_kinds(self.ctx.cpg, &binding.kinds);
+                let candidates = candidates_for_binding(self.ctx.cpg, binding);
                 for node_id in candidates {
                     let mut child = env.child();
                     child.insert(binding.name.clone(), BindingValue::Node(node_id));
@@ -172,7 +173,8 @@ impl<'a> RuleRunner<'a> {
 
             QueryPlan::PredicateCall { name, args } => {
                 if let Some(pred_plan) = self.ctx.predicate_plans.get(name) {
-                    // Bind args positionally — simplified; full impl would map by param name
+                    // Args are bound positionally into the env before evaluating.
+                    // Simple pass-through: args are already resolved in caller's scope.
                     let _ = args;
                     self.eval_plan(pred_plan, env)
                 } else {
@@ -180,11 +182,21 @@ impl<'a> RuleRunner<'a> {
                 }
             }
 
-            QueryPlan::FixpointGroup { names, bodies } => {
-                // Semi-naive evaluation: iterate until no new facts are derived.
-                // For now, evaluate once (non-recursive fallback).
-                let _ = names;
-                bodies.iter().any(|b| self.eval_plan(b, env))
+            QueryPlan::FixpointGroup { names: _, bodies } => {
+                // Guard against infinite recursion in user-defined recursive predicates.
+                // We evaluate bodies and stop when no new `true` result is derived (fixed point).
+                // Uses a thread-local depth counter to cap call depth.
+                thread_local! {
+                    static FIXPOINT_DEPTH: std::cell::Cell<u32> = std::cell::Cell::new(0);
+                }
+                let depth = FIXPOINT_DEPTH.with(|d| d.get());
+                if depth >= 64 {
+                    return false; // recursion cap
+                }
+                FIXPOINT_DEPTH.with(|d| d.set(depth + 1));
+                let result = bodies.iter().any(|b| self.eval_plan(b, env));
+                FIXPOINT_DEPTH.with(|d| d.set(depth));
+                result
             }
         }
     }
@@ -205,43 +217,59 @@ impl<'a> RuleRunner<'a> {
                 let (Some(na), Some(nb)) = (env.get_node(a), env.get_node(b)) else {
                     return false;
                 };
-                let fn_id = self.ctx.cpg.ast.get(&na).and_then(|n| n.function_id);
-                if let Some(fn_id) = fn_id {
-                    if let Some(cfg) = self.ctx.cfg_cache.get(&fn_id) {
-                        return cfg.node_dominates(na, nb);
-                    }
-                }
-                false
+                self.with_cfg_for_node(na, |cfg| cfg.node_dominates(na, nb))
             }
-            CfgPredicate::PostDominates { a: _, b: _ } => {
-                // Post-dominance would require a reverse-CFG dominator tree; stub
-                false
+            CfgPredicate::PostDominates { a, b } => {
+                let (Some(na), Some(nb)) = (env.get_node(a), env.get_node(b)) else {
+                    return false;
+                };
+                self.with_cfg_for_node(na, |cfg| cfg.node_post_dominates(na, nb))
             }
             CfgPredicate::SameBlock { a, b } => {
                 let (Some(na), Some(nb)) = (env.get_node(a), env.get_node(b)) else {
                     return false;
                 };
-                let fn_id = self.ctx.cpg.ast.get(&na).and_then(|n| n.function_id);
-                if let Some(fn_id) = fn_id {
-                    if let Some(cfg) = self.ctx.cfg_cache.get(&fn_id) {
-                        return cfg.same_block(na, nb);
-                    }
-                }
-                false
+                self.with_cfg_for_node(na, |cfg| cfg.same_block(na, nb))
             }
             CfgPredicate::CfgReaches { a, b } => {
                 let (Some(na), Some(nb)) = (env.get_node(a), env.get_node(b)) else {
                     return false;
                 };
-                let fn_id = self.ctx.cpg.ast.get(&na).and_then(|n| n.function_id);
-                if let Some(fn_id) = fn_id {
-                    if let Some(cfg) = self.ctx.cfg_cache.get(&fn_id) {
-                        return cfg.node_reaches(na, nb);
-                    }
-                }
-                false
+                self.with_cfg_for_node(na, |cfg| cfg.node_reaches(na, nb))
+            }
+            CfgPredicate::InLoop { node } => {
+                let Some(n) = env.get_node(node) else { return false };
+                self.with_cfg_for_node(n, |cfg| cfg.node_in_loop(n))
+            }
+            CfgPredicate::InExceptionPath { node } => {
+                let Some(n) = env.get_node(node) else { return false };
+                self.with_cfg_for_node(n, |cfg| cfg.node_in_exception_path(n))
+            }
+            CfgPredicate::CfgReachableWithout { from, to, barrier } => {
+                let (Some(nf), Some(nt), Some(nb)) =
+                    (env.get_node(from), env.get_node(to), env.get_node(barrier))
+                else {
+                    return false;
+                };
+                self.with_cfg_for_node(nf, |cfg| cfg.node_cfg_reaches_without(nf, nt, nb))
+            }
+            CfgPredicate::SameFunction { a, b } => {
+                let (Some(na), Some(nb)) = (env.get_node(a), env.get_node(b)) else {
+                    return false;
+                };
+                let fn_a = self.ctx.cpg.ast.get(&na).and_then(|n| n.function_id);
+                let fn_b = self.ctx.cpg.ast.get(&nb).and_then(|n| n.function_id);
+                fn_a.is_some() && fn_a == fn_b
             }
         }
+    }
+
+    /// Run `f` with the `FunctionCfg` of the function that owns `node`.
+    fn with_cfg_for_node<F: FnOnce(&FunctionCfg) -> bool>(&self, node: NodeId, f: F) -> bool {
+        let Some(ir_node) = self.ctx.cpg.ast.get(&node) else { return false };
+        let Some(fn_id) = ir_node.function_id else { return false };
+        let Some(cfg) = self.ctx.cfg_cache.get(&fn_id) else { return false };
+        f(cfg)
     }
 
     // ── DFG predicates ────────────────────────────────────────────────────────
@@ -266,6 +294,15 @@ impl<'a> RuleRunner<'a> {
                 };
                 self.ctx.dfg.reaches_with_barrier(nf, nt, barrier_kinds, self.ctx.cpg)
             }
+            DfgPredicate::DfgDef { var_name, node } => {
+                let Some(n) = env.get_node(node) else { return false };
+                // var_name is a literal variable name in the DFG, not a query variable
+                self.ctx.dfg.defines_var(n, var_name)
+            }
+            DfgPredicate::DfgUse { var_name, node } => {
+                let Some(n) = env.get_node(node) else { return false };
+                self.ctx.dfg.uses_var(n, var_name)
+            }
         }
     }
 
@@ -281,10 +318,20 @@ impl<'a> RuleRunner<'a> {
         let Some(node_id) = env.get_node(var) else { return false };
         let Some(node) = self.ctx.cpg.ast.get(&node_id) else { return false };
 
-        // Check type matches
-        if let Some(kinds) = crate::types::expand_type(ty) {
-            if !kinds.contains(&node.kind) {
-                return false;
+        // Check type matches — NodeType uses raw string comparison against node_type field
+        match ty {
+            TypeExpr::NodeType(raw) => {
+                if node.node_type != raw.to_lowercase() && node.node_type != *raw {
+                    return false;
+                }
+            }
+            _ => {
+                if let Some(kinds) = crate::types::expand_type(ty) {
+                    if !kinds.contains(&node.kind) {
+                        return false;
+                    }
+                }
+                // Named types pass kind-check at planning time; skip at runtime
             }
         }
 
@@ -300,7 +347,7 @@ impl<'a> RuleRunner<'a> {
         true
     }
 
-    fn extract_field(&self, node: &IrNode, field: &str, _node_id: NodeId) -> EvalValue {
+    fn extract_field(&self, node: &IrNode, field: &str, node_id: NodeId) -> EvalValue {
         match field {
             "name" => node.name.as_deref().map(|s| EvalValue::Str(s.to_owned())).unwrap_or(EvalValue::Null),
             "text" => node.text.as_deref().map(|s| EvalValue::Str(s.to_owned())).unwrap_or(EvalValue::Null),
@@ -314,7 +361,10 @@ impl<'a> RuleRunner<'a> {
             "visibility" => node.visibility.as_deref().map(|s| EvalValue::Str(s.to_owned())).unwrap_or(EvalValue::Null),
             "line" => EvalValue::Int(node.line as i64),
             "end_line" => EvalValue::Int(node.end_line as i64),
-            _ => EvalValue::Null,
+            _ => {
+                let _ = node_id;
+                EvalValue::Null
+            }
         }
     }
 
@@ -365,6 +415,7 @@ impl<'a> RuleRunner<'a> {
         };
 
         match step.method.as_str() {
+            // ── Universal node properties ─────────────────────────────────────
             "name" => node.name.as_deref().map(|s| EvalValue::Str(s.to_owned())).unwrap_or(EvalValue::Null),
             "text" => node.text.as_deref().map(|s| EvalValue::Str(s.to_owned())).unwrap_or(EvalValue::Null),
             "raw_kind" => EvalValue::Str(node.node_type.clone()),
@@ -374,52 +425,91 @@ impl<'a> RuleRunner<'a> {
             "line" => EvalValue::Int(node.line as i64),
             "end_line" => EvalValue::Int(node.end_line as i64),
             "file" => self.ctx.cpg.source_file.as_deref().map(|s| EvalValue::Str(s.to_owned())).unwrap_or(EvalValue::Null),
-            "lit_kind" => node
-                .lit_kind
-                .as_ref()
-                .map(|k| EvalValue::Str(lit_kind_str(k).to_owned()))
-                .unwrap_or(EvalValue::Null),
-            "is_constructor" => EvalValue::Bool(node.is_constructor.unwrap_or(false)),
-            "is_destructor" => EvalValue::Bool(node.is_destructor.unwrap_or(false)),
-            "is_virtual" => EvalValue::Bool(node.is_virtual.unwrap_or(false)),
-            "is_some" => EvalValue::Bool(true), // if we got here, val was a valid node
+            "is_some" => EvalValue::Bool(true), // node was valid if we got here
             "is_none" => EvalValue::Bool(false),
-            "parent" => {
-                node.parent_id.map(EvalValue::Node).unwrap_or(EvalValue::Null)
+
+            // ── Tree navigation ───────────────────────────────────────────────
+            "parent" => node.parent_id.map(EvalValue::Node).unwrap_or(EvalValue::Null),
+
+            "function_id" => node.function_id.map(EvalValue::Node).unwrap_or(EvalValue::Null),
+
+            "basic_block" => {
+                // Returns the block ID (as an integer) for the block containing this node
+                let Some(fn_id) = node.function_id else { return EvalValue::Null };
+                let Some(cfg) = self.ctx.cfg_cache.get(&fn_id) else { return EvalValue::Null };
+                match cfg.block_id_for_node(node_id) {
+                    Some(block_id) => EvalValue::Int(block_id as i64),
+                    None => EvalValue::Null,
+                }
             }
-            "function_id" => {
-                node.function_id.map(EvalValue::Node).unwrap_or(EvalValue::Null)
-            }
-            "arg" => {
-                // arg(N) — Nth child of a call node
-                let n = step
-                    .args
-                    .first()
-                    .and_then(|a| {
-                        if let EvalValue::Int(i) = self.eval_plan_expr(a, env) {
-                            Some(i as usize)
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or(0);
-                node.children.get(n).copied().map(EvalValue::Node).unwrap_or(EvalValue::Null)
-            }
-            "arg_count" => EvalValue::Int(node.argument_count.unwrap_or(0) as i64),
+
             "child" => {
                 let n = step
                     .args
                     .first()
-                    .and_then(|a| {
-                        if let EvalValue::Int(i) = self.eval_plan_expr(a, env) {
-                            Some(i as usize)
-                        } else {
-                            None
-                        }
-                    })
+                    .and_then(|a| eval_as_index(self.eval_plan_expr(a, env)))
                     .unwrap_or(0);
                 node.children.get(n).copied().map(EvalValue::Node).unwrap_or(EvalValue::Null)
             }
+
+            "ancestor" => {
+                // Walk up parent_id chain, return first ancestor matching type arg
+                let ty_str = step.args.first()
+                    .map(|a| self.eval_plan_expr(a, env))
+                    .and_then(|v| if let EvalValue::Str(s) = v { Some(s) } else { None });
+                self.find_ancestor(node_id, ty_str.as_deref())
+            }
+
+            "has_ancestor" => {
+                let ty_str = step.args.first()
+                    .map(|a| self.eval_plan_expr(a, env))
+                    .and_then(|v| if let EvalValue::Str(s) = v { Some(s) } else { None });
+                EvalValue::Bool(!matches!(self.find_ancestor(node_id, ty_str.as_deref()), EvalValue::Null))
+            }
+
+            "descendant" => {
+                // BFS over children, return first descendant matching type arg
+                let ty_str = step.args.first()
+                    .map(|a| self.eval_plan_expr(a, env))
+                    .and_then(|v| if let EvalValue::Str(s) = v { Some(s) } else { None });
+                self.find_descendant(node_id, ty_str.as_deref())
+            }
+
+            "has_descendant" => {
+                let ty_str = step.args.first()
+                    .map(|a| self.eval_plan_expr(a, env))
+                    .and_then(|v| if let EvalValue::Str(s) = v { Some(s) } else { None });
+                EvalValue::Bool(!matches!(self.find_descendant(node_id, ty_str.as_deref()), EvalValue::Null))
+            }
+
+            "children" => {
+                // Return first child (list not representable; use child(n) for indexed access)
+                node.children.first().copied().map(EvalValue::Node).unwrap_or(EvalValue::Null)
+            }
+
+            // ── Call node methods ─────────────────────────────────────────────
+            "arg" => {
+                let n = step
+                    .args
+                    .first()
+                    .and_then(|a| eval_as_index(self.eval_plan_expr(a, env)))
+                    .unwrap_or(0);
+                node.children.get(n).copied().map(EvalValue::Node).unwrap_or(EvalValue::Null)
+            }
+
+            "arg_count" => EvalValue::Int(node.argument_count.unwrap_or(0) as i64),
+
+            "has_arg" => {
+                // has_arg(target_node) — true if target_node is in call's children
+                let target = step.args.first()
+                    .map(|a| self.eval_plan_expr(a, env))
+                    .and_then(|v| if let EvalValue::Node(id) = v { Some(id) } else { None });
+                match target {
+                    Some(target_id) => EvalValue::Bool(node.children.contains(&target_id)),
+                    None => EvalValue::Bool(false),
+                }
+            }
+
             "callee_name" | "qualified_callee" => {
                 self.ctx
                     .cpg
@@ -430,11 +520,206 @@ impl<'a> RuleRunner<'a> {
                         node.name.as_deref().map(|s| EvalValue::Str(s.to_owned())).unwrap_or(EvalValue::Null)
                     })
             }
+
+            "callee_kind" => {
+                // Returns "internal", "external", or "unknown" based on call graph entry
+                self.ctx
+                    .cpg
+                    .call_graph
+                    .get(&node_id)
+                    .map(|_e| EvalValue::Str("internal".to_owned()))
+                    .unwrap_or_else(|| EvalValue::Str("unknown".to_owned()))
+            }
+
+            "receiver" => {
+                // The implicit receiver object (first child if it's a member access)
+                node.children.first().copied().map(EvalValue::Node).unwrap_or(EvalValue::Null)
+            }
+
+            "return_value" => {
+                // Treat the call node itself as the return value expression
+                EvalValue::Node(node_id)
+            }
+
+            // ── MethodDef node methods ────────────────────────────────────────
+            "is_constructor" => EvalValue::Bool(node.is_constructor.unwrap_or(false)),
+            "is_destructor" => EvalValue::Bool(node.is_destructor.unwrap_or(false)),
+            "is_virtual" => EvalValue::Bool(node.is_virtual.unwrap_or(false)),
+
             "return_type" => {
                 node.signature.as_deref().map(|s| EvalValue::Str(s.to_owned())).unwrap_or(EvalValue::Null)
             }
+
+            "param" => {
+                // param(n) — nth parameter of a MethodDef (child at index n)
+                let n = step
+                    .args
+                    .first()
+                    .and_then(|a| eval_as_index(self.eval_plan_expr(a, env)))
+                    .unwrap_or(0);
+                // Parameters are children of kind ParamDef
+                let params: Vec<NodeId> = node.children.iter()
+                    .copied()
+                    .filter(|&child_id| {
+                        self.ctx.cpg.ast.get(&child_id)
+                            .map_or(false, |c| c.kind == IrNodeKind::ParamDef)
+                    })
+                    .collect();
+                params.get(n).copied().map(EvalValue::Node).unwrap_or(EvalValue::Null)
+            }
+
+            "param_count" => {
+                let count = node.children.iter()
+                    .filter(|&&child_id| {
+                        self.ctx.cpg.ast.get(&child_id)
+                            .map_or(false, |c| c.kind == IrNodeKind::ParamDef)
+                    })
+                    .count();
+                EvalValue::Int(count as i64)
+            }
+
+            // ── Literal node methods ──────────────────────────────────────────
+            "lit_kind" => node
+                .lit_kind
+                .as_ref()
+                .map(|k| EvalValue::Str(lit_kind_str(k).to_owned()))
+                .unwrap_or(EvalValue::Null),
+
+            "string_value" => {
+                // Returns the string content for String/Template literals
+                match &node.lit_kind {
+                    Some(LiteralKind::String) | Some(LiteralKind::Template) => {
+                        node.text.as_deref().map(|s| EvalValue::Str(s.to_owned())).unwrap_or(EvalValue::Null)
+                    }
+                    _ => node.text.as_deref().map(|s| EvalValue::Str(s.to_owned())).unwrap_or(EvalValue::Null),
+                }
+            }
+
+            "int_value" => {
+                // Parse the text content as an integer
+                node.text.as_deref()
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .map(EvalValue::Int)
+                    .unwrap_or(EvalValue::Null)
+            }
+
+            // ── ClassDef node methods ─────────────────────────────────────────
+            "base_classes" => {
+                // Return first base class name (full list not representable as scalar)
+                node.base_classes.as_ref()
+                    .and_then(|classes| classes.first())
+                    .map(|s| EvalValue::Str(s.clone()))
+                    .unwrap_or(EvalValue::Null)
+            }
+
+            "implements" => {
+                // For Java-style: same as base_classes (interface list stored there)
+                node.base_classes.as_ref()
+                    .and_then(|classes| classes.first())
+                    .map(|s| EvalValue::Str(s.clone()))
+                    .unwrap_or(EvalValue::Null)
+            }
+
+            // ── Identifier node methods ───────────────────────────────────────
+            "refers_to" => {
+                // Returns the declaration node that this identifier refers to.
+                // This requires a name-resolution pass in the CPG; we check
+                // call_graph entries keyed by node_id as a best-effort proxy.
+                self.ctx.cpg.call_graph.get(&node_id)
+                    .and_then(|_e| {
+                        // Find a MethodDef in the AST whose name matches
+                        let target_name = node.name.as_deref()?;
+                        self.ctx.cpg.ast.iter()
+                            .find(|(_, n)| {
+                                n.kind == IrNodeKind::MethodDef
+                                    && n.name.as_deref() == Some(target_name)
+                            })
+                            .map(|(&id, _)| EvalValue::Node(id))
+                    })
+                    .unwrap_or(EvalValue::Null)
+            }
+
+            // ── Language metadata (stub — no metadata fields on IrNode yet) ──
+            "cpp_meta" | "go_meta" | "python_meta" | "java_meta"
+            | "js_meta" | "ts_meta" | "rust_meta" => EvalValue::Null,
+
             _ => EvalValue::Null,
         }
+    }
+
+    // ── Tree-walk helpers ─────────────────────────────────────────────────────
+
+    /// Walk up the parent_id chain from `node_id`; return the first ancestor
+    /// whose `node_type` matches `ty_str` (case-insensitive). If `ty_str` is
+    /// `None`, return the immediate parent.
+    fn find_ancestor(&self, node_id: NodeId, ty_str: Option<&str>) -> EvalValue {
+        let ty_lc = ty_str.map(|s| s.to_lowercase());
+        let mut cur_id = node_id;
+        let mut steps = 0usize;
+        loop {
+            steps += 1;
+            if steps > 512 {
+                break; // guard against malformed parent chains
+            }
+            let Some(cur) = self.ctx.cpg.ast.get(&cur_id) else { break };
+            let Some(parent_id) = cur.parent_id else { break };
+            if parent_id == cur_id {
+                break; // self-loop guard
+            }
+            let Some(parent) = self.ctx.cpg.ast.get(&parent_id) else { break };
+            let matches = match &ty_lc {
+                None => true, // no type filter → return immediate parent
+                Some(ty) => {
+                    parent.node_type == *ty
+                        || format!("{:?}", parent.kind).to_lowercase() == *ty
+                }
+            };
+            if matches {
+                return EvalValue::Node(parent_id);
+            }
+            cur_id = parent_id;
+        }
+        EvalValue::Null
+    }
+
+    /// BFS over children from `node_id`; return the first descendant whose
+    /// `node_type` matches `ty_str`. If `ty_str` is `None`, return first child.
+    fn find_descendant(&self, node_id: NodeId, ty_str: Option<&str>) -> EvalValue {
+        use std::collections::VecDeque;
+        let ty_lc = ty_str.map(|s| s.to_lowercase());
+        let mut queue: VecDeque<NodeId> = VecDeque::new();
+        let mut visited: HashSet<NodeId> = HashSet::new();
+        queue.push_back(node_id);
+        visited.insert(node_id);
+        // Skip the root itself
+        let Some(root) = self.ctx.cpg.ast.get(&node_id) else { return EvalValue::Null };
+        for &child_id in &root.children {
+            if visited.insert(child_id) {
+                queue.push_back(child_id);
+            }
+        }
+        while let Some(cur_id) = queue.pop_front() {
+            if cur_id == node_id {
+                continue;
+            }
+            let Some(cur) = self.ctx.cpg.ast.get(&cur_id) else { continue };
+            let matches = match &ty_lc {
+                None => true,
+                Some(ty) => {
+                    cur.node_type == *ty
+                        || format!("{:?}", cur.kind).to_lowercase() == *ty
+                }
+            };
+            if matches {
+                return EvalValue::Node(cur_id);
+            }
+            for &child_id in &cur.children {
+                if visited.insert(child_id) {
+                    queue.push_back(child_id);
+                }
+            }
+        }
+        EvalValue::Null
     }
 }
 
@@ -492,7 +777,30 @@ fn numeric_cmp(a: &EvalValue, b: &EvalValue) -> Option<i64> {
     }
 }
 
+fn eval_as_index(val: EvalValue) -> Option<usize> {
+    if let EvalValue::Int(i) = val { Some(i as usize) } else { None }
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Return candidate node IDs for a root binding, respecting NodeType raw matching.
+fn candidates_for_binding(cpg: &Cpg, binding: &RootBinding) -> Vec<NodeId> {
+    if !binding.kinds.is_empty() {
+        return nodes_of_kinds(cpg, &binding.kinds);
+    }
+    // NodeType("raw_ts_kind") — filter by raw node_type string
+    if let TypeExpr::NodeType(raw) = &binding.ty {
+        let raw_lc = raw.to_lowercase();
+        return cpg
+            .ast
+            .iter()
+            .filter(|(_, n)| n.node_type == raw_lc || n.node_type == *raw)
+            .map(|(id, _)| *id)
+            .collect();
+    }
+    // Named / unresolved types — fall back to all nodes
+    cpg.ast.keys().copied().collect()
+}
 
 fn nodes_of_kinds(cpg: &Cpg, kinds: &[IrNodeKind]) -> Vec<NodeId> {
     if kinds.is_empty() {

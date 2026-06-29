@@ -174,12 +174,20 @@ pub struct AstConstraint {
 pub enum CfgPredicate {
     /// `a` dominates `b` in the CFG of their enclosing function
     Dominates { a: String, b: String },
-    /// `a` post-dominates `b`
+    /// `a` post-dominates `b` (every path from b to exit goes through a)
     PostDominates { a: String, b: String },
     /// `a` is in the same basic block as `b`
     SameBlock { a: String, b: String },
     /// `a` reaches `b` along control flow (not necessarily dominates)
     CfgReaches { a: String, b: String },
+    /// `node` is inside a loop body (its block has a back edge)
+    InLoop { node: String },
+    /// `node` is on an exception-handling path
+    InExceptionPath { node: String },
+    /// There exists a CFG path from `from` to `to` that avoids `barrier`
+    CfgReachableWithout { from: String, to: String, barrier: String },
+    /// `a` and `b` are in the same function (share the same function_id)
+    SameFunction { a: String, b: String },
 }
 
 // ── DFG predicates ────────────────────────────────────────────────────────────
@@ -196,6 +204,10 @@ pub enum DfgPredicate {
         to: String,
         barrier_kinds: Vec<IrNodeKind>,
     },
+    /// `node` is a definition site for variable `var_name` in the DFG
+    DfgDef { var_name: String, node: String },
+    /// `node` is a use site for variable `var_name` in the DFG
+    DfgUse { var_name: String, node: String },
 }
 
 // ── Taint spec ────────────────────────────────────────────────────────────────

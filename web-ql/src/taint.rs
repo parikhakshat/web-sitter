@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
-use web_sitter::{Cpg, FunctionSummary, IrNode, NodeId};
+use std::collections::VecDeque;
+use web_sitter::{Cpg, FunctionSummary, IrNode, IrNodeKind, NodeId};
 use crate::dfg::{DfgIndex, TaintConfig};
 use crate::ir::{TaintEndpointRef, TaintSpec};
 
@@ -120,7 +121,59 @@ impl<'a> TaintEngine<'a> {
         };
 
         let source_ids: Vec<NodeId> = sources.iter().map(|r| r.node).collect();
-        let result = self.dfg.propagate_taint(&source_ids, &taint_cfg);
+        let mut result = self.dfg.propagate_taint(&source_ids, &taint_cfg);
+
+        // Interprocedural expansion: for each tainted Call node, check if any
+        // argument is tainted. If a function summary says arg_i → return, mark
+        // the call node itself as tainted (representing the return value) and
+        // re-propagate. This handles library functions without DFG edges.
+        if spec.require_interprocedural && !self.summaries.is_empty() {
+            let mut changed = true;
+            while changed {
+                changed = false;
+                let mut new_tainted: Vec<NodeId> = Vec::new();
+
+                for (node_id, node) in &self.cpg.ast {
+                    if node.kind != web_sitter::IrNodeKind::Call {
+                        continue;
+                    }
+                    if sanitizer_nodes.contains(node_id) {
+                        continue;
+                    }
+                    // Check which argument positions are tainted
+                    let tainted_args: HashSet<usize> = node
+                        .children
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, arg_id)| result.tainted.contains(*arg_id))
+                        .map(|(i, _)| i)
+                        .collect();
+
+                    if tainted_args.is_empty() {
+                        continue;
+                    }
+
+                    let expansion = expand_call_with_summary(node, &tainted_args, self.summaries);
+                    match expansion {
+                        TaintExpansionResult::Known { return_tainted: true, .. } => {
+                            if result.tainted.insert(*node_id) {
+                                new_tainted.push(*node_id);
+                                changed = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                if !new_tainted.is_empty() {
+                    // Re-propagate from newly tainted call nodes
+                    let extra = self.dfg.propagate_taint(&new_tainted, &taint_cfg);
+                    for node in extra.tainted {
+                        result.tainted.insert(node);
+                    }
+                }
+            }
+        }
 
         // Check which sinks are reachable and emit findings
         let mut findings = Vec::new();
@@ -128,13 +181,11 @@ impl<'a> TaintEngine<'a> {
             if result.tainted.contains(&sink.node) {
                 // Find which source leads to this sink
                 for src in &sources {
-                    if self.dfg.reaches(src.node, sink.node) {
+                    if self.dfg.reaches(src.node, sink.node)
+                        || result.tainted.contains(&src.node)
+                    {
                         // Build a minimal path (source → sink) via BFS
-                        let path = self.shortest_path(
-                            src.node,
-                            sink.node,
-                            &taint_cfg,
-                        );
+                        let path = self.shortest_path(src.node, sink.node, &taint_cfg);
                         findings.push(TaintFinding {
                             source_node: src.node,
                             source_def: src.def_name.clone(),
@@ -175,7 +226,6 @@ impl<'a> TaintEngine<'a> {
         to: NodeId,
         cfg: &TaintConfig<'_>,
     ) -> Vec<NodeId> {
-        use std::collections::VecDeque;
         let mut visited: HashMap<NodeId, NodeId> = HashMap::new(); // node → parent
         let mut queue = VecDeque::new();
         queue.push_back(from);
