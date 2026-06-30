@@ -452,7 +452,7 @@ impl LanguageLifter for PythonLifter {
             "named_expression" => IrNodeKind::NamedExpr,
             "global_statement" | "nonlocal_statement" => IrNodeKind::Global,
             "type_alias_statement" => IrNodeKind::TypeAlias,
-            "parameters" | "typed_parameter" | "default_parameter"
+            "typed_parameter" | "default_parameter"
             | "typed_default_parameter" | "dictionary_splat_pattern"
             | "list_splat_pattern" => IrNodeKind::ParamDef,
             // ── Statements ─────────────────────────────────────────────────
@@ -607,7 +607,7 @@ impl LanguageLifter for JavaLifter {
             "string_template" => IrNodeKind::StringTemplate,
             "class_literal" => IrNodeKind::ClassLiteral,
             // ── Identifiers / literals ──────────────────────────────────────
-            "identifier" | "type_identifier" => IrNodeKind::Identifier,
+            "identifier" => IrNodeKind::Identifier,
             "decimal_integer_literal" | "hex_integer_literal" | "octal_integer_literal"
             | "binary_integer_literal" | "decimal_floating_point_literal"
             | "hex_floating_point_literal" | "string_literal" | "character_literal"

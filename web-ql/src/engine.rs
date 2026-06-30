@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use rayon::prelude::*;
 use web_sitter::{CallSite, Cpg, IrNode, IrNodeKind, LiteralKind, NodeId};
 use web_profiler as prof;
+use crate::alias::AliasIndex;
 use crate::ast::{CmpOp, Literal, TypeExpr};
 use crate::cfg::FunctionCfg;
 use crate::dfg::DfgIndex;
@@ -11,6 +12,9 @@ use crate::ir::{
     SearchPlan,
 };
 use crate::finding::{Finding, FindingLocation};
+use crate::nullability::NullabilityIndex;
+use crate::size_tracking::{AllocSizeIndex, SizeValue};
+use crate::symbolic::SymbolicEval;
 use crate::taint::{CrossFileTaintCtx, EndpointRegistry, TaintEngine};
 
 // ── Eval context ──────────────────────────────────────────────────────────────
@@ -19,6 +23,12 @@ pub struct EvalContext<'a> {
     pub cpg: &'a Cpg,
     pub dfg: &'a DfgIndex,
     pub cfg_cache: &'a HashMap<NodeId, FunctionCfg>,
+    /// Pointer alias analysis (built from POINTS_TO edges).
+    pub alias: &'a AliasIndex,
+    /// Buffer / allocation size index.
+    pub sizes: &'a AllocSizeIndex,
+    /// Null-value propagation index.
+    pub nullability: &'a NullabilityIndex,
     pub summaries: &'a HashMap<String, web_sitter::FunctionSummary>,
     pub registry: &'a EndpointRegistry,
     /// Compiled predicates for recursive calls
@@ -292,7 +302,7 @@ impl<'a> RuleRunner<'a> {
                             EvalValue::Str(s) => BindingValue::Str(s),
                             EvalValue::Int(n) => BindingValue::Int(n),
                             EvalValue::Bool(b) => BindingValue::Bool(b),
-                            EvalValue::Null => BindingValue::Null,
+                            EvalValue::Null | EvalValue::MetaNode(..) => BindingValue::Null,
                         };
                         child.insert(param_name.to_owned(), binding);
                     }
@@ -385,7 +395,43 @@ impl<'a> RuleRunner<'a> {
             }
             CfgPredicate::LoopHasNoExit { node } => {
                 let Some(n) = env.get_node(node) else { return false };
-                self.with_cfg_for_node(n, |cfg| cfg.node_loop_has_no_exit(n))
+                let cpg = self.ctx.cpg;
+                self.with_cfg_for_node(n, |cfg| cfg.node_loop_has_no_exit(n, cpg))
+            }
+
+            // ── Symbolic / path-sensitive CFG predicates ──────────────────────
+            CfgPredicate::CfgReachesFeasible { a, b } => {
+                let (Some(na), Some(nb)) = (env.get_node(a), env.get_node(b)) else {
+                    return false;
+                };
+                let Some(ir) = self.ctx.cpg.ast.get(&na) else { return false };
+                let Some(fn_id) = ir.function_id else { return false };
+                let Some(cfg) = self.ctx.cfg_cache.get(&fn_id) else { return false };
+                cfg.feasible_reaches(na, nb, self.ctx.cpg)
+            }
+
+            CfgPredicate::GuardEvalTrue { node } => {
+                let Some(n) = env.get_node(node) else { return false };
+                guard_const_eval(self.ctx.cpg, n) == Some(true)
+            }
+
+            CfgPredicate::GuardEvalFalse { node } => {
+                let Some(n) = env.get_node(node) else { return false };
+                guard_const_eval(self.ctx.cpg, n) == Some(false)
+            }
+
+            CfgPredicate::InDeadBranch { node } => {
+                let Some(n) = env.get_node(node) else { return false };
+                let Some(ir) = self.ctx.cpg.ast.get(&n) else { return false };
+                let Some(fn_id) = ir.function_id else { return false };
+                let Some(cfg) = self.ctx.cfg_cache.get(&fn_id) else { return false };
+                // Find any node in the entry block to use as origin
+                let entry_node = cfg.node_to_block.iter()
+                    .find_map(|(&nid, &bid)| if bid == cfg.entry { Some(nid) } else { None });
+                match entry_node {
+                    Some(en) => !cfg.feasible_reaches(en, n, self.ctx.cpg),
+                    None => false,
+                }
             }
         }
     }
@@ -406,13 +452,43 @@ impl<'a> RuleRunner<'a> {
                 let (Some(nf), Some(nt)) = (env.get_node(from), env.get_node(to)) else {
                     return false;
                 };
-                self.ctx.dfg.direct_flow(nf, nt)
+                if self.ctx.dfg.direct_flow(nf, nt) {
+                    return true;
+                }
+                // Subtree extension: any descendant of `from` has a direct DFG edge
+                // to any descendant of `to`. Handles LocalDef→LocalDef patterns where
+                // the CPG's DFG edges go between identifier children, not declaration nodes.
+                let from_sub = ast_subtree(self.ctx.cpg, nf);
+                let to_sub = ast_subtree(self.ctx.cpg, nt);
+                from_sub.iter().any(|&f| {
+                    if let Some(succs) = self.ctx.dfg.forward.get(&f) {
+                        succs.iter().any(|s| to_sub.contains(s) && *s != nf)
+                    } else {
+                        false
+                    }
+                })
             }
             DfgPredicate::ReachesFlow { from, to } => {
                 let (Some(nf), Some(nt)) = (env.get_node(from), env.get_node(to)) else {
                     return false;
                 };
-                self.ctx.dfg.reaches(nf, nt)
+                if self.ctx.dfg.reaches(nf, nt) {
+                    return true;
+                }
+                // Subtree extension: check if any node reachable from any descendant
+                // of `from` can reach any descendant of `to`.
+                // This enables Call.dfg_reaches(Call) patterns where the DFG path goes
+                // through intermediate identifier/argument nodes that are AST-children
+                // of the target call.
+                let to_sub = ast_subtree(self.ctx.cpg, nt);
+                let from_sub = ast_subtree(self.ctx.cpg, nf);
+                for &f in &from_sub {
+                    let reachable = self.ctx.dfg.reachable_from(f);
+                    if reachable.iter().any(|r| to_sub.contains(r) && *r != nf) {
+                        return true;
+                    }
+                }
+                false
             }
             DfgPredicate::ReachesWithBarrier { from, to, barrier_kinds } => {
                 let (Some(nf), Some(nt)) = (env.get_node(from), env.get_node(to)) else {
@@ -422,12 +498,23 @@ impl<'a> RuleRunner<'a> {
             }
             DfgPredicate::DfgDef { var_name, node } => {
                 let Some(n) = env.get_node(node) else { return false };
-                // var_name is a literal variable name in the DFG, not a query variable
-                self.ctx.dfg.defines_var(n, var_name)
+                if self.ctx.dfg.defines_var(n, var_name) {
+                    return true;
+                }
+                // Subtree extension: any descendant of `node` defines `var_name`
+                ast_subtree(self.ctx.cpg, n).iter().any(|&d| {
+                    d != n && self.ctx.dfg.defines_var(d, var_name)
+                })
             }
             DfgPredicate::DfgUse { var_name, node } => {
                 let Some(n) = env.get_node(node) else { return false };
-                self.ctx.dfg.uses_var(n, var_name)
+                if self.ctx.dfg.uses_var(n, var_name) {
+                    return true;
+                }
+                // Subtree extension: any descendant of `node` uses `var_name`
+                ast_subtree(self.ctx.cpg, n).iter().any(|&d| {
+                    d != n && self.ctx.dfg.uses_var(d, var_name)
+                })
             }
         }
     }
@@ -531,6 +618,12 @@ impl<'a> RuleRunner<'a> {
         step: &MethodStep,
         env: &BindingEnv,
     ) -> EvalValue {
+        // A MetaNode is the result of `node.cpp_meta` (etc.); the next step accesses
+        // a field on the language-specific metadata side-table.
+        if let EvalValue::MetaNode(meta_id, ref ns) = val {
+            return self.eval_meta_field(meta_id, ns, &step.method);
+        }
+
         let node_id = match val {
             EvalValue::Node(id) => id,
             _ => return EvalValue::Null,
@@ -545,6 +638,9 @@ impl<'a> RuleRunner<'a> {
             "name" => node.name.as_deref().map(|s| EvalValue::Str(s.to_owned())).unwrap_or(EvalValue::Null),
             "text" => node.text.as_deref().map(|s| EvalValue::Str(s.to_owned())).unwrap_or(EvalValue::Null),
             "raw_kind" => EvalValue::Str(node.node_type.clone()),
+            // `kind` returns the IrNodeKind as a PascalCase string (e.g. "Call", "Identifier").
+            // This lets rules write `n.arg(0).kind == "Identifier"` to check the IR type.
+            "kind" => EvalValue::Str(format!("{:?}", node.kind)),
             "namespace" => node.namespace.as_deref().map(|s| EvalValue::Str(s.to_owned())).unwrap_or(EvalValue::Null),
             "class_context" => node.class_context.as_deref().map(|s| EvalValue::Str(s.to_owned())).unwrap_or(EvalValue::Null),
             "visibility" => node.visibility.as_deref().map(|s| EvalValue::Str(s.to_owned())).unwrap_or(EvalValue::Null),
@@ -620,7 +716,19 @@ impl<'a> RuleRunner<'a> {
                     .first()
                     .and_then(|a| eval_as_index(self.eval_plan_expr(a, env)))
                     .unwrap_or(0);
-                node.children.get(n).copied().map(EvalValue::Node).unwrap_or(EvalValue::Null)
+                // Arguments live inside an argument_list/arguments child for most
+                // languages (C/C++, Java, Go, JS/TS). Find that container first.
+                let arg_id = node.children.iter().find_map(|&cid| {
+                    let child = self.ctx.cpg.ast.get(&cid)?;
+                    if matches!(child.node_type.as_str(), "argument_list" | "arguments") {
+                        child.children.get(n).copied()
+                    } else {
+                        None
+                    }
+                });
+                arg_id.or_else(|| node.children.get(n).copied())
+                    .map(EvalValue::Node)
+                    .unwrap_or(EvalValue::Null)
             }
 
             "arg_count" => EvalValue::Int(node.argument_count.unwrap_or(0) as i64),
@@ -694,30 +802,23 @@ impl<'a> RuleRunner<'a> {
             }
 
             "param" => {
-                // param(n) — nth parameter of a MethodDef (child at index n)
+                // param(n) — nth parameter of a MethodDef.
+                // In C/C++ params are nested: function_definition →
+                // function_declarator → parameter_list → parameter_declaration.
+                // In Java/Go/JS/TS params sit inside formal_parameters or
+                // parameter_list which IS a direct child. We descend up to two
+                // container levels to collect all ParamDef nodes.
                 let n = step
                     .args
                     .first()
                     .and_then(|a| eval_as_index(self.eval_plan_expr(a, env)))
                     .unwrap_or(0);
-                // Parameters are children of kind ParamDef
-                let params: Vec<NodeId> = node.children.iter()
-                    .copied()
-                    .filter(|&child_id| {
-                        self.ctx.cpg.ast.get(&child_id)
-                            .map_or(false, |c| c.kind == IrNodeKind::ParamDef)
-                    })
-                    .collect();
+                let params = collect_param_nodes(self.ctx.cpg, node);
                 params.get(n).copied().map(EvalValue::Node).unwrap_or(EvalValue::Null)
             }
 
             "param_count" => {
-                let count = node.children.iter()
-                    .filter(|&&child_id| {
-                        self.ctx.cpg.ast.get(&child_id)
-                            .map_or(false, |c| c.kind == IrNodeKind::ParamDef)
-                    })
-                    .count();
+                let count = collect_param_nodes(self.ctx.cpg, node).len();
                 EvalValue::Int(count as i64)
             }
 
@@ -763,6 +864,21 @@ impl<'a> RuleRunner<'a> {
                     .unwrap_or(EvalValue::Null)
             }
 
+            // ── Symbolic / path-sensitive node methods ───────────────────────
+            // Walk up the parent chain to find the nearest Conditional or Switch
+            // ancestor, then return its "condition" field child.  This lets rules
+            // do things like `n.branch_condition().eval_bool()` to ask "is the
+            // guard that dominates n statically known to be true/false?"
+            "branch_condition" => {
+                find_enclosing_condition(self.ctx.cpg, node_id,
+                    &[IrNodeKind::Conditional, IrNodeKind::Switch])
+            }
+
+            // Same as branch_condition but walks up to the nearest Loop ancestor.
+            "loop_condition" => {
+                find_enclosing_condition(self.ctx.cpg, node_id, &[IrNodeKind::Loop])
+            }
+
             // ── Identifier node methods ───────────────────────────────────────
             "refers_to" => {
                 // Returns the resolved declaration node for this Call or identifier node.
@@ -774,9 +890,86 @@ impl<'a> RuleRunner<'a> {
                     .unwrap_or(EvalValue::Null)
             }
 
-            // ── Language metadata (stub — no metadata fields on IrNode yet) ──
-            "cpp_meta" | "go_meta" | "python_meta" | "java_meta"
-            | "js_meta" | "ts_meta" | "rust_meta" => EvalValue::Null,
+            // ── Alias / pointer analysis ─────────────────────────────────────
+            "points_to" => {
+                // Returns the first POINTS_TO target for this node, or Null.
+                self.ctx.alias.points_to_set(node_id)
+                    .and_then(|s| s.iter().next().copied())
+                    .map(EvalValue::Node)
+                    .unwrap_or(EvalValue::Null)
+            }
+
+            "alias_target" => {
+                // Synonym for points_to — first POINTS_TO target.
+                self.ctx.alias.points_to_set(node_id)
+                    .and_then(|s| s.iter().next().copied())
+                    .map(EvalValue::Node)
+                    .unwrap_or(EvalValue::Null)
+            }
+
+            "is_pointer" => {
+                // True if this node has any outgoing POINTS_TO edges.
+                EvalValue::Bool(self.ctx.alias.is_pointer(node_id))
+            }
+
+            // ── Size tracking ─────────────────────────────────────────────────
+            "alloc_size" => {
+                // Returns Int(n) for concrete sizes, Str(expr) for symbolic, Null if unknown.
+                match self.ctx.sizes.size_of(node_id) {
+                    SizeValue::Concrete(n) => EvalValue::Int(n),
+                    SizeValue::Symbolic(s) => EvalValue::Str(s),
+                    SizeValue::Unknown => EvalValue::Null,
+                }
+            }
+
+            "has_known_size" => {
+                // True only when a concrete byte count is known.
+                EvalValue::Bool(self.ctx.sizes.concrete_size(node_id).is_some())
+            }
+
+            // ── Nullability ───────────────────────────────────────────────────
+            "may_be_null" => {
+                EvalValue::Bool(self.ctx.nullability.may_be_null(node_id))
+            }
+
+            "null_source" => {
+                // Returns the original null-producing seed node, or Null.
+                self.ctx.nullability.null_origin_of(node_id)
+                    .map(EvalValue::Node)
+                    .unwrap_or(EvalValue::Null)
+            }
+
+            // ── Symbolic / constant-folding evaluation ────────────────────────
+            "eval_int" => {
+                let mut se = SymbolicEval::new(self.ctx.cpg);
+                match se.eval_int(node_id) {
+                    Some(n) => EvalValue::Int(n),
+                    None => EvalValue::Null,
+                }
+            }
+
+            "eval_bool" => {
+                let mut se = SymbolicEval::new(self.ctx.cpg);
+                match se.eval_bool(node_id) {
+                    Some(b) => EvalValue::Bool(b),
+                    None => EvalValue::Null,
+                }
+            }
+
+            "is_const_expr" => {
+                let mut se = SymbolicEval::new(self.ctx.cpg);
+                EvalValue::Bool(se.is_const(node_id))
+            }
+
+            // ── Language metadata side-table accessors ────────────────────────
+            // Return a MetaNode sentinel; the next chained step resolves the field.
+            "cpp_meta"    => EvalValue::MetaNode(node_id, "cpp".to_owned()),
+            "go_meta"     => EvalValue::MetaNode(node_id, "go".to_owned()),
+            "python_meta" => EvalValue::MetaNode(node_id, "python".to_owned()),
+            "java_meta"   => EvalValue::MetaNode(node_id, "java".to_owned()),
+            "js_meta"     => EvalValue::MetaNode(node_id, "js".to_owned()),
+            "ts_meta"     => EvalValue::MetaNode(node_id, "ts".to_owned()),
+            "rust_meta"   => EvalValue::MetaNode(node_id, "rust".to_owned()),
 
             _ => EvalValue::Null,
         }
@@ -856,6 +1049,199 @@ impl<'a> RuleRunner<'a> {
         }
         EvalValue::Null
     }
+
+    /// Resolve a single field from the language-specific metadata side-table for
+    /// `node_id`. Called when `eval_method_step` receives an `EvalValue::MetaNode`.
+    fn eval_meta_field(&self, node_id: NodeId, ns: &str, field: &str) -> EvalValue {
+        match ns {
+            "cpp" => {
+                let Some(m) = self.ctx.cpg.cpp_metadata.get(&node_id) else {
+                    return EvalValue::Null;
+                };
+                match field {
+                    "class_context"      => opt_str(&m.class_context),
+                    "namespace"          => opt_str(&m.namespace),
+                    "visibility"         => opt_str(&m.visibility),
+                    "qualified_name"     => opt_str(&m.qualified_name),
+                    "is_constructor"     => EvalValue::Bool(m.is_constructor.unwrap_or(false)),
+                    "is_destructor"      => EvalValue::Bool(m.is_destructor.unwrap_or(false)),
+                    "is_virtual"         => EvalValue::Bool(m.is_virtual.unwrap_or(false)),
+                    "is_virtual_dispatch" => EvalValue::Bool(m.is_virtual_dispatch),
+                    "template_params"    => first_str(&m.template_params),
+                    "base_classes"       => first_str(&m.base_classes),
+                    _                    => EvalValue::Null,
+                }
+            }
+            "go" => {
+                let Some(m) = self.ctx.cpg.go_metadata.get(&node_id) else {
+                    return EvalValue::Null;
+                };
+                match field {
+                    "package_name"       => opt_str(&m.package_name),
+                    "receiver_type"      => opt_str(&m.receiver_type),
+                    "receiver_name"      => opt_str(&m.receiver_name),
+                    "qualified_name"     => opt_str(&m.qualified_name),
+                    "is_exported"        => EvalValue::Bool(m.is_exported),
+                    "is_variadic"        => EvalValue::Bool(m.is_variadic),
+                    "is_interface"       => EvalValue::Bool(m.is_interface),
+                    "is_goroutine"       => EvalValue::Bool(m.is_goroutine),
+                    "is_deferred"        => EvalValue::Bool(m.is_deferred),
+                    "is_closure"         => EvalValue::Bool(m.is_closure),
+                    "is_init"            => EvalValue::Bool(m.is_init),
+                    "is_alias"           => EvalValue::Bool(m.is_alias),
+                    "is_const"           => EvalValue::Bool(m.is_const),
+                    "embedded_interfaces" => first_str(&m.embedded_interfaces),
+                    "generic_type_params" => first_str(&m.generic_type_params),
+                    _                    => EvalValue::Null,
+                }
+            }
+            "python" => {
+                let Some(m) = self.ctx.cpg.python_metadata.get(&node_id) else {
+                    return EvalValue::Null;
+                };
+                match field {
+                    "is_async"            => EvalValue::Bool(m.is_async),
+                    "is_generator"        => EvalValue::Bool(m.is_generator),
+                    "is_staticmethod"     => EvalValue::Bool(m.is_staticmethod),
+                    "is_classmethod"      => EvalValue::Bool(m.is_classmethod),
+                    "is_property"         => EvalValue::Bool(m.is_property),
+                    "is_abstract"         => EvalValue::Bool(m.is_abstract),
+                    "is_augmented"        => EvalValue::Bool(m.is_augmented),
+                    "is_constructor_call" => EvalValue::Bool(m.is_constructor_call),
+                    "is_super_call"       => EvalValue::Bool(m.is_super_call),
+                    "is_dunder_call"      => EvalValue::Bool(m.is_dunder_call),
+                    "is_yield_from"       => EvalValue::Bool(m.is_yield_from),
+                    "has_star_args"       => EvalValue::Bool(m.has_star_args),
+                    "has_double_star_args" => EvalValue::Bool(m.has_double_star_args),
+                    "is_star_param"       => EvalValue::Bool(m.is_star_param),
+                    "is_double_star_param" => EvalValue::Bool(m.is_double_star_param),
+                    "is_keyword_only"     => EvalValue::Bool(m.is_keyword_only),
+                    "return_annotation"   => opt_str(&m.return_annotation),
+                    "annotation"          => opt_str(&m.annotation),
+                    "metaclass"           => opt_str(&m.metaclass),
+                    "call_receiver_text"  => opt_str(&m.call_receiver_text),
+                    "decorators"          => first_str_vec(&m.decorators),
+                    "closure_vars"        => first_str_vec(&m.closure_vars),
+                    _                     => EvalValue::Null,
+                }
+            }
+            "java" => {
+                let Some(m) = self.ctx.cpg.java_metadata.get(&node_id) else {
+                    return EvalValue::Null;
+                };
+                match field {
+                    "package_name"          => opt_str(&m.package_name),
+                    "fully_qualified_class" => opt_str(&m.fully_qualified_class),
+                    "enclosing_class"       => opt_str(&m.enclosing_class),
+                    "extends_type"          => opt_str(&m.extends_type),
+                    "label_target"          => opt_str(&m.label_target),
+                    "is_interface"          => EvalValue::Bool(m.is_interface),
+                    "is_enum"               => EvalValue::Bool(m.is_enum),
+                    "is_record"             => EvalValue::Bool(m.is_record),
+                    "is_abstract"           => EvalValue::Bool(m.is_abstract),
+                    "is_final"              => EvalValue::Bool(m.is_final),
+                    "is_sealed"             => EvalValue::Bool(m.is_sealed),
+                    "is_anonymous"          => EvalValue::Bool(m.is_anonymous),
+                    "is_static"             => EvalValue::Bool(m.is_static),
+                    "is_synchronized"       => EvalValue::Bool(m.is_synchronized),
+                    "is_native"             => EvalValue::Bool(m.is_native),
+                    "is_varargs"            => EvalValue::Bool(m.is_varargs),
+                    "is_virtual_dispatch"   => EvalValue::Bool(m.is_virtual_dispatch),
+                    "is_this_call"          => EvalValue::Bool(m.is_this_call),
+                    "is_super_call"         => EvalValue::Bool(m.is_super_call),
+                    "is_static_import"      => EvalValue::Bool(m.is_static_import),
+                    "has_finally"           => EvalValue::Bool(m.has_finally),
+                    "access_modifiers"      => first_str_vec(&m.access_modifiers),
+                    "annotations"           => first_str_vec(&m.annotations),
+                    "throws_types"          => first_str_vec(&m.throws_types),
+                    "generic_type_params"   => first_str_vec(&m.generic_type_params),
+                    "implements_types"      => first_str_vec(&m.implements_types),
+                    "catch_types"           => first_str_vec(&m.catch_types),
+                    _                       => EvalValue::Null,
+                }
+            }
+            "js" => {
+                let Some(m) = self.ctx.cpg.js_metadata.get(&node_id) else {
+                    return EvalValue::Null;
+                };
+                match field {
+                    "is_async"       => EvalValue::Bool(m.is_async),
+                    "is_generator"   => EvalValue::Bool(m.is_generator),
+                    "is_arrow"       => EvalValue::Bool(m.is_arrow),
+                    "is_constructor" => EvalValue::Bool(m.is_constructor),
+                    "is_getter"      => EvalValue::Bool(m.is_getter),
+                    "is_setter"      => EvalValue::Bool(m.is_setter),
+                    "is_static"      => EvalValue::Bool(m.is_static),
+                    "is_private"     => EvalValue::Bool(m.is_private),
+                    "is_delegate"    => EvalValue::Bool(m.is_delegate),
+                    "is_for_of"      => EvalValue::Bool(m.is_for_of),
+                    "module_kind"    => opt_str(&m.module_kind),
+                    "scope_kind"     => opt_str(&m.scope_kind),
+                    "class_context"  => opt_str(&m.class_context),
+                    "export_kind"    => opt_str(&m.export_kind),
+                    "import_source"  => opt_str(&m.import_source),
+                    "decorator_names" => first_str_vec(&m.decorator_names),
+                    _                => EvalValue::Null,
+                }
+            }
+            "ts" => {
+                let Some(m) = self.ctx.cpg.ts_metadata.get(&node_id) else {
+                    return EvalValue::Null;
+                };
+                match field {
+                    "is_async"               => EvalValue::Bool(m.is_async),
+                    "is_abstract"            => EvalValue::Bool(m.is_abstract),
+                    "is_readonly"            => EvalValue::Bool(m.is_readonly),
+                    "is_optional"            => EvalValue::Bool(m.is_optional),
+                    "is_definite_assignment" => EvalValue::Bool(m.is_definite_assignment),
+                    "is_ambient"             => EvalValue::Bool(m.is_ambient),
+                    "is_declare"             => EvalValue::Bool(m.is_declare),
+                    "is_override"            => EvalValue::Bool(m.is_override),
+                    "is_using"               => EvalValue::Bool(m.is_using),
+                    "enum_is_const"          => EvalValue::Bool(m.enum_is_const),
+                    "module_is_namespace"    => EvalValue::Bool(m.module_is_namespace),
+                    "access_modifier"        => opt_str(&m.access_modifier),
+                    "type_annotation"        => opt_str(&m.type_annotation),
+                    "extends_type"           => opt_str(&m.extends_type),
+                    "satisfies_type"         => opt_str(&m.satisfies_type),
+                    "decorator_names"        => first_str_vec(&m.decorator_names),
+                    "implements_types"       => first_str_vec(&m.implements_types),
+                    "type_arguments"         => first_str_vec(&m.type_arguments),
+                    "generic_constraints"    => m.generic_constraints.first()
+                        .map(|(n, _)| EvalValue::Str(n.clone()))
+                        .unwrap_or(EvalValue::Null),
+                    _                        => EvalValue::Null,
+                }
+            }
+            "rust" => {
+                let Some(m) = self.ctx.cpg.rust_metadata.get(&node_id) else {
+                    return EvalValue::Null;
+                };
+                match field {
+                    "visibility"        => opt_str(&m.visibility),
+                    "abi"               => opt_str(&m.abi),
+                    "self_type"         => opt_str(&m.self_type),
+                    "trait_type"        => opt_str(&m.trait_type),
+                    "is_async"          => EvalValue::Bool(m.is_async),
+                    "is_unsafe"         => EvalValue::Bool(m.is_unsafe),
+                    "is_const"          => EvalValue::Bool(m.is_const),
+                    "is_extern"         => EvalValue::Bool(m.is_extern),
+                    "is_mut"            => EvalValue::Bool(m.is_mut),
+                    "is_move_closure"   => EvalValue::Bool(m.is_move_closure),
+                    "use_after_move"    => EvalValue::Bool(m.use_after_move),
+                    "is_unsafe_context" => EvalValue::Bool(m.is_unsafe_context),
+                    "is_no_std"         => EvalValue::Bool(m.is_no_std),
+                    "derive_macros"     => first_str_vec(&m.derive_macros),
+                    "lifetimes"         => first_str_vec(&m.lifetimes),
+                    "generic_params"    => first_str_vec(&m.generic_params),
+                    "where_clauses"     => first_str_vec(&m.where_clauses),
+                    "trait_bounds"      => first_str_vec(&m.trait_bounds),
+                    _                   => EvalValue::Null,
+                }
+            }
+            _ => EvalValue::Null,
+        }
+    }
 }
 
 // ── Evaluation values ─────────────────────────────────────────────────────────
@@ -863,10 +1249,37 @@ impl<'a> RuleRunner<'a> {
 #[derive(Debug, Clone)]
 pub enum EvalValue {
     Node(NodeId),
+    /// Intermediate value for language-metadata chains: `node.cpp_meta.is_virtual`.
+    /// Carries the node ID and the metadata namespace tag ("cpp", "go", "python",
+    /// "java", "js", "ts", "rust"). The next `eval_method_step` call resolves the
+    /// actual field from the matching side-table in the CPG.
+    MetaNode(NodeId, String),
     Str(String),
     Int(i64),
     Bool(bool),
     Null,
+}
+
+/// Return the set of all node IDs in the AST subtree rooted at `root` (inclusive).
+/// Used by DFG predicate subtree extensions so that `LocalDef.dfg_reaches(Call)`
+/// checks flow between descendant identifier/expression nodes, not just the
+/// structural container nodes (which have no DFG edges themselves).
+fn ast_subtree(cpg: &Cpg, root: NodeId) -> HashSet<NodeId> {
+    use std::collections::VecDeque;
+    let mut visited: HashSet<NodeId> = HashSet::new();
+    let mut queue: VecDeque<NodeId> = VecDeque::new();
+    queue.push_back(root);
+    visited.insert(root);
+    while let Some(nid) = queue.pop_front() {
+        if let Some(node) = cpg.ast.get(&nid) {
+            for &child in &node.children {
+                if visited.insert(child) {
+                    queue.push_back(child);
+                }
+            }
+        }
+    }
+    visited
 }
 
 fn eval_value_of_literal(lit: &Literal) -> EvalValue {
@@ -916,6 +1329,77 @@ fn eval_as_index(val: EvalValue) -> Option<usize> {
     if let EvalValue::Int(i) = val { Some(i as usize) } else { None }
 }
 
+fn opt_str(s: &Option<String>) -> EvalValue {
+    s.as_deref().map(|v| EvalValue::Str(v.to_owned())).unwrap_or(EvalValue::Null)
+}
+
+fn first_str(v: &Option<Vec<String>>) -> EvalValue {
+    v.as_ref().and_then(|list| list.first()).map(|s| EvalValue::Str(s.clone())).unwrap_or(EvalValue::Null)
+}
+
+fn first_str_vec(v: &[String]) -> EvalValue {
+    v.first().map(|s| EvalValue::Str(s.clone())).unwrap_or(EvalValue::Null)
+}
+
+// ── Symbolic / path-sensitive helpers ────────────────────────────────────────
+
+/// Walk up the AST parent chain from `start` and return the condition child of
+/// the nearest ancestor whose `kind` is in `targets` (Conditional, Loop, Switch).
+/// Prefers the child whose field name is "condition"; falls back to first child.
+/// Used by `.branch_condition()` and `.loop_condition()` node methods.
+fn find_enclosing_condition(cpg: &Cpg, start: NodeId, targets: &[IrNodeKind]) -> EvalValue {
+    let mut cur = start;
+    let mut depth = 0usize;
+    loop {
+        depth += 1;
+        if depth > 200 {
+            return EvalValue::Null;
+        }
+        let node = match cpg.ast.get(&cur) {
+            Some(n) => n,
+            None => return EvalValue::Null,
+        };
+        if targets.contains(&node.kind) {
+            // Find "condition" field child
+            let cond = node.children.iter().enumerate().find_map(|(i, &cid)| {
+                if node.field_names.get(i).and_then(|f| f.as_deref()) == Some("condition") {
+                    Some(cid)
+                } else {
+                    None
+                }
+            }).or_else(|| node.children.first().copied());
+            return cond.map(EvalValue::Node).unwrap_or(EvalValue::Null);
+        }
+        match node.parent_id {
+            Some(p) if p != cur => cur = p,
+            _ => return EvalValue::Null,
+        }
+    }
+}
+
+/// Symbolically evaluate the guard condition of the nearest enclosing
+/// Conditional/Loop/Switch ancestor of `node_id`.
+/// Returns `Some(true)` / `Some(false)` when the condition is a constant;
+/// `None` when it is not constant or when no enclosing branch exists.
+fn guard_const_eval(cpg: &Cpg, node_id: NodeId) -> Option<bool> {
+    let cond_val = find_enclosing_condition(
+        cpg,
+        node_id,
+        &[IrNodeKind::Conditional, IrNodeKind::Loop, IrNodeKind::Switch],
+    );
+    let cond_id = match cond_val {
+        EvalValue::Node(id) => id,
+        _ => return None,
+    };
+    let mut se = SymbolicEval::new(cpg);
+    match se.eval(cond_id) {
+        crate::symbolic::SymbolicValue::Bool(b) => Some(b),
+        crate::symbolic::SymbolicValue::Int(0) => Some(false),
+        crate::symbolic::SymbolicValue::Int(_) => Some(true),
+        _ => None,
+    }
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Find the `CallSite` record in the call graph that corresponds to the given call-expression
@@ -931,6 +1415,61 @@ fn callee_site_for_node<'a>(cpg: &'a Cpg, call_node_id: NodeId) -> Option<&'a Ca
         }
     }
     None
+}
+
+/// Collect all `ParamDef` nodes for a function/method node, descending into
+/// transparent parameter containers (`parameter_list`, `formal_parameters`,
+/// `function_declarator`) so this works for all supported languages.
+fn collect_param_nodes(cpg: &Cpg, fn_node: &IrNode) -> Vec<NodeId> {
+    let mut params: Vec<NodeId> = Vec::new();
+    for &cid in &fn_node.children {
+        let child = match cpg.ast.get(&cid) { Some(c) => c, None => continue };
+        if child.kind == IrNodeKind::ParamDef {
+            params.push(cid);
+        } else if matches!(
+            child.node_type.as_str(),
+            "parameter_list" | "formal_parameters" | "parameters"
+        ) {
+            for &gcid in &child.children {
+                if cpg.ast.get(&gcid).map_or(false, |g| g.kind == IrNodeKind::ParamDef) {
+                    params.push(gcid);
+                }
+            }
+        } else if child.node_type == "function_declarator" {
+            // C/C++: function_definition → function_declarator → parameter_list → params
+            for &gcid in &child.children {
+                if let Some(gc) = cpg.ast.get(&gcid) {
+                    if gc.node_type == "parameter_list" {
+                        for &ggcid in &gc.children {
+                            if cpg.ast.get(&ggcid).map_or(false, |g| g.kind == IrNodeKind::ParamDef) {
+                                params.push(ggcid);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Filter out C-style `(void)` — a nameless parameter_declaration whose only
+    // non-punctuation child is `primitive_type` "void". This represents an empty
+    // parameter list in C, not an actual void-typed parameter.
+    params.retain(|&pid| !is_c_void_param(cpg, pid));
+    params
+}
+
+/// Returns true for a `parameter_declaration` node that is the C `(void)` sentinel,
+/// meaning the function takes no arguments (as opposed to an unprototyped `()`).
+fn is_c_void_param(cpg: &Cpg, param_id: NodeId) -> bool {
+    let Some(node) = cpg.ast.get(&param_id) else { return false };
+    if node.node_type != "parameter_declaration" { return false }
+    if node.name.is_some() { return false }
+    let type_children: Vec<_> = node.children.iter()
+        .filter_map(|&cid| cpg.ast.get(&cid))
+        .filter(|c| c.node_type != "," && !c.node_type.starts_with('*'))
+        .collect();
+    type_children.len() == 1
+        && type_children[0].node_type == "primitive_type"
+        && type_children[0].text.as_deref() == Some("void")
 }
 
 /// Return candidate node IDs for a root binding, respecting NodeType raw matching.

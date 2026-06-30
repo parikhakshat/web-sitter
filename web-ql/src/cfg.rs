@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use roaring::RoaringBitmap;
-use web_sitter::{BasicBlock, Cpg, NodeId};
+use web_sitter::{BasicBlock, Cpg, IrNodeKind, NodeId};
+use crate::symbolic::{SymbolicEval, SymbolicValue};
 
 /// Unique identifier for a basic block within a function.
 pub type BlockId = u32;
@@ -195,6 +196,11 @@ pub struct FunctionCfg {
     pub entry: BlockId,
     /// Blocks reachable via exception_successors edges (propagated transitively)
     pub exception_blocks: HashSet<BlockId>,
+    /// For each block that ends in a conditional branch, the CPG NodeId of the
+    /// condition expression.  Derived from Conditional/Loop/Switch AST nodes
+    /// whose condition-field child lands in that block.  Used by feasible-path
+    /// analysis to prune provably-dead edges.
+    pub block_to_condition: HashMap<BlockId, NodeId>,
 }
 
 impl FunctionCfg {
@@ -208,8 +214,15 @@ impl FunctionCfg {
             .filter(|(_, b)| b.function == fn_id)
             .collect();
 
-        // Sort by block ID string for deterministic ordering
-        fn_blocks.sort_by_key(|(id, _)| id.as_str());
+        // Sort by numeric suffix for deterministic ordering that matches
+        // the block creation order (e.g. "bb_5" < "bb_12" < "bb_100").
+        // Lexicographic sort would mis-order these ("bb_100" < "bb_5").
+        fn_blocks.sort_by(|(a, _), (b, _)| {
+            let num = |s: &str| -> u64 {
+                s.rsplit('_').next().and_then(|n| n.parse().ok()).unwrap_or(0)
+            };
+            num(a).cmp(&num(b))
+        });
 
         let n = fn_blocks.len();
 
@@ -223,6 +236,7 @@ impl FunctionCfg {
                 reach: CfgReachability { reach: vec![], n: 0 },
                 entry: 0,
                 exception_blocks: HashSet::new(),
+                block_to_condition: HashMap::new(),
             };
         }
 
@@ -296,7 +310,39 @@ impl FunctionCfg {
             }
         }
 
-        Self { succs, preds, node_to_block, dom, post_dom, reach, entry, exception_blocks }
+        // For each Conditional / Loop / Switch node in this function, find the
+        // "condition" field child and record which block that child lives in.
+        // This drives feasible-path analysis: when a block with 2 successors has
+        // a statically-evaluable condition we can prune the dead arm.
+        let mut block_to_condition: HashMap<BlockId, NodeId> = HashMap::new();
+        for (&nid, node) in &cpg.ast {
+            if node.function_id != Some(fn_id) {
+                continue;
+            }
+            if !matches!(node.kind, IrNodeKind::Conditional | IrNodeKind::Loop | IrNodeKind::Switch) {
+                continue;
+            }
+            // Prefer the "condition" named field; fall back to the first child.
+            let cond_child = node.children.iter().enumerate().find_map(|(i, &cid)| {
+                if node.field_names.get(i).and_then(|f| f.as_deref()) == Some("condition") {
+                    Some(cid)
+                } else {
+                    None
+                }
+            }).or_else(|| node.children.first().copied());
+
+            if let Some(cid) = cond_child {
+                if let Some(&blk) = node_to_block.get(&cid) {
+                    // Only map it if that block actually branches (2+ successors);
+                    // otherwise we'd incorrectly annotate non-branching blocks.
+                    if succs[blk as usize].len() >= 2 {
+                        block_to_condition.insert(blk, cid);
+                    }
+                }
+            }
+        }
+
+        Self { succs, preds, node_to_block, dom, post_dom, reach, entry, exception_blocks, block_to_condition }
     }
 
     /// True if node `a` dominates node `b` in this function's CFG.
@@ -331,16 +377,13 @@ impl FunctionCfg {
         }
     }
 
-    /// True if `node` is inside a loop (its block has a back-edge to a dominating block).
+    /// True if `node` is inside a loop (i.e., its block is part of the loop's SCC).
     pub fn node_in_loop(&self, node: NodeId) -> bool {
         let Some(&block) = self.node_to_block.get(&node) else { return false };
-        for &succ in &self.succs[block as usize] {
-            // A back edge is one where the target dominates the source
-            if self.dom.dominates(succ, block) {
-                return true;
-            }
-        }
-        false
+        let Some(header) = self.find_loop_header(block) else { return false };
+        // The block IS the header (back edge discovered on header's predecessors), or
+        // the block can reach the header (proving it's in the SCC, not just dominated by it).
+        block == header || self.reach.can_reach(block, header)
     }
 
     /// Walk up the dominator chain from `block` to find the innermost enclosing
@@ -364,17 +407,30 @@ impl FunctionCfg {
 
     /// True if `node` is inside a loop whose strongly-connected component has
     /// no exit edge to outside the loop body (i.e., infinite loop with no break/return).
-    pub fn node_loop_has_no_exit(&self, node: NodeId) -> bool {
+    pub fn node_loop_has_no_exit(&self, node: NodeId, cpg: &Cpg) -> bool {
         let Some(&block) = self.node_to_block.get(&node) else { return false };
         let n = self.succs.len();
         let Some(header) = self.find_loop_header(block) else { return false };
-        // Loop SCC: blocks that can reach header AND are reachable from header
+
+        // Symbolic short-circuit: if the loop header's condition is constant-true,
+        // the structural "exit" edge is dead and the loop never terminates.
+        if let Some(&cond_node) = self.block_to_condition.get(&header) {
+            let mut se = SymbolicEval::new(cpg);
+            match se.eval_int(cond_node) {
+                Some(v) if v != 0 => return true,
+                _ => {}
+            }
+            if se.eval_bool(cond_node) == Some(true) {
+                return true;
+            }
+        }
+
+        // Structural check: no block in the SCC has an exit edge.
         let in_scc = |b: u32| -> bool {
             (b as usize) < n
                 && self.reach.can_reach(header, b)
                 && self.reach.can_reach(b, header)
         };
-        // If any block in the SCC has a normal successor outside the SCC, the loop has an exit
         for b in 0..n as u32 {
             if !in_scc(b) {
                 continue;
@@ -414,6 +470,58 @@ impl FunctionCfg {
             for &s in &self.succs[b as usize] {
                 if !visited.contains(&s) && Some(s) != barrier_block {
                     visited.insert(s);
+                    queue.push_back(s);
+                }
+            }
+        }
+        false
+    }
+
+    /// Path-sensitive reachability: same as `node_reaches` but prunes edges whose
+    /// branch guard is a constant.  For a block with exactly two successors:
+    /// - Condition evaluates to `true`/nonzero → only follow successor[0] (the
+    ///   "then"/"body" arm, which the CPG generator always emits first).
+    /// - Condition evaluates to `false`/zero → only follow successor[1] (the
+    ///   "else"/"exit" arm).
+    /// Falls back to following all successors when the condition isn't constant.
+    pub fn feasible_reaches(&self, from: NodeId, to: NodeId, cpg: &Cpg) -> bool {
+        let (Some(&bf), Some(&bt)) = (
+            self.node_to_block.get(&from),
+            self.node_to_block.get(&to),
+        ) else {
+            return false;
+        };
+
+        let mut visited = HashSet::new();
+        let mut queue = VecDeque::new();
+        queue.push_back(bf);
+        visited.insert(bf);
+
+        while let Some(b) = queue.pop_front() {
+            if b == bt {
+                return true;
+            }
+            let succs = &self.succs[b as usize];
+            let live: Vec<BlockId> = if succs.len() == 2 {
+                if let Some(&cid) = self.block_to_condition.get(&b) {
+                    let mut se = SymbolicEval::new(cpg);
+                    match se.eval(cid) {
+                        // Condition always true → only the "then/body" arm (index 0)
+                        SymbolicValue::Bool(true) => vec![succs[0]],
+                        SymbolicValue::Int(n) if n != 0 => vec![succs[0]],
+                        // Condition always false → only the "else/exit" arm (index 1)
+                        SymbolicValue::Bool(false) | SymbolicValue::Int(0) => vec![succs[1]],
+                        _ => succs.to_vec(),
+                    }
+                } else {
+                    succs.to_vec()
+                }
+            } else {
+                succs.to_vec()
+            };
+
+            for s in live {
+                if visited.insert(s) {
                     queue.push_back(s);
                 }
             }

@@ -199,14 +199,33 @@ impl<'a> TaintEngine<'a> {
                     if result.tainted.contains(node_id) {
                         continue;
                     }
-                    // Check which argument positions are tainted
-                    let tainted_args: HashSet<usize> = node
-                        .children
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, arg_id)| result.tainted.contains(*arg_id))
-                        .map(|(i, _)| i)
-                        .collect();
+                    // Check which argument positions are tainted.
+                    // For most languages args live inside an argument_list/arguments
+                    // child of the call node, not as direct children. Descend one
+                    // level into that container before enumerating positions.
+                    let tainted_args: HashSet<usize> = {
+                        let arg_ids: Vec<NodeId> = node
+                            .children
+                            .iter()
+                            .find_map(|&cid| {
+                                let child = self.cpg.ast.get(&cid)?;
+                                if matches!(
+                                    child.node_type.as_str(),
+                                    "argument_list" | "arguments"
+                                ) {
+                                    Some(child.children.iter().copied().collect::<Vec<_>>())
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or_else(|| node.children.iter().copied().collect());
+                        arg_ids
+                            .into_iter()
+                            .enumerate()
+                            .filter(|(_, arg_id)| result.tainted.contains(arg_id))
+                            .map(|(i, _)| i)
+                            .collect()
+                    };
 
                     if tainted_args.is_empty() {
                         continue;
@@ -255,7 +274,6 @@ impl<'a> TaintEngine<'a> {
                 // Find which source leads to this sink
                 for src in &sources {
                     if self.dfg.reaches(src.node, sink.node)
-                        || result.tainted.contains(&src.node)
                     {
                         // Enforce same-function constraint when requested
                         if spec.require_same_function {

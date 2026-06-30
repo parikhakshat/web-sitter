@@ -364,9 +364,16 @@ impl Parser {
         let start = self.current_span();
         self.expect(&Token::Find, "`find`")?;
         let bindings = self.parse_binding_list()?;
-        self.expect(&Token::Where, "`where`")?;
-        let condition = self.parse_expr()?;
-        let end = condition.span;
+        // `where <condition>` is optional — if absent, defaults to `true`
+        let (condition, end) = if self.peek_tok() == Some(&Token::Where) {
+            self.pos += 1;
+            let cond = self.parse_expr()?;
+            let e = cond.span;
+            (cond, e)
+        } else {
+            let sp = self.current_span();
+            (Expr { span: sp, kind: ExprKind::Literal(Literal::Bool(true)) }, sp)
+        };
         Ok(SearchClause {
             span: start.merge(end),
             bindings,
@@ -1015,9 +1022,17 @@ impl Parser {
         let start = self.current_span();
         self.expect(&Token::Find, "`find`")?;
         let bindings = self.parse_binding_list()?;
-        self.expect(&Token::Where, "`where`")?;
-        let condition = self.parse_expr()?;
-        let end = condition.span;
+        // `where <condition>` is optional — if omitted, condition defaults to `true`
+        let (condition, end) = if self.peek_tok() == Some(&Token::Where) {
+            self.pos += 1; // consume `where`
+            let cond = self.parse_expr()?;
+            let e = cond.span;
+            (cond, e)
+        } else {
+            let sp = self.current_span();
+            let cond = Expr { span: sp, kind: ExprKind::Literal(Literal::Bool(true)) };
+            (cond, sp)
+        };
         Ok(FindExpr { span: start.merge(end), bindings, condition })
     }
 

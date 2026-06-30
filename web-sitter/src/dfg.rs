@@ -543,7 +543,7 @@ fn build_call_graph_impl(
                     entry.calls.push(CallSite {
                         callee: callee_name.clone(),
                         callee_id,
-                        call_site: Some(node.line),
+                        call_site: Some(*node_id),
                         qualified_callee: qualified_callee.clone(),
                         callee_kind,
                     });
@@ -578,7 +578,7 @@ fn build_call_graph_impl(
                 entry.calls.push(CallSite {
                     callee: callback_name.clone(),
                     callee_id: callback_id,
-                    call_site: Some(node.line),
+                    call_site: Some(*node_id),
                     qualified_callee: None,
                     callee_kind: callback_kind,
                 });
@@ -646,7 +646,7 @@ fn build_call_graph_impl(
                     entry.calls.push(CallSite {
                         callee: callee_name.clone(),
                         callee_id,
-                        call_site: Some(new_node.line),
+                        call_site: Some(node_id),
                         qualified_callee: None,
                         callee_kind,
                     });
@@ -982,7 +982,20 @@ fn build_dataflow_impl(
             }
         }
 
-        let Some(lhs_var) = lhs_vars.first() else {
+        // When the LHS is a plain identifier, collect_identifiers_in_expr returns []
+        // because is_lvalue_context returns true for the first child of
+        // assignment_expression. Fall back to reading the identifier directly.
+        let lhs_var_owned;
+        let lhs_var = if let Some(v) = lhs_vars.first() {
+            v
+        } else if graph.get(&lhs_expr_id).map(|n| n.is_identifier()).unwrap_or(false) {
+            if let Some(name) = graph.get(&lhs_expr_id).and_then(|n| n.text.clone()) {
+                lhs_var_owned = VarRef { name, node_id: lhs_expr_id };
+                &lhs_var_owned
+            } else {
+                continue;
+            }
+        } else {
             continue;
         };
 
@@ -1743,6 +1756,169 @@ fn build_dataflow_impl(
         }
     }
 
+    // ── Python: assignment / augmented-assignment statements ─────────────────
+    // assignment:           [lhs, "=",  rhs]
+    // augmented_assignment: [lhs, "+=", rhs]  (and similar)
+    //
+    // The identifier loop above already classifies the LHS identifier as a DEF
+    // (via is_lvalue_context recognising "assignment"/"augmented_assignment").
+    // What is missing is a cross-variable REACHING_DEF edge from each RHS
+    // identifier → the LHS identifier so that taint flows between variables
+    // (e.g. `x = data` should give data→x flow, not just same-variable flow).
+    for assign_type in ["assignment", "augmented_assignment"] {
+        for node_id in type_index.get(assign_type).cloned().unwrap_or_default() {
+            if !node_in_scope(node_id, &function_map, affected_function_ids, include_globals) {
+                continue;
+            }
+            let Some(node) = graph.get(&node_id) else { continue; };
+            if node.children.len() < 2 { continue; }
+            let lhs_expr_id = node.children[0];
+            // collect_identifiers_in_expr skips lvalue-context nodes, but here we
+            // specifically want the LHS identifier, so look up it directly.
+            let Some(lhs_node) = graph.get(&lhs_expr_id) else { continue; };
+            let lhs_name = lhs_node.text.clone().or_else(|| {
+                // tuple / attribute LHS — skip for now
+                None
+            });
+            let Some(lhs_name) = lhs_name else { continue; };
+            if !lhs_node.is_identifier() { continue; }
+            let rhs_children: Vec<NodeId> = node.children[1..].to_vec();
+            for rhs_child_id in rhs_children {
+                for var in collect_identifiers_in_expr(graph, rhs_child_id, Some(&parent_map)) {
+                    push_edge(
+                        &mut edges,
+                        var.node_id,
+                        lhs_expr_id,
+                        lhs_name.clone(),
+                        "REACHING_DEF",
+                    );
+                }
+            }
+        }
+    }
+
+    // ── Go: short_var_declaration / assignment_statement ────────────────────
+    // short_var_declaration: [lhs_identifier, ":=", rhs_expr]
+    //   or (multi-assign): [expression_list_lhs, ":=", expression_list_rhs]
+    // assignment_statement:  similar structure with "="
+    //
+    // The identifier loop above already classifies LHS identifiers as DEFs.
+    // This pass adds the missing cross-variable REACHING_DEF edge from each
+    // RHS identifier to the LHS identifier.
+    for assign_type in ["short_var_declaration", "assignment_statement"] {
+        for node_id in type_index.get(assign_type).cloned().unwrap_or_default() {
+            if !node_in_scope(node_id, &function_map, affected_function_ids, include_globals) {
+                continue;
+            }
+            let Some(node) = graph.get(&node_id) else { continue; };
+            if node.children.len() < 2 { continue; }
+            // Collect LHS identifier(s): first child (identifier) or first child's children
+            // if it's an expression_list.
+            let lhs_child_id = node.children[0];
+            let lhs_ids: Vec<(NodeId, String)> = {
+                match graph.get(&lhs_child_id) {
+                    Some(lhs) if lhs.is_identifier() => {
+                        lhs.text.as_ref().map(|t| vec![(lhs_child_id, t.clone())]).unwrap_or_default()
+                    }
+                    Some(lhs) if lhs.node_type == "expression_list" => {
+                        lhs.children.iter().filter_map(|&cid| {
+                            let c = graph.get(&cid)?;
+                            if c.is_identifier() {
+                                Some((cid, c.text.clone()?))
+                            } else {
+                                None
+                            }
+                        }).collect()
+                    }
+                    _ => vec![],
+                }
+            };
+            for (lhs_id, lhs_name) in lhs_ids {
+                for &rhs_child_id in node.children.iter().skip(1) {
+                    for var in collect_identifiers_in_expr(graph, rhs_child_id, Some(&parent_map)) {
+                        push_edge(&mut edges, var.node_id, lhs_id, lhs_name.clone(), "REACHING_DEF");
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Java / JS / TS: variable_declarator ─────────────────────────────────
+    // variable_declarator: [name_identifier, "=", rhs_expr]
+    // The identifier loop classifies name_identifier as a DEF.
+    // This pass creates the cross-variable edge: rhs_identifier → name_identifier.
+    for node_id in type_index.get("variable_declarator").cloned().unwrap_or_default() {
+        if !node_in_scope(node_id, &function_map, affected_function_ids, include_globals) {
+            continue;
+        }
+        let Some(node) = graph.get(&node_id) else { continue; };
+        if node.children.len() < 2 { continue; }
+        let lhs_id = node.children[0];
+        let Some(lhs_node) = graph.get(&lhs_id) else { continue; };
+        let Some(lhs_name) = lhs_node.text.clone() else { continue; };
+        if !lhs_node.is_identifier() { continue; }
+        for &rhs_child_id in node.children.iter().skip(1) {
+            for var in collect_identifiers_in_expr(graph, rhs_child_id, Some(&parent_map)) {
+                push_edge(&mut edges, var.node_id, lhs_id, lhs_name.clone(), "REACHING_DEF");
+            }
+        }
+    }
+
+    // ── Rust: let_declaration ────────────────────────────────────────────────
+    // let_declaration children have field names: "pattern" (lhs) and "value" (rhs).
+    // The identifier loop classifies the pattern identifier as a DEF.
+    // This pass creates the cross-variable edge: rhs_identifier → pattern_identifier.
+    for node_id in type_index.get("let_declaration").cloned().unwrap_or_default() {
+        if !node_in_scope(node_id, &function_map, affected_function_ids, include_globals) {
+            continue;
+        }
+        let Some(node) = graph.get(&node_id) else { continue; };
+        let mut lhs_id_opt: Option<NodeId> = None;
+        let mut rhs_ids: Vec<NodeId> = Vec::new();
+        let mut past_eq = false;
+        for (&cid, fname) in node.children.iter().zip(node.field_names.iter()) {
+            match fname.as_deref() {
+                Some("pattern") => lhs_id_opt = Some(cid),
+                Some("value") => rhs_ids.push(cid),
+                _ => {
+                    // Fallback: split on "=" token for let declarations without field names
+                    if graph.get(&cid).and_then(|c| c.text.as_deref()).map(|t| t == "=") == Some(true) {
+                        past_eq = true;
+                    } else if past_eq {
+                        rhs_ids.push(cid);
+                    }
+                }
+            }
+        }
+        // If no pattern field found, assume first non-keyword child is the pattern
+        if lhs_id_opt.is_none() {
+            past_eq = false;
+            for (&cid, fname) in node.children.iter().zip(node.field_names.iter()) {
+                if graph.get(&cid).and_then(|c| c.text.as_deref()).map(|t| t == "let") == Some(true) {
+                    continue;
+                }
+                if graph.get(&cid).and_then(|c| c.text.as_deref()).map(|t| t == "=") == Some(true) {
+                    past_eq = true;
+                    continue;
+                }
+                if !past_eq && lhs_id_opt.is_none() {
+                    lhs_id_opt = Some(cid);
+                } else if past_eq {
+                    rhs_ids.push(cid);
+                }
+            }
+        }
+        let Some(lhs_id) = lhs_id_opt else { continue; };
+        let Some(lhs_node) = graph.get(&lhs_id) else { continue; };
+        if !lhs_node.is_identifier() { continue; }
+        let Some(lhs_name) = lhs_node.text.clone() else { continue; };
+        for &rhs_child_id in &rhs_ids {
+            for var in collect_identifiers_in_expr(graph, rhs_child_id, Some(&parent_map)) {
+                push_edge(&mut edges, var.node_id, lhs_id, lhs_name.clone(), "REACHING_DEF");
+            }
+        }
+    }
+
     // Python: for-in comprehension iteration variable — isolated scope def.
     // for_in_clause: [identifier, "in", iterable]
     for node_id in type_index.get("for_in_clause").cloned().unwrap_or_default() {
@@ -2392,6 +2568,10 @@ fn is_parameter_name(graph: &BTreeMap<NodeId, AstNode>, node_id: NodeId) -> bool
     let Some(node) = graph.get(&node_id) else {
         return false;
     };
+    // Python: parameters are lifted to ParamDef kind directly (not wrapped in an Identifier child)
+    if node.is_param_def() {
+        return true;
+    }
     if !node.is_identifier() {
         return false;
     }

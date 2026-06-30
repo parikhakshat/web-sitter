@@ -4,10 +4,13 @@ use rayon::prelude::*;
 use web_sitter::{Cpg, FunctionSummary, IrNodeKind, NodeId};
 use web_profiler as prof;
 
+use crate::alias::AliasIndex;
 use crate::cfg::FunctionCfg;
 use crate::dfg::DfgIndex;
 use crate::finding::Finding;
 use crate::ir::RuleSet;
+use crate::nullability::NullabilityIndex;
+use crate::size_tracking::AllocSizeIndex;
 use crate::taint::{CrossFileTaintCtx, EndpointRegistry, TaintFinding};
 use crate::engine::{EvalContext, RuleRunner};
 
@@ -19,6 +22,12 @@ pub struct FileIndex {
     pub cpg: Cpg,
     pub dfg: DfgIndex,
     pub cfg_cache: HashMap<NodeId, FunctionCfg>,
+    /// Pointer alias index (POINTS_TO edges).
+    pub alias: AliasIndex,
+    /// Buffer / allocation size index.
+    pub sizes: AllocSizeIndex,
+    /// Null-value propagation index.
+    pub nullability: NullabilityIndex,
     /// Content hash (mtime + size) for invalidation.
     pub content_hash: u64,
     /// Approximate memory footprint in bytes (for profiler cache tracking).
@@ -42,10 +51,23 @@ impl FileIndex {
             build_cfg_cache(&cpg)
         };
 
+        let alias = {
+            let _s = prof::span("query.build_alias_index");
+            AliasIndex::build(&cpg)
+        };
+        let sizes = {
+            let _s = prof::span("query.build_size_index");
+            AllocSizeIndex::build(&cpg)
+        };
+        let nullability = {
+            let _s = prof::span("query.build_nullability_index");
+            NullabilityIndex::build(&cpg)
+        };
+
         prof::cache_insert("file_index", size_estimate);
         prof::count("cfg_functions_cached", cfg_cache.len() as u64);
 
-        Self { path, cpg, dfg, cfg_cache, content_hash, size_estimate }
+        Self { path, cpg, dfg, cfg_cache, alias, sizes, nullability, content_hash, size_estimate }
     }
 }
 
@@ -332,6 +354,9 @@ impl Workspace {
                     cpg: &file_idx.cpg,
                     dfg: &file_idx.dfg,
                     cfg_cache: &file_idx.cfg_cache,
+                    alias: &file_idx.alias,
+                    sizes: &file_idx.sizes,
+                    nullability: &file_idx.nullability,
                     summaries: &self.summaries,
                     registry: &self.registry,
                     predicate_plans,
@@ -384,6 +409,9 @@ impl Workspace {
                     cpg: &file_idx.cpg,
                     dfg: &file_idx.dfg,
                     cfg_cache: &file_idx.cfg_cache,
+                    alias: &file_idx.alias,
+                    sizes: &file_idx.sizes,
+                    nullability: &file_idx.nullability,
                     summaries: &self.summaries,
                     registry: &self.registry,
                     predicate_plans,

@@ -1193,20 +1193,27 @@ fn enrich_cpp_metadata(cpg: &mut crate::Cpg) {
     }
 
     // Extract the simple function name from a function_definition node via AST.
+    // Handles pointer/reference-returning functions where function_declarator is
+    // nested inside pointer_declarator / reference_declarator / parenthesized_declarator.
     fn extract_fn_simple_name(ast: &BTreeMap<NodeId, AstNode>, fn_def_id: NodeId) -> String {
         let Some(fn_node) = ast.get(&fn_def_id) else {
             return String::new();
         };
-        for &child_id in &fn_node.children {
-            let Some(child) = ast.get(&child_id) else {
-                continue;
-            };
-            if child.node_type == "function_declarator" {
-                if let Some(&name_id) = child.children.first() {
-                    if let Some(name_node) = ast.get(&name_id) {
-                        // qualified_identifier: use last component
+
+        fn resolve_name(ast: &BTreeMap<NodeId, AstNode>, node_id: NodeId, depth: usize) -> Option<String> {
+            if depth > 8 {
+                return None;
+            }
+            let node = ast.get(&node_id)?;
+            match node.node_type.as_str() {
+                "function_declarator" => {
+                    // First child is the name node (identifier, qualified_identifier,
+                    // destructor_name, operator_name, etc.).
+                    node.children.first().and_then(|&name_id| {
+                        let name_node = ast.get(&name_id)?;
                         let raw = name_node.text.as_deref().unwrap_or("");
-                        return raw
+                        // Strip namespace qualifier, parameter list, destructor tilde, pointer star.
+                        let simple = raw
                             .rsplit("::")
                             .next()
                             .unwrap_or(raw)
@@ -1215,9 +1222,26 @@ fn enrich_cpp_metadata(cpg: &mut crate::Cpg) {
                             .unwrap_or(raw)
                             .trim_matches('~')
                             .trim_matches('*')
-                            .to_string();
-                    }
+                            .trim();
+                        if simple.is_empty() { None } else { Some(simple.to_string()) }
+                    })
                 }
+                // Pointer/reference/parenthesized declarators wrap the function_declarator.
+                "pointer_declarator"
+                | "reference_declarator"
+                | "rvalue_reference_declarator"
+                | "parenthesized_declarator"
+                | "abstract_pointer_declarator"
+                | "abstract_reference_declarator" => {
+                    node.children.iter().find_map(|&cid| resolve_name(ast, cid, depth + 1))
+                }
+                _ => None,
+            }
+        }
+
+        for &child_id in &fn_node.children {
+            if let Some(name) = resolve_name(ast, child_id, 0) {
+                return name;
             }
         }
         String::new()
@@ -1291,7 +1315,7 @@ fn enrich_cpp_metadata(cpg: &mut crate::Cpg) {
             .map(|n| n.node_type == "function_definition")
             .unwrap_or(false);
 
-        let (is_ctor, is_dtor, is_virt, qname) = if is_fn_def {
+        let (is_ctor, is_dtor, is_virt, qname, fn_simple_name) = if is_fn_def {
             let (_, is_dtor) = detect_ctor_dtor(&cpg.ast, node_id);
             let is_virt = detect_virtual(&cpg.ast, node_id);
             let fn_name = extract_fn_simple_name(&cpg.ast, node_id);
@@ -1317,13 +1341,19 @@ fn enrich_cpp_metadata(cpg: &mut crate::Cpg) {
                     Some(parts.join("::"))
                 }
             };
-            (is_ctor, is_dtor, is_virt, qname)
+            (is_ctor, is_dtor, is_virt, qname, fn_name)
         } else {
-            (false, false, false, None)
+            (false, false, false, None, String::new())
         };
 
         // Write to AstNode fields for backward compatibility.
         if let Some(node) = cpg.ast.get_mut(&node_id) {
+            // Populate the name field for C/C++ function_definition nodes.
+            // Other languages set this in their own enrichment passes; C/C++ must
+            // set it here so that query predicates like `node.name` work uniformly.
+            if is_fn_def && !fn_simple_name.is_empty() && node.name.is_none() {
+                node.name = Some(fn_simple_name.clone());
+            }
             if class_ctx.is_some() {
                 node.class_context = class_ctx.clone();
             }
@@ -1366,6 +1396,224 @@ fn enrich_cpp_metadata(cpg: &mut crate::Cpg) {
                 }
                 meta.qualified_name = qname;
                 meta.function_kind = crate::FunctionKind::Internal;
+            }
+        }
+    }
+
+    // Populate name and base_classes on class_specifier / struct_specifier (ClassDef) nodes.
+    for (class_id, class_name) in &class_nodes {
+        if let Some(node) = cpg.ast.get_mut(class_id) {
+            if node.name.is_none() {
+                node.name = Some(class_name.clone());
+            }
+        }
+        // C++: extract base classes from base_class_clause → base_specifier → type_identifier
+        let children = cpg.ast.get(class_id).map(|n| n.children.clone()).unwrap_or_default();
+        let base_classes: Vec<String> = children.iter().find_map(|&cid| {
+            let c = cpg.ast.get(&cid)?;
+            if c.node_type != "base_class_clause" { return None; }
+            let bases: Vec<String> = c.children.iter().filter_map(|&bid| {
+                let b = cpg.ast.get(&bid)?;
+                if b.node_type == "base_specifier" {
+                    // Look for type_identifier inside base_specifier
+                    b.children.iter().find_map(|&tid| {
+                        cpg.ast.get(&tid).filter(|t| {
+                            matches!(t.node_type.as_str(), "type_identifier" | "identifier")
+                        }).and_then(|t| t.text.clone())
+                    })
+                } else if matches!(b.node_type.as_str(), "type_identifier" | "identifier") {
+                    b.text.clone()
+                } else {
+                    None
+                }
+            }).collect();
+            if bases.is_empty() { None } else { Some(bases) }
+        }).unwrap_or_default();
+        if !base_classes.is_empty() {
+            if let Some(n) = cpg.ast.get_mut(class_id) {
+                n.base_classes = Some(base_classes);
+            }
+        }
+    }
+
+    // Populate name on namespace_definition nodes.
+    for (ns_id, ns_name) in &namespace_nodes {
+        if let Some(node) = cpg.ast.get_mut(ns_id) {
+            if node.name.is_none() {
+                node.name = Some(ns_name.clone());
+            }
+        }
+    }
+
+    // ── Third pass: populate names and signatures for param/local nodes ─────────
+    // C/C++ parameter_declaration and declaration/init_declarator nodes do not
+    // go through the main enrichment pass above; handle them here so that queries
+    // on `node.name` work uniformly across all languages.
+    let node_ids_pass3: Vec<NodeId> = cpg.ast.keys().copied().collect();
+    for node_id in node_ids_pass3 {
+        let node_type = cpg.ast.get(&node_id).map(|n| n.node_type.clone()).unwrap_or_default();
+        match node_type.as_str() {
+            "parameter_declaration" | "variadic_parameter_declaration" => {
+                let node = cpg.ast[&node_id].clone();
+                // Find first identifier or pointer_declarator → identifier child
+                let param_name = node.children.iter().find_map(|&cid| {
+                    let c = cpg.ast.get(&cid)?;
+                    match c.node_type.as_str() {
+                        "identifier" => c.text.clone(),
+                        "pointer_declarator" | "reference_declarator"
+                        | "rvalue_reference_declarator" => {
+                            // recurse one level to find the identifier
+                            c.children.iter().find_map(|&gcid| {
+                                cpg.ast.get(&gcid)
+                                    .filter(|gc| gc.node_type == "identifier")
+                                    .and_then(|gc| gc.text.clone())
+                            })
+                        }
+                        _ => None,
+                    }
+                });
+                if let Some(n) = cpg.ast.get_mut(&node_id) {
+                    if n.name.is_none() {
+                        n.name = param_name;
+                    }
+                }
+            }
+            "init_declarator" => {
+                // `int x = 0;` → init_declarator → identifier "x"
+                let node = cpg.ast[&node_id].clone();
+                let var_name = node.children.iter().find_map(|&cid| {
+                    cpg.ast.get(&cid)
+                        .filter(|c| c.node_type == "identifier")
+                        .and_then(|c| c.text.clone())
+                });
+                if let Some(n) = cpg.ast.get_mut(&node_id) {
+                    if n.name.is_none() {
+                        n.name = var_name;
+                    }
+                }
+            }
+            "declaration" => {
+                // `int x;` → declaration → declarator → identifier
+                // The name lives in a direct declarator child.
+                let node = cpg.ast[&node_id].clone();
+                let var_name = node.children.iter().find_map(|&cid| {
+                    let c = cpg.ast.get(&cid)?;
+                    match c.node_type.as_str() {
+                        "identifier" => c.text.clone(),
+                        "init_declarator" | "pointer_declarator"
+                        | "reference_declarator" | "rvalue_reference_declarator"
+                        | "array_declarator" => {
+                            // First identifier child is the variable name
+                            c.children.iter().find_map(|&gcid| {
+                                cpg.ast.get(&gcid)
+                                    .filter(|gc| gc.node_type == "identifier")
+                                    .and_then(|gc| gc.text.clone())
+                            })
+                        }
+                        _ => None,
+                    }
+                });
+                if let Some(n) = cpg.ast.get_mut(&node_id) {
+                    if n.name.is_none() {
+                        n.name = var_name;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // ── Fourth pass: populate signature for function_definition nodes ────────────
+    // Extract `(params) -> return_type` style signature text similar to Go/Python.
+    let fn_def_ids: Vec<NodeId> = cpg
+        .ast
+        .iter()
+        .filter(|(_, n)| n.node_type == "function_definition" && n.signature.is_none())
+        .map(|(id, _)| *id)
+        .collect();
+    for fn_id in fn_def_ids {
+        let node = cpg.ast[&fn_id].clone();
+        // Find the function_declarator (possibly wrapped in pointer/ref declarator)
+        fn find_fn_declarator<'a>(
+            ast: &'a BTreeMap<NodeId, AstNode>,
+            children: &[NodeId],
+            depth: usize,
+        ) -> Option<&'a AstNode> {
+            if depth > 6 {
+                return None;
+            }
+            for &cid in children {
+                if let Some(c) = ast.get(&cid) {
+                    if c.node_type == "function_declarator" {
+                        return Some(c);
+                    }
+                    if matches!(
+                        c.node_type.as_str(),
+                        "pointer_declarator"
+                            | "reference_declarator"
+                            | "rvalue_reference_declarator"
+                            | "parenthesized_declarator"
+                    ) {
+                        if let Some(found) = find_fn_declarator(ast, &c.children, depth + 1) {
+                            return Some(found);
+                        }
+                    }
+                }
+            }
+            None
+        }
+        let fn_decl = find_fn_declarator(&cpg.ast, &node.children, 0);
+        let params_text = fn_decl.and_then(|fd| {
+            fd.children.iter().find_map(|&cid| {
+                cpg.ast
+                    .get(&cid)
+                    .filter(|c| c.node_type == "parameter_list")
+                    .and_then(|c| c.text.clone())
+            })
+        });
+        // Return type: first type-like child of function_definition (before the declarator)
+        let return_type_text = node.children.iter().find_map(|&cid| {
+            cpg.ast.get(&cid).and_then(|c| {
+                if matches!(
+                    c.node_type.as_str(),
+                    "primitive_type"
+                        | "type_identifier"
+                        | "qualified_identifier"
+                        | "auto"
+                        | "sized_type_specifier"
+                        | "template_type"
+                        | "decltype"
+                        | "type_specifier"
+                        | "void"
+                ) {
+                    c.text.clone()
+                } else {
+                    None
+                }
+            })
+        });
+        let signature = match (params_text, return_type_text) {
+            (Some(p), Some(r)) => Some(format!("{p} -> {r}")),
+            (Some(p), None) => Some(p),
+            _ => None,
+        };
+        if let Some(sig) = signature {
+            if let Some(n) = cpg.ast.get_mut(&fn_id) {
+                n.signature = Some(sig);
+            }
+        }
+    }
+
+    // ── Fix float literals: number_literal with '.' or 'e'/'E' is Float ─────
+    for node in cpg.ast.values_mut() {
+        if node.kind == IrNodeKind::Literal && node.node_type == "number_literal" {
+            if let Some(ref text) = node.text {
+                let has_dot = text.contains('.');
+                let has_exp = text.contains('e') || text.contains('E')
+                           || text.contains('p') || text.contains('P');
+                if has_dot || has_exp {
+                    node.lit_kind = Some(LiteralKind::Float);
+                }
             }
         }
     }
@@ -2122,8 +2370,22 @@ fn enrich_python_metadata(cpg: &mut Cpg) {
             // Python call: extract callee name from function field
             "call" => {
                 let node = &cpg.ast[&node_id];
-                let call_name = child_with_field(node, &cpg.ast, "function")
-                    .and_then(|(_, c)| c.text.clone())
+                let func_child = child_with_field(node, &cpg.ast, "function");
+                let call_name = func_child
+                    .and_then(|(_, c)| {
+                        if c.node_type == "attribute" {
+                            // Method call like db.execute(query) — use only the method name
+                            // (the last identifier child of the attribute node), not "db.execute".
+                            let children: Vec<NodeId> = c.children.clone();
+                            children.into_iter().rev().find_map(|cid| {
+                                cpg.ast.get(&cid)
+                                    .filter(|gc| gc.node_type == "identifier")
+                                    .and_then(|gc| gc.text.clone())
+                            })
+                        } else {
+                            c.text.clone()
+                        }
+                    })
                     .or_else(|| {
                         node.children.iter().find_map(|&cid| {
                             cpg.ast.get(&cid).filter(|c| {
@@ -2564,8 +2826,12 @@ fn enrich_java_metadata(cpg: &mut Cpg) {
                 }).unwrap_or_default();
                 let is_interface = node_type == "interface_declaration";
                 let is_record = node_type == "record_declaration";
+                let is_abstract = access_mods.contains(&"abstract".to_string());
                 if let Some(n) = cpg.ast.get_mut(&node_id) {
                     n.name = class_name;
+                    if let Some(ref et) = extends_type {
+                        n.base_classes = Some(vec![et.clone()]);
+                    }
                 }
                 let meta = cpg.java_meta_mut(node_id);
                 meta.access_modifiers = access_mods;
@@ -2575,6 +2841,7 @@ fn enrich_java_metadata(cpg: &mut Cpg) {
                 meta.generic_type_params = generic_type_params;
                 meta.is_interface = is_interface;
                 meta.is_record = is_record;
+                meta.is_abstract = is_abstract;
             }
 
             "enum_declaration" => {
@@ -3126,6 +3393,61 @@ fn enrich_js_metadata(cpg: &mut Cpg) {
             "do_statement" => {
                 if let Some(n) = cpg.ast.get_mut(&node_id) {
                     n.loop_kind = Some(LoopKind::DoWhile);
+                }
+            }
+
+            // JS/TS call_expression: extract callee name from member_expression or identifier
+            "call_expression" => {
+                let children = cpg.ast[&node_id].children.clone();
+                let call_name = children.iter().next().and_then(|&cid| {
+                    let callee = cpg.ast.get(&cid)?;
+                    match callee.node_type.as_str() {
+                        "member_expression" => {
+                            // console.log(...) → "log"
+                            let gc_ids = callee.children.clone();
+                            gc_ids.iter().rev().find_map(|&gcid| {
+                                cpg.ast.get(&gcid).filter(|gc| {
+                                    matches!(gc.node_type.as_str(), "property_identifier" | "identifier")
+                                }).and_then(|gc| gc.text.clone())
+                            })
+                        }
+                        "identifier" => callee.text.clone(),
+                        _ => None,
+                    }
+                });
+                if let Some(n) = cpg.ast.get_mut(&node_id) {
+                    n.name = call_name;
+                }
+            }
+
+            // JS plain identifier parameters are not lifted to ParamDef by the lifter
+            "formal_parameters" => {
+                let param_children: Vec<NodeId> = cpg.ast[&node_id].children.clone();
+                for cid in param_children {
+                    let child_type = cpg.ast.get(&cid).map(|c| c.node_type.as_str()).unwrap_or("").to_string();
+                    match child_type.as_str() {
+                        "identifier" => {
+                            let name = cpg.ast.get(&cid).and_then(|c| c.text.clone());
+                            if let Some(n) = cpg.ast.get_mut(&cid) {
+                                n.kind = IrNodeKind::ParamDef;
+                                n.name = name;
+                            }
+                        }
+                        "assignment_pattern" | "rest_pattern" => {
+                            // Default or rest param: extract the identifier inside
+                            let ident_id = cpg.ast.get(&cid).and_then(|c| {
+                                c.children.iter().find_map(|&gcid| {
+                                    cpg.ast.get(&gcid).filter(|gc| gc.node_type == "identifier").map(|_| gcid)
+                                })
+                            });
+                            let name = ident_id.and_then(|id| cpg.ast.get(&id).and_then(|n| n.text.clone()));
+                            if let Some(n) = cpg.ast.get_mut(&cid) {
+                                n.kind = IrNodeKind::ParamDef;
+                                n.name = name;
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
 
