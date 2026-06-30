@@ -395,7 +395,8 @@ impl<'a> RuleRunner<'a> {
             }
             CfgPredicate::LoopHasNoExit { node } => {
                 let Some(n) = env.get_node(node) else { return false };
-                self.with_cfg_for_node(n, |cfg| cfg.node_loop_has_no_exit(n))
+                let cpg = self.ctx.cpg;
+                self.with_cfg_for_node(n, |cfg| cfg.node_loop_has_no_exit(n, cpg))
             }
 
             // ── Symbolic / path-sensitive CFG predicates ──────────────────────
@@ -451,13 +452,43 @@ impl<'a> RuleRunner<'a> {
                 let (Some(nf), Some(nt)) = (env.get_node(from), env.get_node(to)) else {
                     return false;
                 };
-                self.ctx.dfg.direct_flow(nf, nt)
+                if self.ctx.dfg.direct_flow(nf, nt) {
+                    return true;
+                }
+                // Subtree extension: any descendant of `from` has a direct DFG edge
+                // to any descendant of `to`. Handles LocalDef→LocalDef patterns where
+                // the CPG's DFG edges go between identifier children, not declaration nodes.
+                let from_sub = ast_subtree(self.ctx.cpg, nf);
+                let to_sub = ast_subtree(self.ctx.cpg, nt);
+                from_sub.iter().any(|&f| {
+                    if let Some(succs) = self.ctx.dfg.forward.get(&f) {
+                        succs.iter().any(|s| to_sub.contains(s) && *s != nf)
+                    } else {
+                        false
+                    }
+                })
             }
             DfgPredicate::ReachesFlow { from, to } => {
                 let (Some(nf), Some(nt)) = (env.get_node(from), env.get_node(to)) else {
                     return false;
                 };
-                self.ctx.dfg.reaches(nf, nt)
+                if self.ctx.dfg.reaches(nf, nt) {
+                    return true;
+                }
+                // Subtree extension: check if any node reachable from any descendant
+                // of `from` can reach any descendant of `to`.
+                // This enables Call.dfg_reaches(Call) patterns where the DFG path goes
+                // through intermediate identifier/argument nodes that are AST-children
+                // of the target call.
+                let to_sub = ast_subtree(self.ctx.cpg, nt);
+                let from_sub = ast_subtree(self.ctx.cpg, nf);
+                for &f in &from_sub {
+                    let reachable = self.ctx.dfg.reachable_from(f);
+                    if reachable.iter().any(|r| to_sub.contains(r) && *r != nf) {
+                        return true;
+                    }
+                }
+                false
             }
             DfgPredicate::ReachesWithBarrier { from, to, barrier_kinds } => {
                 let (Some(nf), Some(nt)) = (env.get_node(from), env.get_node(to)) else {
@@ -467,12 +498,23 @@ impl<'a> RuleRunner<'a> {
             }
             DfgPredicate::DfgDef { var_name, node } => {
                 let Some(n) = env.get_node(node) else { return false };
-                // var_name is a literal variable name in the DFG, not a query variable
-                self.ctx.dfg.defines_var(n, var_name)
+                if self.ctx.dfg.defines_var(n, var_name) {
+                    return true;
+                }
+                // Subtree extension: any descendant of `node` defines `var_name`
+                ast_subtree(self.ctx.cpg, n).iter().any(|&d| {
+                    d != n && self.ctx.dfg.defines_var(d, var_name)
+                })
             }
             DfgPredicate::DfgUse { var_name, node } => {
                 let Some(n) = env.get_node(node) else { return false };
-                self.ctx.dfg.uses_var(n, var_name)
+                if self.ctx.dfg.uses_var(n, var_name) {
+                    return true;
+                }
+                // Subtree extension: any descendant of `node` uses `var_name`
+                ast_subtree(self.ctx.cpg, n).iter().any(|&d| {
+                    d != n && self.ctx.dfg.uses_var(d, var_name)
+                })
             }
         }
     }
@@ -596,6 +638,9 @@ impl<'a> RuleRunner<'a> {
             "name" => node.name.as_deref().map(|s| EvalValue::Str(s.to_owned())).unwrap_or(EvalValue::Null),
             "text" => node.text.as_deref().map(|s| EvalValue::Str(s.to_owned())).unwrap_or(EvalValue::Null),
             "raw_kind" => EvalValue::Str(node.node_type.clone()),
+            // `kind` returns the IrNodeKind as a PascalCase string (e.g. "Call", "Identifier").
+            // This lets rules write `n.arg(0).kind == "Identifier"` to check the IR type.
+            "kind" => EvalValue::Str(format!("{:?}", node.kind)),
             "namespace" => node.namespace.as_deref().map(|s| EvalValue::Str(s.to_owned())).unwrap_or(EvalValue::Null),
             "class_context" => node.class_context.as_deref().map(|s| EvalValue::Str(s.to_owned())).unwrap_or(EvalValue::Null),
             "visibility" => node.visibility.as_deref().map(|s| EvalValue::Str(s.to_owned())).unwrap_or(EvalValue::Null),
@@ -1213,6 +1258,28 @@ pub enum EvalValue {
     Int(i64),
     Bool(bool),
     Null,
+}
+
+/// Return the set of all node IDs in the AST subtree rooted at `root` (inclusive).
+/// Used by DFG predicate subtree extensions so that `LocalDef.dfg_reaches(Call)`
+/// checks flow between descendant identifier/expression nodes, not just the
+/// structural container nodes (which have no DFG edges themselves).
+fn ast_subtree(cpg: &Cpg, root: NodeId) -> HashSet<NodeId> {
+    use std::collections::VecDeque;
+    let mut visited: HashSet<NodeId> = HashSet::new();
+    let mut queue: VecDeque<NodeId> = VecDeque::new();
+    queue.push_back(root);
+    visited.insert(root);
+    while let Some(nid) = queue.pop_front() {
+        if let Some(node) = cpg.ast.get(&nid) {
+            for &child in &node.children {
+                if visited.insert(child) {
+                    queue.push_back(child);
+                }
+            }
+        }
+    }
+    visited
 }
 
 fn eval_value_of_literal(lit: &Literal) -> EvalValue {

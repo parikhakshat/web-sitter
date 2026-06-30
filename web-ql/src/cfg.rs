@@ -377,16 +377,10 @@ impl FunctionCfg {
         }
     }
 
-    /// True if `node` is inside a loop (its block has a back-edge to a dominating block).
+    /// True if `node` is inside a loop.
     pub fn node_in_loop(&self, node: NodeId) -> bool {
         let Some(&block) = self.node_to_block.get(&node) else { return false };
-        for &succ in &self.succs[block as usize] {
-            // A back edge is one where the target dominates the source
-            if self.dom.dominates(succ, block) {
-                return true;
-            }
-        }
-        false
+        self.find_loop_header(block).is_some()
     }
 
     /// Walk up the dominator chain from `block` to find the innermost enclosing
@@ -410,17 +404,30 @@ impl FunctionCfg {
 
     /// True if `node` is inside a loop whose strongly-connected component has
     /// no exit edge to outside the loop body (i.e., infinite loop with no break/return).
-    pub fn node_loop_has_no_exit(&self, node: NodeId) -> bool {
+    pub fn node_loop_has_no_exit(&self, node: NodeId, cpg: &Cpg) -> bool {
         let Some(&block) = self.node_to_block.get(&node) else { return false };
         let n = self.succs.len();
         let Some(header) = self.find_loop_header(block) else { return false };
-        // Loop SCC: blocks that can reach header AND are reachable from header
+
+        // Symbolic short-circuit: if the loop header's condition is constant-true,
+        // the structural "exit" edge is dead and the loop never terminates.
+        if let Some(&cond_node) = self.block_to_condition.get(&header) {
+            let mut se = SymbolicEval::new(cpg);
+            match se.eval_int(cond_node) {
+                Some(v) if v != 0 => return true,
+                _ => {}
+            }
+            if se.eval_bool(cond_node) == Some(true) {
+                return true;
+            }
+        }
+
+        // Structural check: no block in the SCC has an exit edge.
         let in_scc = |b: u32| -> bool {
             (b as usize) < n
                 && self.reach.can_reach(header, b)
                 && self.reach.can_reach(b, header)
         };
-        // If any block in the SCC has a normal successor outside the SCC, the loop has an exit
         for b in 0..n as u32 {
             if !in_scc(b) {
                 continue;

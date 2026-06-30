@@ -201,8 +201,9 @@ impl<'a> SymbolicEval<'a> {
 /// Strips common suffixes (ULL, LL, L, U, u, n, f, etc.).
 pub(crate) fn parse_int(raw: &str) -> Option<i64> {
     let s = raw.trim();
-    // Strip trailing type suffixes
-    let s = s.trim_end_matches(|c: char| matches!(c, 'u' | 'U' | 'l' | 'L' | 'n' | 'f' | 'F'));
+    // Strip trailing integer type suffixes (u/U/l/L/n).
+    // Do NOT strip 'f'/'F' — those are valid hex digits (e.g. 0xFF).
+    let s = s.trim_end_matches(|c: char| matches!(c, 'u' | 'U' | 'l' | 'L' | 'n'));
     // Remove Python/Rust visual separators
     let no_sep: String = s.chars().filter(|&c| c != '_' && c != '\'').collect();
     let s = no_sep.as_str();
