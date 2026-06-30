@@ -397,6 +397,41 @@ impl<'a> RuleRunner<'a> {
                 let Some(n) = env.get_node(node) else { return false };
                 self.with_cfg_for_node(n, |cfg| cfg.node_loop_has_no_exit(n))
             }
+
+            // ── Symbolic / path-sensitive CFG predicates ──────────────────────
+            CfgPredicate::CfgReachesFeasible { a, b } => {
+                let (Some(na), Some(nb)) = (env.get_node(a), env.get_node(b)) else {
+                    return false;
+                };
+                let Some(ir) = self.ctx.cpg.ast.get(&na) else { return false };
+                let Some(fn_id) = ir.function_id else { return false };
+                let Some(cfg) = self.ctx.cfg_cache.get(&fn_id) else { return false };
+                cfg.feasible_reaches(na, nb, self.ctx.cpg)
+            }
+
+            CfgPredicate::GuardEvalTrue { node } => {
+                let Some(n) = env.get_node(node) else { return false };
+                guard_const_eval(self.ctx.cpg, n) == Some(true)
+            }
+
+            CfgPredicate::GuardEvalFalse { node } => {
+                let Some(n) = env.get_node(node) else { return false };
+                guard_const_eval(self.ctx.cpg, n) == Some(false)
+            }
+
+            CfgPredicate::InDeadBranch { node } => {
+                let Some(n) = env.get_node(node) else { return false };
+                let Some(ir) = self.ctx.cpg.ast.get(&n) else { return false };
+                let Some(fn_id) = ir.function_id else { return false };
+                let Some(cfg) = self.ctx.cfg_cache.get(&fn_id) else { return false };
+                // Find any node in the entry block to use as origin
+                let entry_node = cfg.node_to_block.iter()
+                    .find_map(|(&nid, &bid)| if bid == cfg.entry { Some(nid) } else { None });
+                match entry_node {
+                    Some(en) => !cfg.feasible_reaches(en, n, self.ctx.cpg),
+                    None => false,
+                }
+            }
         }
     }
 
@@ -782,6 +817,21 @@ impl<'a> RuleRunner<'a> {
                     .and_then(|classes| classes.first())
                     .map(|s| EvalValue::Str(s.clone()))
                     .unwrap_or(EvalValue::Null)
+            }
+
+            // ── Symbolic / path-sensitive node methods ───────────────────────
+            // Walk up the parent chain to find the nearest Conditional or Switch
+            // ancestor, then return its "condition" field child.  This lets rules
+            // do things like `n.branch_condition().eval_bool()` to ask "is the
+            // guard that dominates n statically known to be true/false?"
+            "branch_condition" => {
+                find_enclosing_condition(self.ctx.cpg, node_id,
+                    &[IrNodeKind::Conditional, IrNodeKind::Switch])
+            }
+
+            // Same as branch_condition but walks up to the nearest Loop ancestor.
+            "loop_condition" => {
+                find_enclosing_condition(self.ctx.cpg, node_id, &[IrNodeKind::Loop])
             }
 
             // ── Identifier node methods ───────────────────────────────────────
@@ -1222,6 +1272,65 @@ fn first_str(v: &Option<Vec<String>>) -> EvalValue {
 
 fn first_str_vec(v: &[String]) -> EvalValue {
     v.first().map(|s| EvalValue::Str(s.clone())).unwrap_or(EvalValue::Null)
+}
+
+// ── Symbolic / path-sensitive helpers ────────────────────────────────────────
+
+/// Walk up the AST parent chain from `start` and return the condition child of
+/// the nearest ancestor whose `kind` is in `targets` (Conditional, Loop, Switch).
+/// Prefers the child whose field name is "condition"; falls back to first child.
+/// Used by `.branch_condition()` and `.loop_condition()` node methods.
+fn find_enclosing_condition(cpg: &Cpg, start: NodeId, targets: &[IrNodeKind]) -> EvalValue {
+    let mut cur = start;
+    let mut depth = 0usize;
+    loop {
+        depth += 1;
+        if depth > 200 {
+            return EvalValue::Null;
+        }
+        let node = match cpg.ast.get(&cur) {
+            Some(n) => n,
+            None => return EvalValue::Null,
+        };
+        if targets.contains(&node.kind) {
+            // Find "condition" field child
+            let cond = node.children.iter().enumerate().find_map(|(i, &cid)| {
+                if node.field_names.get(i).and_then(|f| f.as_deref()) == Some("condition") {
+                    Some(cid)
+                } else {
+                    None
+                }
+            }).or_else(|| node.children.first().copied());
+            return cond.map(EvalValue::Node).unwrap_or(EvalValue::Null);
+        }
+        match node.parent_id {
+            Some(p) if p != cur => cur = p,
+            _ => return EvalValue::Null,
+        }
+    }
+}
+
+/// Symbolically evaluate the guard condition of the nearest enclosing
+/// Conditional/Loop/Switch ancestor of `node_id`.
+/// Returns `Some(true)` / `Some(false)` when the condition is a constant;
+/// `None` when it is not constant or when no enclosing branch exists.
+fn guard_const_eval(cpg: &Cpg, node_id: NodeId) -> Option<bool> {
+    let cond_val = find_enclosing_condition(
+        cpg,
+        node_id,
+        &[IrNodeKind::Conditional, IrNodeKind::Loop, IrNodeKind::Switch],
+    );
+    let cond_id = match cond_val {
+        EvalValue::Node(id) => id,
+        _ => return None,
+    };
+    let mut se = SymbolicEval::new(cpg);
+    match se.eval(cond_id) {
+        crate::symbolic::SymbolicValue::Bool(b) => Some(b),
+        crate::symbolic::SymbolicValue::Int(0) => Some(false),
+        crate::symbolic::SymbolicValue::Int(_) => Some(true),
+        _ => None,
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

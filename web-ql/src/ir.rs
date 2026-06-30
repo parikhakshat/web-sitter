@@ -199,6 +199,19 @@ pub enum CfgPredicate {
     SameFunction { a: String, b: String },
     /// `node` is inside a loop whose SCC has no exit edge to outside the loop
     LoopHasNoExit { node: String },
+    /// Like `CfgReaches` but prunes edges whose branch guard statically evaluates
+    /// to a constant — skipping the dead arm (the taken arm is still followed).
+    /// Requires the CFG to have been built with condition-node tracking.
+    CfgReachesFeasible { a: String, b: String },
+    /// `node` is inside a branch (if/while/for/switch) whose guard condition
+    /// statically evaluates to a non-zero / `true` constant.
+    GuardEvalTrue { node: String },
+    /// `node` is inside a branch whose guard condition statically evaluates to
+    /// zero / `false`.
+    GuardEvalFalse { node: String },
+    /// `node` is on a path that is statically unreachable from the function entry
+    /// once constant-false guards are pruned (i.e., it is dead code).
+    InDeadBranch { node: String },
 }
 
 // ── DFG predicates ────────────────────────────────────────────────────────────

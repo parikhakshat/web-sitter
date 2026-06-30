@@ -479,6 +479,22 @@ impl Planner {
             ("in_exception_path", 0) => {
                 QueryPlan::CfgPredicate(CfgPredicate::InExceptionPath { node: recv })
             }
+            // Symbolic / path-sensitive predicates
+            ("cfg_reaches_feasible", 1) => {
+                QueryPlan::CfgPredicate(CfgPredicate::CfgReachesFeasible {
+                    a: recv,
+                    b: get_var(&args[0], "to")?,
+                })
+            }
+            ("guard_evals_true", 0) => {
+                QueryPlan::CfgPredicate(CfgPredicate::GuardEvalTrue { node: recv })
+            }
+            ("guard_evals_false", 0) => {
+                QueryPlan::CfgPredicate(CfgPredicate::GuardEvalFalse { node: recv })
+            }
+            ("in_dead_branch", 0) => {
+                QueryPlan::CfgPredicate(CfgPredicate::InDeadBranch { node: recv })
+            }
 
             // ── DFG predicates ────────────────────────────────────────────────
             ("dfg_reaches", 1) => QueryPlan::DfgPredicate(DfgPredicate::ReachesFlow {
