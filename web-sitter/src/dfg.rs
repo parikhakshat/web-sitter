@@ -543,7 +543,7 @@ fn build_call_graph_impl(
                     entry.calls.push(CallSite {
                         callee: callee_name.clone(),
                         callee_id,
-                        call_site: Some(node.line),
+                        call_site: Some(*node_id),
                         qualified_callee: qualified_callee.clone(),
                         callee_kind,
                     });
@@ -578,7 +578,7 @@ fn build_call_graph_impl(
                 entry.calls.push(CallSite {
                     callee: callback_name.clone(),
                     callee_id: callback_id,
-                    call_site: Some(node.line),
+                    call_site: Some(*node_id),
                     qualified_callee: None,
                     callee_kind: callback_kind,
                 });
@@ -646,7 +646,7 @@ fn build_call_graph_impl(
                     entry.calls.push(CallSite {
                         callee: callee_name.clone(),
                         callee_id,
-                        call_site: Some(new_node.line),
+                        call_site: Some(node_id),
                         qualified_callee: None,
                         callee_kind,
                     });

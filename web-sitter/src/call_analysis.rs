@@ -578,53 +578,12 @@ pub fn build_interprocedural_dfg(cpg: &mut Cpg) {
         }
     }
 
-    // Emit cross-boundary INTERPROCEDURAL edges at each call site
-    let call_sites: Vec<(NodeId, NodeId, Vec<NodeId>)> = cpg.call_graph.iter()
-        .flat_map(|(&caller_id, entry)| {
-            entry.calls.iter().filter_map(|site| {
-                // Resolve callee to a NodeId
-                let callee_id = cpg.ast.iter()
-                    .find(|(_, n)| n.is_method_def()
-                        && n.name.as_deref() == Some(&site.callee))
-                    .map(|(id, _)| *id)?;
-                // Collect argument nodes at this call site
-                let args: Vec<NodeId> = site.call_site
-                    .and_then(|cs_id| cpg.ast.get(&cs_id))
-                    .map(|n| n.children.clone())
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|&cid| cpg.ast.get(&cid)
-                        .map(|c| c.is_identifier() || c.is_literal())
-                        .unwrap_or(false))
-                    .collect();
-                Some((caller_id, callee_id, args))
-            }).collect::<Vec<_>>()
-        })
-        .collect();
-
-    // Emit INTERPROCEDURAL edges: for each call site where the callee has a TaintReturn summary,
-    // connect each tainted argument to the call expression node (which represents the return value).
-    let _ = defs_by_fn; // summaries are the primary output; defs_by_fn was used for summary building
-    let mut new_edges: Vec<crate::DataflowEdge> = Vec::new();
-    for (caller_id, callee_id, args) in &call_sites {
-        if let Some(summary) = cpg.workspace.function_summaries.get(callee_id) {
-            for effect in &summary.param_effects.clone() {
-                if let crate::ParamEffect::TaintReturn(param_idx) = effect {
-                    if let Some(&arg_node_id) = args.get(*param_idx) {
-                        // The call site node (caller_id here is the function, not the call node;
-                        // we emit from arg to the callee function node as a cross-boundary marker)
-                        new_edges.push(crate::DataflowEdge {
-                            source: arg_node_id,
-                            destination: *caller_id,
-                            variable: format!("__ret_{}", param_idx),
-                            edge_type: "INTERPROCEDURAL".to_string(),
-                            field_path: Vec::new(),
-                        });
-                    }
-                }
-            }
-        }
-    }
-    cpg.dataflow.edges.extend(new_edges);
+    // Suppress unused warning — summaries are consumed by the workspace and by
+    // cross-file analysis; edge emission is handled by apply_cached_interprocedural_edges
+    // in the incremental path and by build_dataflow_impl in the full-build path, both
+    // of which emit properly-typed INTERPROCEDURAL_FLOW edges.  The redundant
+    // INTERPROCEDURAL edge block that used to live here was broken (it read call_site
+    // as a node ID but the field previously stored a line number) and has been removed.
+    let _ = defs_by_fn;
 }
 
