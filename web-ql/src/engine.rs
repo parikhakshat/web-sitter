@@ -1450,7 +1450,26 @@ fn collect_param_nodes(cpg: &Cpg, fn_node: &IrNode) -> Vec<NodeId> {
             }
         }
     }
+    // Filter out C-style `(void)` — a nameless parameter_declaration whose only
+    // non-punctuation child is `primitive_type` "void". This represents an empty
+    // parameter list in C, not an actual void-typed parameter.
+    params.retain(|&pid| !is_c_void_param(cpg, pid));
     params
+}
+
+/// Returns true for a `parameter_declaration` node that is the C `(void)` sentinel,
+/// meaning the function takes no arguments (as opposed to an unprototyped `()`).
+fn is_c_void_param(cpg: &Cpg, param_id: NodeId) -> bool {
+    let Some(node) = cpg.ast.get(&param_id) else { return false };
+    if node.node_type != "parameter_declaration" { return false }
+    if node.name.is_some() { return false }
+    let type_children: Vec<_> = node.children.iter()
+        .filter_map(|&cid| cpg.ast.get(&cid))
+        .filter(|c| c.node_type != "," && !c.node_type.starts_with('*'))
+        .collect();
+    type_children.len() == 1
+        && type_children[0].node_type == "primitive_type"
+        && type_children[0].text.as_deref() == Some("void")
 }
 
 /// Return candidate node IDs for a root binding, respecting NodeType raw matching.

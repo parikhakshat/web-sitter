@@ -818,6 +818,8 @@ impl<'a> CfgBuilder<'a> {
         current_bb_id: String,
         state: &mut FunctionState,
     ) -> String {
+        // Register the if_statement node so node_to_block can find it (for dominance queries).
+        self.register_node_in_bb(stmt_id, &current_bb_id);
         let (init_id, condition_id, consequence_id, alternative_id) =
             self.extract_if_parts(stmt_id);
 
@@ -867,6 +869,7 @@ impl<'a> CfgBuilder<'a> {
         current_bb_id: String,
         state: &mut FunctionState,
     ) -> String {
+        self.register_node_in_bb(stmt_id, &current_bb_id);
         let (condition_id, body_id, _) = self.extract_condition_and_body(stmt_id);
         let header_bb_id = self.create_bb(func_id);
         let body_bb_id = self.create_bb(func_id);
@@ -907,6 +910,7 @@ impl<'a> CfgBuilder<'a> {
         current_bb_id: String,
         state: &mut FunctionState,
     ) -> String {
+        self.register_node_in_bb(stmt_id, &current_bb_id);
         let (init_id, condition_id, update_id, body_id) = self.extract_for_parts(stmt_id);
         let current_bb_id = current_bb_id;
         if let Some(init_id) = init_id {
@@ -1471,7 +1475,26 @@ impl<'a> CfgBuilder<'a> {
                 continue;
             };
             match child.node_type.as_str() {
-                "compound_statement" => body_id = Some(*child_id),
+                // C/C++ uses compound_statement; Go/Rust use block
+                "compound_statement" | "block" => body_id = Some(*child_id),
+                // Go's for_clause wraps init/condition/post — look inside it
+                "for_clause" => {
+                    let clause_children = child.children.clone();
+                    let mut fc_expr_count = 0usize;
+                    for gc_id in &clause_children {
+                        let Some(gc) = self.graph.get(gc_id) else { continue };
+                        let gt = gc.node_type.as_str();
+                        if gt.contains("expression") || gt.contains("binary") {
+                            if fc_expr_count == 0 { condition_id = Some(*gc_id); }
+                            else if fc_expr_count == 1 { update_id = Some(*gc_id); }
+                            fc_expr_count += 1;
+                        } else if init_id.is_none() && !matches!(gt, "for" | ";" | "(") {
+                            init_id = Some(*gc_id);
+                        } else if update_id.is_none() && !matches!(gt, ";" | ")") {
+                            update_id = Some(*gc_id);
+                        }
+                    }
+                }
                 "declaration" | "expression_statement" if init_id.is_none() => {
                     init_id = Some(*child_id)
                 }
@@ -1548,7 +1571,10 @@ impl<'a> CfgBuilder<'a> {
                 continue;
             };
             match child.node_type.as_str() {
-                "compound_statement" if try_body_id.is_none() => try_body_id = Some(*child_id),
+                // Java uses `block`; C++/C# use `compound_statement`.
+                "compound_statement" | "block" if try_body_id.is_none() => {
+                    try_body_id = Some(*child_id)
+                }
                 "catch_clause" => catch_clauses.push(*child_id),
                 _ => {}
             }
@@ -1571,6 +1597,18 @@ impl<'a> CfgBuilder<'a> {
         // Push landing pad onto the catch stack so throw expressions inside can find it.
         state.catch_stack.push(first_landing_pad.clone());
 
+        // Unconditionally add an exception edge from the pre-try BB to the first landing
+        // pad. Any statement inside a try body may throw (Java checked exceptions, C++
+        // anything, Python BaseException). This ensures catch blocks are always marked as
+        // exception-path even when the try body contains no explicit call expressions.
+        if !landing_pad_bbs.is_empty() {
+            if let Some(bb_node) = self.basic_blocks.get_mut(&current_bb_id) {
+                if !bb_node.exception_successors.contains(&first_landing_pad) {
+                    bb_node.exception_successors.push(first_landing_pad.clone());
+                }
+            }
+        }
+
         // Process try body.
         let try_body_end = if let Some(body_id) = try_body_id {
             let body_children = self
@@ -1580,8 +1618,8 @@ impl<'a> CfgBuilder<'a> {
                 .unwrap_or_default();
             let mut bb = current_bb_id.clone();
             for child_id in body_children {
-                // Add exception edge to landing pad for any expression that can throw (A5):
-                // call_expression, new_expression, throw_expression, delete_expression.
+                // Add exception edge to landing pad for any expression that can throw:
+                // call_expression, new_expression, throw_statement, delete_expression.
                 let can_throw = self
                     .graph
                     .get(&child_id)
@@ -1597,7 +1635,6 @@ impl<'a> CfgBuilder<'a> {
                     .unwrap_or(false);
                 bb = self.process_statement(func_id, child_id, bb, state);
                 if can_throw && !landing_pad_bbs.is_empty() {
-                    // Add exception flow edge from current BB to landing pad.
                     if let Some(bb_node) = self.basic_blocks.get_mut(&bb) {
                         if !bb_node.exception_successors.contains(&first_landing_pad) {
                             bb_node.exception_successors.push(first_landing_pad.clone());
@@ -1619,10 +1656,10 @@ impl<'a> CfgBuilder<'a> {
             let Some(catch) = self.graph.get(catch_id).cloned() else {
                 continue;
             };
-            // Find compound_statement body inside catch clause.
+            // Find block body inside catch clause (Java: "block"; C++: "compound_statement").
             let catch_body_id = catch.children.iter().find_map(|cid| {
                 let child = self.graph.get(cid)?;
-                (child.node_type == "compound_statement").then_some(*cid)
+                matches!(child.node_type.as_str(), "compound_statement" | "block").then_some(*cid)
             });
             let catch_end = if let Some(body_id) = catch_body_id {
                 let body_children = self
@@ -1888,8 +1925,9 @@ impl<'a> CfgBuilder<'a> {
                 continue;
             };
             match child.node_type.as_str() {
-                "for" | "(" | ")" | ":" => {}
-                "compound_statement" => body_id = Some(*child_id),
+                "for" | "(" | ")" | ":" | "in" => {}
+                // C/C++ uses compound_statement; Rust/Go/Java use block
+                "compound_statement" | "block" => body_id = Some(*child_id),
                 "type_specifier"
                 | "auto"
                 | "declaration"
@@ -1996,6 +2034,20 @@ impl<'a> CfgBuilder<'a> {
                 }
             }
             stack.extend(children);
+        }
+    }
+
+    /// Add only `node_id` itself to `bb_id` (without recursing into children).
+    /// Needed for compound statement nodes (if/loop/etc.) whose children live in
+    /// different blocks — we still want the parent node to be findable in node_to_block.
+    fn register_node_in_bb(&mut self, node_id: NodeId, bb_id: &str) {
+        if let Some(node) = self.graph.get_mut(&node_id) {
+            node.basic_block = Some(bb_id.to_string());
+        }
+        if let Some(bb) = self.basic_blocks.get_mut(bb_id) {
+            if !bb.nodes.contains(&node_id) {
+                bb.nodes.push(node_id);
+            }
         }
     }
 

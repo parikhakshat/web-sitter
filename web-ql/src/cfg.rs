@@ -377,10 +377,13 @@ impl FunctionCfg {
         }
     }
 
-    /// True if `node` is inside a loop.
+    /// True if `node` is inside a loop (i.e., its block is part of the loop's SCC).
     pub fn node_in_loop(&self, node: NodeId) -> bool {
         let Some(&block) = self.node_to_block.get(&node) else { return false };
-        self.find_loop_header(block).is_some()
+        let Some(header) = self.find_loop_header(block) else { return false };
+        // The block IS the header (back edge discovered on header's predecessors), or
+        // the block can reach the header (proving it's in the SCC, not just dominated by it).
+        block == header || self.reach.can_reach(block, header)
     }
 
     /// Walk up the dominator chain from `block` to find the innermost enclosing

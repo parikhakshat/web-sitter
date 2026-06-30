@@ -1400,12 +1400,38 @@ fn enrich_cpp_metadata(cpg: &mut crate::Cpg) {
         }
     }
 
-    // Populate name on class_specifier / struct_specifier (ClassDef) nodes.
-    // This mirrors what other language enrichers do for their class declarations.
+    // Populate name and base_classes on class_specifier / struct_specifier (ClassDef) nodes.
     for (class_id, class_name) in &class_nodes {
         if let Some(node) = cpg.ast.get_mut(class_id) {
             if node.name.is_none() {
                 node.name = Some(class_name.clone());
+            }
+        }
+        // C++: extract base classes from base_class_clause → base_specifier → type_identifier
+        let children = cpg.ast.get(class_id).map(|n| n.children.clone()).unwrap_or_default();
+        let base_classes: Vec<String> = children.iter().find_map(|&cid| {
+            let c = cpg.ast.get(&cid)?;
+            if c.node_type != "base_class_clause" { return None; }
+            let bases: Vec<String> = c.children.iter().filter_map(|&bid| {
+                let b = cpg.ast.get(&bid)?;
+                if b.node_type == "base_specifier" {
+                    // Look for type_identifier inside base_specifier
+                    b.children.iter().find_map(|&tid| {
+                        cpg.ast.get(&tid).filter(|t| {
+                            matches!(t.node_type.as_str(), "type_identifier" | "identifier")
+                        }).and_then(|t| t.text.clone())
+                    })
+                } else if matches!(b.node_type.as_str(), "type_identifier" | "identifier") {
+                    b.text.clone()
+                } else {
+                    None
+                }
+            }).collect();
+            if bases.is_empty() { None } else { Some(bases) }
+        }).unwrap_or_default();
+        if !base_classes.is_empty() {
+            if let Some(n) = cpg.ast.get_mut(class_id) {
+                n.base_classes = Some(base_classes);
             }
         }
     }
@@ -1574,6 +1600,20 @@ fn enrich_cpp_metadata(cpg: &mut crate::Cpg) {
         if let Some(sig) = signature {
             if let Some(n) = cpg.ast.get_mut(&fn_id) {
                 n.signature = Some(sig);
+            }
+        }
+    }
+
+    // ── Fix float literals: number_literal with '.' or 'e'/'E' is Float ─────
+    for node in cpg.ast.values_mut() {
+        if node.kind == IrNodeKind::Literal && node.node_type == "number_literal" {
+            if let Some(ref text) = node.text {
+                let has_dot = text.contains('.');
+                let has_exp = text.contains('e') || text.contains('E')
+                           || text.contains('p') || text.contains('P');
+                if has_dot || has_exp {
+                    node.lit_kind = Some(LiteralKind::Float);
+                }
             }
         }
     }
@@ -2786,8 +2826,12 @@ fn enrich_java_metadata(cpg: &mut Cpg) {
                 }).unwrap_or_default();
                 let is_interface = node_type == "interface_declaration";
                 let is_record = node_type == "record_declaration";
+                let is_abstract = access_mods.contains(&"abstract".to_string());
                 if let Some(n) = cpg.ast.get_mut(&node_id) {
                     n.name = class_name;
+                    if let Some(ref et) = extends_type {
+                        n.base_classes = Some(vec![et.clone()]);
+                    }
                 }
                 let meta = cpg.java_meta_mut(node_id);
                 meta.access_modifiers = access_mods;
@@ -2797,6 +2841,7 @@ fn enrich_java_metadata(cpg: &mut Cpg) {
                 meta.generic_type_params = generic_type_params;
                 meta.is_interface = is_interface;
                 meta.is_record = is_record;
+                meta.is_abstract = is_abstract;
             }
 
             "enum_declaration" => {
@@ -3348,6 +3393,61 @@ fn enrich_js_metadata(cpg: &mut Cpg) {
             "do_statement" => {
                 if let Some(n) = cpg.ast.get_mut(&node_id) {
                     n.loop_kind = Some(LoopKind::DoWhile);
+                }
+            }
+
+            // JS/TS call_expression: extract callee name from member_expression or identifier
+            "call_expression" => {
+                let children = cpg.ast[&node_id].children.clone();
+                let call_name = children.iter().next().and_then(|&cid| {
+                    let callee = cpg.ast.get(&cid)?;
+                    match callee.node_type.as_str() {
+                        "member_expression" => {
+                            // console.log(...) → "log"
+                            let gc_ids = callee.children.clone();
+                            gc_ids.iter().rev().find_map(|&gcid| {
+                                cpg.ast.get(&gcid).filter(|gc| {
+                                    matches!(gc.node_type.as_str(), "property_identifier" | "identifier")
+                                }).and_then(|gc| gc.text.clone())
+                            })
+                        }
+                        "identifier" => callee.text.clone(),
+                        _ => None,
+                    }
+                });
+                if let Some(n) = cpg.ast.get_mut(&node_id) {
+                    n.name = call_name;
+                }
+            }
+
+            // JS plain identifier parameters are not lifted to ParamDef by the lifter
+            "formal_parameters" => {
+                let param_children: Vec<NodeId> = cpg.ast[&node_id].children.clone();
+                for cid in param_children {
+                    let child_type = cpg.ast.get(&cid).map(|c| c.node_type.as_str()).unwrap_or("").to_string();
+                    match child_type.as_str() {
+                        "identifier" => {
+                            let name = cpg.ast.get(&cid).and_then(|c| c.text.clone());
+                            if let Some(n) = cpg.ast.get_mut(&cid) {
+                                n.kind = IrNodeKind::ParamDef;
+                                n.name = name;
+                            }
+                        }
+                        "assignment_pattern" | "rest_pattern" => {
+                            // Default or rest param: extract the identifier inside
+                            let ident_id = cpg.ast.get(&cid).and_then(|c| {
+                                c.children.iter().find_map(|&gcid| {
+                                    cpg.ast.get(&gcid).filter(|gc| gc.node_type == "identifier").map(|_| gcid)
+                                })
+                            });
+                            let name = ident_id.and_then(|id| cpg.ast.get(&id).and_then(|n| n.text.clone()));
+                            if let Some(n) = cpg.ast.get_mut(&cid) {
+                                n.kind = IrNodeKind::ParamDef;
+                                n.name = name;
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
 
