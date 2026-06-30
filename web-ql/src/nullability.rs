@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use web_sitter::{Cpg, IrNodeKind, LiteralKind, NodeId};
+use crate::kind_index::KindIndex;
 
 /// Functions whose return value may be null (NULL / nullptr / None / nil).
 ///
@@ -49,7 +50,7 @@ pub struct NullabilityIndex {
 }
 
 impl NullabilityIndex {
-    pub fn build(cpg: &Cpg) -> Self {
+    pub fn build(cpg: &Cpg, kind_index: &KindIndex) -> Self {
         let mut seeds: Vec<NodeId> = Vec::new();
 
         for (node_id, node) in &cpg.ast {
@@ -67,7 +68,7 @@ impl NullabilityIndex {
 
             // 2. Nullable function call sites
             if node.kind == IrNodeKind::Call {
-                if let Some(callee) = callee_name(cpg, *node_id) {
+                if let Some(callee) = callee_name(cpg, kind_index, *node_id) {
                     if is_nullable_callee(&callee) {
                         seeds.push(*node_id);
                     }
@@ -122,13 +123,9 @@ fn is_nullable_callee(callee: &str) -> bool {
     })
 }
 
-fn callee_name(cpg: &Cpg, call_id: NodeId) -> Option<String> {
-    for entry in cpg.call_graph.values() {
-        for cs in &entry.calls {
-            if cs.call_site == Some(call_id) {
-                return Some(cs.callee.clone());
-            }
-        }
+fn callee_name(cpg: &Cpg, kind_index: &KindIndex, call_id: NodeId) -> Option<String> {
+    if let Some(cs) = kind_index.call_site_for_node(call_id) {
+        return Some(cs.callee.clone());
     }
     // Fallback: first identifier child of the call node
     cpg.ast.get(&call_id)?.children.iter().find_map(|&cid| {

@@ -12,6 +12,7 @@ use web_ql::{
     },
     ast::{CmpOp, Language, Literal, Severity, TypeExpr},
     cfg::FunctionCfg,
+    kind_index::KindIndex,
     nullability::NullabilityIndex,
     size_tracking::AllocSizeIndex,
     taint::EndpointRegistry,
@@ -59,11 +60,13 @@ fn run_rule(rule: CompiledRule, cpg: &web_sitter::Cpg) -> Vec<Finding> {
     let predicate_params: HashMap<String, Vec<String>> = HashMap::new();
     let alias = AliasIndex::build(cpg);
     let sizes = AllocSizeIndex::build(cpg);
-    let nullability = NullabilityIndex::build(cpg);
+    let kind_index = KindIndex::build(cpg);
+    let nullability = NullabilityIndex::build(cpg, &kind_index);
     let ctx = EvalContext {
         cpg,
         dfg: &dfg,
         cfg_cache: &cfg_cache,
+        kind_index: &kind_index,
         alias: &alias,
         sizes: &sizes,
         nullability: &nullability,
@@ -550,11 +553,13 @@ fn run_multiple_rules_all_findings_collected() {
     let predicate_params: HashMap<String, Vec<String>> = HashMap::new();
     let alias = AliasIndex::build(&cpg);
     let sizes = AllocSizeIndex::build(&cpg);
-    let nullability = NullabilityIndex::build(&cpg);
+    let kind_index = KindIndex::build(&cpg);
+    let nullability = NullabilityIndex::build(&cpg, &kind_index);
     let ctx = EvalContext {
         cpg: &cpg,
         dfg: &dfg,
         cfg_cache: &cfg_cache,
+        kind_index: &kind_index,
         alias: &alias,
         sizes: &sizes,
         nullability: &nullability,
@@ -587,11 +592,13 @@ fn empty_rule_set_returns_no_findings() {
     let predicate_params: HashMap<String, Vec<String>> = HashMap::new();
     let alias = AliasIndex::build(&cpg);
     let sizes = AllocSizeIndex::build(&cpg);
-    let nullability = NullabilityIndex::build(&cpg);
+    let kind_index = KindIndex::build(&cpg);
+    let nullability = NullabilityIndex::build(&cpg, &kind_index);
     let ctx = EvalContext {
         cpg: &cpg,
         dfg: &dfg,
         cfg_cache: &cfg_cache,
+        kind_index: &kind_index,
         alias: &alias,
         sizes: &sizes,
         nullability: &nullability,
@@ -619,11 +626,13 @@ fn run_rule_with_cfg(rule: CompiledRule, cpg: &web_sitter::Cpg, fn_id: u32) -> V
     let predicate_params: HashMap<String, Vec<String>> = HashMap::new();
     let alias = AliasIndex::build(cpg);
     let sizes = AllocSizeIndex::build(cpg);
-    let nullability = NullabilityIndex::build(cpg);
+    let kind_index = KindIndex::build(cpg);
+    let nullability = NullabilityIndex::build(cpg, &kind_index);
     let ctx = EvalContext {
         cpg,
         dfg: &dfg,
         cfg_cache: &cfg_cache,
+        kind_index: &kind_index,
         alias: &alias,
         sizes: &sizes,
         nullability: &nullability,
@@ -869,11 +878,13 @@ fn cfg_reachable_without_blocked_single_path() {
     let predicate_params: HashMap<String, Vec<String>> = HashMap::new();
     let alias = AliasIndex::build(&cpg);
     let sizes = AllocSizeIndex::build(&cpg);
-    let nullability = NullabilityIndex::build(&cpg);
+    let kind_index = KindIndex::build(&cpg);
+    let nullability = NullabilityIndex::build(&cpg, &kind_index);
     let ctx = EvalContext {
         cpg: &cpg,
         dfg: &dfg,
         cfg_cache: &cfg_cache,
+        kind_index: &kind_index,
         alias: &alias,
         sizes: &sizes,
         nullability: &nullability,

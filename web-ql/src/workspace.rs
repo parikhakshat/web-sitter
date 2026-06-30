@@ -9,6 +9,7 @@ use crate::cfg::FunctionCfg;
 use crate::dfg::DfgIndex;
 use crate::finding::Finding;
 use crate::ir::RuleSet;
+use crate::kind_index::KindIndex;
 use crate::nullability::NullabilityIndex;
 use crate::size_tracking::AllocSizeIndex;
 use crate::taint::{CrossFileTaintCtx, EndpointRegistry};
@@ -22,6 +23,9 @@ pub struct FileIndex {
     pub cpg: Cpg,
     pub dfg: DfgIndex,
     pub cfg_cache: HashMap<NodeId, FunctionCfg>,
+    /// Node-kind / raw-node-type / call-site index — replaces repeated full-AST and
+    /// full-call-graph scans during rule evaluation.
+    pub kind_index: KindIndex,
     /// Pointer alias index (POINTS_TO edges).
     pub alias: AliasIndex,
     /// Buffer / allocation size index.
@@ -40,6 +44,11 @@ impl FileIndex {
         let _span = prof::span("query.index_file");
 
         let size_estimate = estimate_cpg_bytes(&cpg);
+
+        let kind_index = {
+            let _s = prof::span("query.build_kind_index");
+            KindIndex::build(&cpg)
+        };
 
         let dfg = {
             let _s = prof::span("query.build_dfg_index");
@@ -61,13 +70,24 @@ impl FileIndex {
         };
         let nullability = {
             let _s = prof::span("query.build_nullability_index");
-            NullabilityIndex::build(&cpg)
+            NullabilityIndex::build(&cpg, &kind_index)
         };
 
         prof::cache_insert("file_index", size_estimate);
         prof::count("cfg_functions_cached", cfg_cache.len() as u64);
 
-        Self { path, cpg, dfg, cfg_cache, alias, sizes, nullability, content_hash, size_estimate }
+        Self {
+            path,
+            cpg,
+            dfg,
+            cfg_cache,
+            kind_index,
+            alias,
+            sizes,
+            nullability,
+            content_hash,
+            size_estimate,
+        }
     }
 }
 
@@ -378,6 +398,7 @@ impl Workspace {
                     cpg: &file_idx.cpg,
                     dfg: &file_idx.dfg,
                     cfg_cache: &file_idx.cfg_cache,
+                    kind_index: &file_idx.kind_index,
                     alias: &file_idx.alias,
                     sizes: &file_idx.sizes,
                     nullability: &file_idx.nullability,
@@ -450,6 +471,7 @@ impl Workspace {
                     cpg: &file_idx.cpg,
                     dfg: &file_idx.dfg,
                     cfg_cache: &file_idx.cfg_cache,
+                    kind_index: &file_idx.kind_index,
                     alias: &file_idx.alias,
                     sizes: &file_idx.sizes,
                     nullability: &file_idx.nullability,

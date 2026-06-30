@@ -11,6 +11,7 @@ pub mod planner;
 pub mod cfg;
 pub mod dfg;
 pub mod alias;
+pub mod kind_index;
 pub mod size_tracking;
 pub mod symbolic;
 pub mod nullability;

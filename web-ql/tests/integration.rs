@@ -17,6 +17,7 @@ use web_ql::{
     engine::{EvalContext, RuleRunner},
     finding::Finding,
     loader::compile_rules,
+    kind_index::KindIndex,
     nullability::NullabilityIndex,
     size_tracking::AllocSizeIndex,
     taint::EndpointRegistry,
@@ -44,7 +45,8 @@ fn run_query(cpg: &web_sitter::Cpg, rule_src: &str) -> Vec<Finding> {
     let dfg = DfgIndex::build(cpg);
     let alias = AliasIndex::build(cpg);
     let sizes = AllocSizeIndex::build(cpg);
-    let nullability = NullabilityIndex::build(cpg);
+    let kind_index = KindIndex::build(cpg);
+    let nullability = NullabilityIndex::build(cpg, &kind_index);
     let cfg_cache: HashMap<NodeId, FunctionCfg> = cpg
         .ast
         .iter()
@@ -60,6 +62,7 @@ fn run_query(cpg: &web_sitter::Cpg, rule_src: &str) -> Vec<Finding> {
         cpg,
         dfg: &dfg,
         cfg_cache: &cfg_cache,
+        kind_index: &kind_index,
         alias: &alias,
         sizes: &sizes,
         nullability: &nullability,
