@@ -1193,20 +1193,27 @@ fn enrich_cpp_metadata(cpg: &mut crate::Cpg) {
     }
 
     // Extract the simple function name from a function_definition node via AST.
+    // Handles pointer/reference-returning functions where function_declarator is
+    // nested inside pointer_declarator / reference_declarator / parenthesized_declarator.
     fn extract_fn_simple_name(ast: &BTreeMap<NodeId, AstNode>, fn_def_id: NodeId) -> String {
         let Some(fn_node) = ast.get(&fn_def_id) else {
             return String::new();
         };
-        for &child_id in &fn_node.children {
-            let Some(child) = ast.get(&child_id) else {
-                continue;
-            };
-            if child.node_type == "function_declarator" {
-                if let Some(&name_id) = child.children.first() {
-                    if let Some(name_node) = ast.get(&name_id) {
-                        // qualified_identifier: use last component
+
+        fn resolve_name(ast: &BTreeMap<NodeId, AstNode>, node_id: NodeId, depth: usize) -> Option<String> {
+            if depth > 8 {
+                return None;
+            }
+            let node = ast.get(&node_id)?;
+            match node.node_type.as_str() {
+                "function_declarator" => {
+                    // First child is the name node (identifier, qualified_identifier,
+                    // destructor_name, operator_name, etc.).
+                    node.children.first().and_then(|&name_id| {
+                        let name_node = ast.get(&name_id)?;
                         let raw = name_node.text.as_deref().unwrap_or("");
-                        return raw
+                        // Strip namespace qualifier, parameter list, destructor tilde, pointer star.
+                        let simple = raw
                             .rsplit("::")
                             .next()
                             .unwrap_or(raw)
@@ -1215,9 +1222,26 @@ fn enrich_cpp_metadata(cpg: &mut crate::Cpg) {
                             .unwrap_or(raw)
                             .trim_matches('~')
                             .trim_matches('*')
-                            .to_string();
-                    }
+                            .trim();
+                        if simple.is_empty() { None } else { Some(simple.to_string()) }
+                    })
                 }
+                // Pointer/reference/parenthesized declarators wrap the function_declarator.
+                "pointer_declarator"
+                | "reference_declarator"
+                | "rvalue_reference_declarator"
+                | "parenthesized_declarator"
+                | "abstract_pointer_declarator"
+                | "abstract_reference_declarator" => {
+                    node.children.iter().find_map(|&cid| resolve_name(ast, cid, depth + 1))
+                }
+                _ => None,
+            }
+        }
+
+        for &child_id in &fn_node.children {
+            if let Some(name) = resolve_name(ast, child_id, 0) {
+                return name;
             }
         }
         String::new()
@@ -1291,7 +1315,7 @@ fn enrich_cpp_metadata(cpg: &mut crate::Cpg) {
             .map(|n| n.node_type == "function_definition")
             .unwrap_or(false);
 
-        let (is_ctor, is_dtor, is_virt, qname) = if is_fn_def {
+        let (is_ctor, is_dtor, is_virt, qname, fn_simple_name) = if is_fn_def {
             let (_, is_dtor) = detect_ctor_dtor(&cpg.ast, node_id);
             let is_virt = detect_virtual(&cpg.ast, node_id);
             let fn_name = extract_fn_simple_name(&cpg.ast, node_id);
@@ -1317,13 +1341,19 @@ fn enrich_cpp_metadata(cpg: &mut crate::Cpg) {
                     Some(parts.join("::"))
                 }
             };
-            (is_ctor, is_dtor, is_virt, qname)
+            (is_ctor, is_dtor, is_virt, qname, fn_name)
         } else {
-            (false, false, false, None)
+            (false, false, false, None, String::new())
         };
 
         // Write to AstNode fields for backward compatibility.
         if let Some(node) = cpg.ast.get_mut(&node_id) {
+            // Populate the name field for C/C++ function_definition nodes.
+            // Other languages set this in their own enrichment passes; C/C++ must
+            // set it here so that query predicates like `node.name` work uniformly.
+            if is_fn_def && !fn_simple_name.is_empty() && node.name.is_none() {
+                node.name = Some(fn_simple_name.clone());
+            }
             if class_ctx.is_some() {
                 node.class_context = class_ctx.clone();
             }
@@ -1366,6 +1396,16 @@ fn enrich_cpp_metadata(cpg: &mut crate::Cpg) {
                 }
                 meta.qualified_name = qname;
                 meta.function_kind = crate::FunctionKind::Internal;
+            }
+        }
+    }
+
+    // Populate name on class_specifier / struct_specifier (ClassDef) nodes.
+    // This mirrors what other language enrichers do for their class declarations.
+    for (class_id, class_name) in &class_nodes {
+        if let Some(node) = cpg.ast.get_mut(class_id) {
+            if node.name.is_none() {
+                node.name = Some(class_name.clone());
             }
         }
     }
