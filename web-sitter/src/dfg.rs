@@ -1743,6 +1743,47 @@ fn build_dataflow_impl(
         }
     }
 
+    // ── Python: assignment / augmented-assignment statements ─────────────────
+    // assignment:           [lhs, "=",  rhs]
+    // augmented_assignment: [lhs, "+=", rhs]  (and similar)
+    //
+    // The identifier loop above already classifies the LHS identifier as a DEF
+    // (via is_lvalue_context recognising "assignment"/"augmented_assignment").
+    // What is missing is a cross-variable REACHING_DEF edge from each RHS
+    // identifier → the LHS identifier so that taint flows between variables
+    // (e.g. `x = data` should give data→x flow, not just same-variable flow).
+    for assign_type in ["assignment", "augmented_assignment"] {
+        for node_id in type_index.get(assign_type).cloned().unwrap_or_default() {
+            if !node_in_scope(node_id, &function_map, affected_function_ids, include_globals) {
+                continue;
+            }
+            let Some(node) = graph.get(&node_id) else { continue; };
+            if node.children.len() < 2 { continue; }
+            let lhs_expr_id = node.children[0];
+            // collect_identifiers_in_expr skips lvalue-context nodes, but here we
+            // specifically want the LHS identifier, so look up it directly.
+            let Some(lhs_node) = graph.get(&lhs_expr_id) else { continue; };
+            let lhs_name = lhs_node.text.clone().or_else(|| {
+                // tuple / attribute LHS — skip for now
+                None
+            });
+            let Some(lhs_name) = lhs_name else { continue; };
+            if !lhs_node.is_identifier() { continue; }
+            let rhs_children: Vec<NodeId> = node.children[1..].to_vec();
+            for rhs_child_id in rhs_children {
+                for var in collect_identifiers_in_expr(graph, rhs_child_id, Some(&parent_map)) {
+                    push_edge(
+                        &mut edges,
+                        var.node_id,
+                        lhs_expr_id,
+                        lhs_name.clone(),
+                        "REACHING_DEF",
+                    );
+                }
+            }
+        }
+    }
+
     // Python: for-in comprehension iteration variable — isolated scope def.
     // for_in_clause: [identifier, "in", iterable]
     for node_id in type_index.get("for_in_clause").cloned().unwrap_or_default() {
@@ -2392,6 +2433,10 @@ fn is_parameter_name(graph: &BTreeMap<NodeId, AstNode>, node_id: NodeId) -> bool
     let Some(node) = graph.get(&node_id) else {
         return false;
     };
+    // Python: parameters are lifted to ParamDef kind directly (not wrapped in an Identifier child)
+    if node.is_param_def() {
+        return true;
+    }
     if !node.is_identifier() {
         return false;
     }

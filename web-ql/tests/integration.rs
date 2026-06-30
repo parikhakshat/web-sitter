@@ -258,17 +258,16 @@ def process(data):
     result = x
     return result
 "#);
-    // The Python CPG uses a reaching-definition DFG (def→use of the same variable).
-    // The edge `result_def → result_use → Return` is in the DFG.
-    // We verify that an Identifier node (the definition of `result`) reaches the Return.
+    // With a fixed CPG, the `data` parameter (ParamDef) flows through assignments
+    // `x = data` and `result = x` to the `return result` statement.
     let findings = run_query(&cpg, r#"
 rule "dfg-chain" {
     severity: info
     languages: [python]
-    find n: Identifier, m: Return where n.dfg_reaches(m)
+    find n: ParamDef, m: Return where n.dfg_reaches(m)
 }
 "#);
-    assert!(!findings.is_empty(), "identifier should reach return via DFG reaching-def chain");
+    assert!(!findings.is_empty(), "parameter 'data' should reach return via DFG chain through assignments");
 }
 
 #[test]
@@ -1119,23 +1118,22 @@ def get_user(username):
     query = "SELECT * FROM users WHERE name = '" + username + "'"
     db.execute(query)
 "#);
-    // The Python CPG's DFG tracks reaching definitions (def→use of same variable),
-    // not cross-expression value flow. The edge `query_def → query_use → execute_args`
-    // IS in the DFG — the query variable defined on line 3 reaches the execute() call.
-    // We search from any Identifier (the query variable) to the execute Call.
+    // The `username` parameter flows via `query = "..." + username + "..."` into
+    // `db.execute(query)`. With fixed CPG DFG and callee_name extraction, the
+    // ParamDef node should reach the execute() Call.
     let findings = run_query(&cpg, r#"
 rule "sql-injection" {
     severity: critical
     message: "SQL injection: tainted variable flows to execute"
     languages: [python]
-    find n: Identifier, m: Call where
+    find n: ParamDef, m: Call where
         n.dfg_reaches(m)
         and m.callee_name() == "execute"
 }
 "#);
     assert!(
         !findings.is_empty(),
-        "query variable should flow through reaching-def to execute() call"
+        "parameter 'username' should reach execute() call via DFG chain"
     );
 }
 

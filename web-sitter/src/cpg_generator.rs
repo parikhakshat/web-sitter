@@ -2330,8 +2330,22 @@ fn enrich_python_metadata(cpg: &mut Cpg) {
             // Python call: extract callee name from function field
             "call" => {
                 let node = &cpg.ast[&node_id];
-                let call_name = child_with_field(node, &cpg.ast, "function")
-                    .and_then(|(_, c)| c.text.clone())
+                let func_child = child_with_field(node, &cpg.ast, "function");
+                let call_name = func_child
+                    .and_then(|(_, c)| {
+                        if c.node_type == "attribute" {
+                            // Method call like db.execute(query) — use only the method name
+                            // (the last identifier child of the attribute node), not "db.execute".
+                            let children: Vec<NodeId> = c.children.clone();
+                            children.into_iter().rev().find_map(|cid| {
+                                cpg.ast.get(&cid)
+                                    .filter(|gc| gc.node_type == "identifier")
+                                    .and_then(|gc| gc.text.clone())
+                            })
+                        } else {
+                            c.text.clone()
+                        }
+                    })
                     .or_else(|| {
                         node.children.iter().find_map(|&cid| {
                             cpg.ast.get(&cid).filter(|c| {
