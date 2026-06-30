@@ -269,70 +269,82 @@ impl Workspace {
         //   2. class_context::name   (e.g. "Foo::bar")
         //   3. namespace::name       (e.g. "myns::helper")
         //   4. simple name           (e.g. "bar")
+        //
+        // The expensive per-node/per-file scan is independent across files, so it runs
+        // in parallel; only the final merge into one shared map needs to stay sequential
+        // (mirroring each key's original "first wins" vs "always overwrite" precedence).
+        let per_file_keys: Vec<Vec<(String, bool, (PathBuf, Vec<NodeId>))>> = self
+            .files
+            .par_iter()
+            .map(|(path, idx)| {
+                let mut keys: Vec<(String, bool, (PathBuf, Vec<NodeId>))> = Vec::new();
+                for (node_id, node) in &idx.cpg.ast {
+                    if node.kind != IrNodeKind::MethodDef {
+                        continue;
+                    }
+                    let Some(fn_name) = &node.name else { continue };
+
+                    // Collect ParamDef children in order.
+                    let params: Vec<NodeId> = node
+                        .children
+                        .iter()
+                        .filter(|&&child_id| {
+                            idx.cpg
+                                .ast
+                                .get(&child_id)
+                                .map(|n| n.kind == IrNodeKind::ParamDef)
+                                .unwrap_or(false)
+                        })
+                        .copied()
+                        .collect();
+
+                    let entry = (path.clone(), params);
+
+                    // Simple name — lowest priority, first registration wins (`overwrite = false`).
+                    keys.push((fn_name.clone(), false, entry.clone()));
+
+                    // Namespace-qualified name (e.g. "myns::helper").
+                    if let Some(ns) = &node.namespace {
+                        keys.push((format!("{}::{}", ns, fn_name), false, entry.clone()));
+                    }
+
+                    // Class-qualified name (e.g. "Foo::bar").
+                    if let Some(cls) = &node.class_context {
+                        keys.push((format!("{}::{}", cls, fn_name), false, entry.clone()));
+                    }
+
+                    // Fully-qualified name — highest specificity, always overwrites.
+                    if let Some(qname) = &node.qualified_name {
+                        keys.push((qname.clone(), true, entry.clone()));
+                    }
+
+                    // Java fully-qualified class name.
+                    if let Some(java_meta) = idx.cpg.java_metadata.get(node_id) {
+                        if let Some(fqc) = &java_meta.fully_qualified_class {
+                            keys.push((format!("{}.{}", fqc, fn_name), true, entry.clone()));
+                        }
+                    }
+
+                    // Go: package-qualified name (e.g. "encoding/json.Marshal").
+                    if let Some(go_meta) = idx.cpg.go_metadata.get(node_id) {
+                        if let Some(pkg) = &go_meta.package_name {
+                            keys.push((format!("{}.{}", pkg, fn_name), false, entry.clone()));
+                        }
+                        if let Some(qname) = &go_meta.qualified_name {
+                            keys.push((qname.clone(), true, entry.clone()));
+                        }
+                    }
+                }
+                keys
+            })
+            .collect();
+
         let mut fn_to_params: HashMap<String, (PathBuf, Vec<NodeId>)> = HashMap::new();
-
-        for (path, idx) in &self.files {
-            for (node_id, node) in &idx.cpg.ast {
-                if node.kind != IrNodeKind::MethodDef {
-                    continue;
-                }
-                let Some(fn_name) = &node.name else { continue };
-
-                // Collect ParamDef children in order.
-                let params: Vec<NodeId> = node
-                    .children
-                    .iter()
-                    .filter(|&&child_id| {
-                        idx.cpg
-                            .ast
-                            .get(&child_id)
-                            .map(|n| n.kind == IrNodeKind::ParamDef)
-                            .unwrap_or(false)
-                    })
-                    .copied()
-                    .collect();
-
-                let entry = (path.clone(), params);
-
-                // Register under simple name (lowest priority — may be overwritten).
-                fn_to_params.entry(fn_name.clone()).or_insert_with(|| entry.clone());
-
-                // Register under namespace-qualified name (e.g. "myns::helper").
-                if let Some(ns) = &node.namespace {
-                    let ns_key = format!("{}::{}", ns, fn_name);
-                    fn_to_params.entry(ns_key).or_insert_with(|| entry.clone());
-                }
-
-                // Register under class-qualified name (e.g. "Foo::bar").
-                if let Some(cls) = &node.class_context {
-                    let cls_key = format!("{}::{}", cls, fn_name);
-                    fn_to_params.entry(cls_key).or_insert_with(|| entry.clone());
-                }
-
-                // Register under fully-qualified name (highest specificity).
-                if let Some(qname) = &node.qualified_name {
-                    // Fully-qualified name overrides everything — use insert directly.
-                    fn_to_params.insert(qname.clone(), entry.clone());
-                }
-
-                // Also check the language-specific metadata side-tables for Java FQNs.
-                if let Some(java_meta) = idx.cpg.java_metadata.get(node_id) {
-                    if let Some(fqc) = &java_meta.fully_qualified_class {
-                        let java_key = format!("{}.{}", fqc, fn_name);
-                        fn_to_params.insert(java_key, entry.clone());
-                    }
-                }
-
-                // Go: package-qualified name (e.g. "encoding/json.Marshal").
-                if let Some(go_meta) = idx.cpg.go_metadata.get(node_id) {
-                    if let Some(pkg) = &go_meta.package_name {
-                        let go_key = format!("{}.{}", pkg, fn_name);
-                        fn_to_params.entry(go_key).or_insert_with(|| entry.clone());
-                    }
-                    if let Some(qname) = &go_meta.qualified_name {
-                        fn_to_params.insert(qname.clone(), entry.clone());
-                    }
-                }
+        for (key, overwrite, value) in per_file_keys.into_iter().flatten() {
+            if overwrite {
+                fn_to_params.insert(key, value);
+            } else {
+                fn_to_params.entry(key).or_insert(value);
             }
         }
 

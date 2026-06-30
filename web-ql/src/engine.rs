@@ -131,67 +131,65 @@ impl<'a> RuleRunner<'a> {
     ) -> EndpointRegistry {
         let mut merged = EndpointRegistry::new();
 
-        // Helper: evaluate a SearchPlan against the current CPG, collecting all
-        // node IDs from all root bindings across all matching environments.
-        let eval_plan_nodes = |plan: &SearchPlan| -> Vec<NodeId> {
-            let envs = self.eval_search(plan);
-            let mut ids = Vec::new();
-            for env in &envs {
-                for binding in &plan.root_bindings {
-                    if let Some(BindingValue::Node(nid)) = env.get(&binding.name) {
-                        ids.push(*nid);
+        // Resolve one endpoint ref: prefer a named plan (evaluated against the current
+        // CPG) over forwarding pre-resolved base-registry entries.
+        let resolve_one = |endpoint_ref: &crate::ir::TaintEndpointRef,
+                            named_plans: &HashMap<String, SearchPlan>|
+         -> (String, Vec<NodeId>) {
+            let nodes = if let Some(plan) = named_plans.get(&endpoint_ref.name) {
+                let envs = self.eval_search(plan);
+                let mut ids = Vec::new();
+                for env in &envs {
+                    for binding in &plan.root_bindings {
+                        if let Some(BindingValue::Node(nid)) = env.get(&binding.name) {
+                            ids.push(*nid);
+                        }
                     }
                 }
-            }
-            ids.sort_unstable();
-            ids.dedup();
-            ids
+                ids.sort_unstable();
+                ids.dedup();
+                ids
+            } else {
+                self.ctx.registry
+                    .resolve(endpoint_ref, self.ctx.cpg)
+                    .into_iter()
+                    .map(|r| r.node)
+                    .collect()
+            };
+            (endpoint_ref.name.clone(), nodes)
         };
 
-        // Resolve each source endpoint: prefer named plan over base registry.
-        for src_ref in &spec.sources {
-            if let Some(plan) = rule_set.source_plans.get(&src_ref.name) {
-                let nodes = eval_plan_nodes(plan);
-                merged.register_static(src_ref.name.clone(), nodes);
-            } else {
-                // Forward base registry entries for this name by pre-resolving them.
-                let base_nodes: Vec<NodeId> = self.ctx.registry
-                    .resolve(src_ref, self.ctx.cpg)
-                    .into_iter()
-                    .map(|r| r.node)
-                    .collect();
-                merged.register_static(src_ref.name.clone(), base_nodes);
-            }
-        }
+        // Sources, sinks, and sanitizers are fully independent of each other — and
+        // each endpoint ref within a category is independent too — so resolve all
+        // three categories concurrently, then merge sequentially (EndpointRegistry's
+        // register_static takes &mut self).
+        let (sources, (sinks, sanitizers)) = rayon::join(
+            || {
+                spec.sources
+                    .par_iter()
+                    .map(|r| resolve_one(r, &rule_set.source_plans))
+                    .collect::<Vec<_>>()
+            },
+            || {
+                rayon::join(
+                    || {
+                        spec.sinks
+                            .par_iter()
+                            .map(|r| resolve_one(r, &rule_set.sink_plans))
+                            .collect::<Vec<_>>()
+                    },
+                    || {
+                        spec.sanitizers
+                            .par_iter()
+                            .map(|r| resolve_one(r, &rule_set.sanitizer_plans))
+                            .collect::<Vec<_>>()
+                    },
+                )
+            },
+        );
 
-        // Resolve each sink endpoint.
-        for sink_ref in &spec.sinks {
-            if let Some(plan) = rule_set.sink_plans.get(&sink_ref.name) {
-                let nodes = eval_plan_nodes(plan);
-                merged.register_static(sink_ref.name.clone(), nodes);
-            } else {
-                let base_nodes: Vec<NodeId> = self.ctx.registry
-                    .resolve(sink_ref, self.ctx.cpg)
-                    .into_iter()
-                    .map(|r| r.node)
-                    .collect();
-                merged.register_static(sink_ref.name.clone(), base_nodes);
-            }
-        }
-
-        // Resolve each sanitizer endpoint.
-        for san_ref in &spec.sanitizers {
-            if let Some(plan) = rule_set.sanitizer_plans.get(&san_ref.name) {
-                let nodes = eval_plan_nodes(plan);
-                merged.register_static(san_ref.name.clone(), nodes);
-            } else {
-                let base_nodes: Vec<NodeId> = self.ctx.registry
-                    .resolve(san_ref, self.ctx.cpg)
-                    .into_iter()
-                    .map(|r| r.node)
-                    .collect();
-                merged.register_static(san_ref.name.clone(), base_nodes);
-            }
+        for (name, nodes) in sources.into_iter().chain(sinks).chain(sanitizers) {
+            merged.register_static(name, nodes);
         }
 
         merged

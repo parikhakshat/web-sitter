@@ -157,6 +157,73 @@ fn total_nodes_zero_after_all_removed() {
     assert_eq!(ws.total_size_bytes(), 0);
 }
 
+// ── taint registry resolution (named source/sink plans + base registry) ───────
+
+#[test]
+fn scan_taint_rule_with_named_source_and_sink_plans_finds_flow() {
+    // Exercises build_taint_registry resolving BOTH named source/sink plan
+    // definitions (evaluated per-CPG) AND falling back to the base registry for an
+    // unnamed-but-registered endpoint, all in one rule — these resolve concurrently
+    // internally, so this locks in that the merge back into one registry is correct.
+    let mut ws = Workspace::new(empty_registry());
+    let (cpg, _src, _sink) = taint_flow_cpg();
+    ws.upsert_file(path("a.py"), cpg, 1);
+
+    let rule_src = r#"
+        source named_source = find n: Call where n.name == "user_input"
+        sink named_sink = find n: Call where n.name == "execute_sql"
+        rule "sqli" {
+            taint {
+                sources: ["named_source"]
+                sinks: ["named_sink"]
+            }
+        }
+    "#;
+    let rule_set = compile_rules(rule_src).expect("rule should compile");
+    let findings = ws.scan(&rule_set);
+
+    assert_eq!(findings.len(), 1, "should find exactly one taint flow: {findings:?}");
+    assert_eq!(findings[0].rule_id, "sqli");
+}
+
+#[test]
+fn scan_taint_rule_falls_back_to_base_registry_for_unnamed_endpoints() {
+    // No `source`/`sink` definitions in the rule file at all — both endpoint names
+    // must resolve purely via the base EndpointRegistry passed into Workspace::new.
+    let mut registry = empty_registry();
+    registry.register("base_source", |cpg: &web_sitter::Cpg| {
+        cpg.ast
+            .iter()
+            .filter(|(_, n)| n.name.as_deref() == Some("user_input"))
+            .map(|(id, _)| *id)
+            .collect()
+    });
+    registry.register("base_sink", |cpg: &web_sitter::Cpg| {
+        cpg.ast
+            .iter()
+            .filter(|(_, n)| n.name.as_deref() == Some("execute_sql"))
+            .map(|(id, _)| *id)
+            .collect()
+    });
+
+    let mut ws = Workspace::new(registry);
+    let (cpg, _src, _sink) = taint_flow_cpg();
+    ws.upsert_file(path("a.py"), cpg, 1);
+
+    let rule_src = r#"
+        rule "sqli-base" {
+            taint {
+                sources: ["base_source"]
+                sinks: ["base_sink"]
+            }
+        }
+    "#;
+    let rule_set = compile_rules(rule_src).expect("rule should compile");
+    let findings = ws.scan(&rule_set);
+
+    assert_eq!(findings.len(), 1, "should find the flow via base-registry fallback: {findings:?}");
+}
+
 // ── scan ─────────────────────────────────────────────────────────────────────
 
 #[test]
