@@ -286,6 +286,126 @@ fn upsert_file_merges_function_summaries() {
     assert!(ws.summaries.contains_key("my_func"), "summaries should be merged");
 }
 
+// ── scan_incremental ─────────────────────────────────────────────────────────
+
+#[test]
+fn scan_incremental_matches_full_scan_results() {
+    let mut ws = Workspace::new(empty_registry());
+    for i in 0..3u64 {
+        let (cpg, _) = simple_call_cpg();
+        ws.upsert_file(PathBuf::from(format!("file{i}.py")), cpg, i);
+    }
+    let rule_set = always_true_rule_set();
+
+    let incremental = ws.scan_incremental(&rule_set);
+    assert_eq!(incremental.len(), 3, "3 files x 1 Call each = 3 findings");
+}
+
+#[test]
+fn scan_incremental_clears_dirty_set_after_scan() {
+    let mut ws = Workspace::new(empty_registry());
+    let (cpg, _) = simple_call_cpg();
+    ws.upsert_file(path("a.py"), cpg, 1);
+    assert!(!ws.dirty_files().is_empty(), "newly inserted file should start dirty");
+
+    ws.scan_incremental(&always_true_rule_set());
+    assert!(
+        ws.dirty_files().is_empty(),
+        "dirty set should be empty after a successful incremental scan"
+    );
+}
+
+#[test]
+fn scan_incremental_repeated_scan_with_no_changes_is_stable() {
+    // Re-running scan_incremental with nothing changed (no files dirty) must reuse the
+    // cache and still produce the exact same findings as the first run.
+    let mut ws = Workspace::new(empty_registry());
+    for i in 0..3u64 {
+        let (cpg, _) = simple_call_cpg();
+        ws.upsert_file(PathBuf::from(format!("file{i}.py")), cpg, i);
+    }
+    let rule_set = always_true_rule_set();
+
+    let first = ws.scan_incremental(&rule_set);
+    assert!(ws.dirty_files().is_empty(), "no files should be dirty after the first scan");
+
+    let second = ws.scan_incremental(&rule_set);
+    assert_eq!(
+        first.len(),
+        second.len(),
+        "scanning again with nothing dirty must return the same findings from cache"
+    );
+    assert_eq!(second.len(), 3);
+}
+
+#[test]
+fn scan_incremental_upsert_marks_only_that_file_dirty() {
+    // Precise per-file dirty tracking is what makes the incremental cache safe to use —
+    // updating one file must not force every other file to be marked dirty too.
+    let mut ws = Workspace::new(empty_registry());
+    let (cpg_a, _) = simple_call_cpg();
+    let (cpg_b, _) = simple_call_cpg();
+    ws.upsert_file(path("a.py"), cpg_a, 1);
+    ws.upsert_file(path("b.py"), cpg_b, 2);
+    ws.scan_incremental(&always_true_rule_set());
+    assert!(ws.dirty_files().is_empty());
+
+    let (cpg_a2, _) = simple_call_cpg();
+    ws.upsert_file(path("a.py"), cpg_a2, 99); // only a.py changes
+    assert_eq!(ws.dirty_files().len(), 1, "only the updated file should be dirty");
+    assert!(ws.dirty_files().contains(&path("a.py")));
+    assert!(!ws.dirty_files().contains(&path("b.py")));
+}
+
+#[test]
+fn scan_incremental_reflects_updated_file_content() {
+    let mut ws = Workspace::new(empty_registry());
+    let (cpg_a, _) = simple_call_cpg(); // 1 Call
+    let (cpg_b, _) = simple_call_cpg(); // 1 Call
+    ws.upsert_file(path("a.py"), cpg_a, 1);
+    ws.upsert_file(path("b.py"), cpg_b, 2);
+
+    let rule_set = always_true_rule_set();
+    let first = ws.scan_incremental(&rule_set);
+    assert_eq!(first.len(), 2);
+
+    // Replace a.py with a CPG that has no Call nodes; b.py is untouched.
+    use web_sitter::Cpg;
+    let empty_cpg = Cpg { language: "python".to_owned(), ..Cpg::default() };
+    ws.upsert_file(path("a.py"), empty_cpg, 100);
+
+    let second = ws.scan_incremental(&rule_set);
+    assert_eq!(
+        second.len(),
+        1,
+        "a.py's findings should disappear after its update, b.py's should remain cached"
+    );
+}
+
+#[test]
+fn scan_incremental_invalidates_cache_when_rule_set_changes() {
+    // A rule set swap (e.g. hot-reloaded rules) must not serve findings computed under
+    // the previous rule set for files that weren't otherwise marked dirty.
+    let mut ws = Workspace::new(empty_registry());
+    let (cpg, _) = simple_call_cpg();
+    ws.upsert_file(path("a.py"), cpg, 1);
+
+    let first = ws.scan_incremental(&always_true_rule_set());
+    assert_eq!(first.len(), 1);
+
+    // No file changes — only the rule set differs (empty rule set now).
+    let second = ws.scan_incremental(&empty_rule_set());
+    assert_eq!(
+        second.len(),
+        0,
+        "switching to an empty rule set must not keep serving the old rule set's cached findings"
+    );
+
+    // Switching back to the original rule set (still no file changes) must recompute too.
+    let third = ws.scan_incremental(&always_true_rule_set());
+    assert_eq!(third.len(), 1, "switching rule sets back must recompute, not serve stale cache");
+}
+
 // ── Profiler integration ──────────────────────────────────────────────────────
 
 #[test]

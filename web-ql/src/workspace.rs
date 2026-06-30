@@ -11,7 +11,7 @@ use crate::finding::Finding;
 use crate::ir::RuleSet;
 use crate::nullability::NullabilityIndex;
 use crate::size_tracking::AllocSizeIndex;
-use crate::taint::{CrossFileTaintCtx, EndpointRegistry, TaintFinding};
+use crate::taint::{CrossFileTaintCtx, EndpointRegistry};
 use crate::engine::{EvalContext, RuleRunner};
 
 // ── File index ────────────────────────────────────────────────────────────────
@@ -99,6 +99,24 @@ fn estimate_cpg_bytes(cpg: &Cpg) -> u64 {
     ast_bytes + bb_bytes + dfg_bytes
 }
 
+/// Cheap change-detection signature for a `RuleSet`, used to invalidate
+/// `Workspace::findings_cache` when a different rule set is scanned. Hashes the ordered
+/// set of rule ids plus a per-rule clause count — enough to catch rules being added,
+/// removed, or reordered. It does *not* hash clause bodies, so editing a rule's logic
+/// in place while keeping the same id and clause count would not be detected; callers
+/// that hot-reload rule bodies under a stable id should treat that as a "new rule set"
+/// (e.g. by reconstructing the `RuleSet`) rather than relying on this signature alone.
+fn rule_set_signature(rule_set: &RuleSet) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    rule_set.rules.len().hash(&mut hasher);
+    for rule in &rule_set.rules {
+        rule.id.hash(&mut hasher);
+        rule.clauses.len().hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 // ── Workspace ─────────────────────────────────────────────────────────────────
 
 /// The scanning workspace: manages per-file indexes and orchestrates evaluation.
@@ -119,8 +137,13 @@ pub struct Workspace {
     /// Files that have been added/changed since the last scan. Used by
     /// `scan_incremental` to skip re-evaluating unchanged files.
     dirty_files: HashSet<PathBuf>,
-    /// Per-(file, rule_id) taint finding cache for incremental scans.
-    taint_cache: HashMap<(PathBuf, String), Vec<TaintFinding>>,
+    /// Per-file finding cache for incremental scans: the full result of the last
+    /// `RuleRunner::run` for a clean file, reused as-is until that file is marked dirty.
+    findings_cache: HashMap<PathBuf, Vec<Finding>>,
+    /// Identity of the rule set used to populate `findings_cache`, so a scan with a
+    /// different rule set (e.g. rules hot-reloaded) invalidates the whole cache instead
+    /// of serving findings computed under a stale rule set.
+    findings_cache_rule_set_sig: Option<u64>,
 }
 
 impl Workspace {
@@ -133,7 +156,8 @@ impl Workspace {
             cross_file_callee_params: HashMap::new(),
             cross_file_dfgs: HashMap::new(),
             dirty_files: HashSet::new(),
-            taint_cache: HashMap::new(),
+            findings_cache: HashMap::new(),
+            findings_cache_rule_set_sig: None,
         }
     }
 
@@ -157,8 +181,8 @@ impl Workspace {
         self.cross_file_callee_params.clear();
         self.cross_file_dfgs.clear();
 
-        // Invalidate any taint cache entries for this file.
-        self.taint_cache.retain(|(p, _), _| p != &path);
+        // Invalidate the cached findings for this file.
+        self.findings_cache.remove(&path);
 
         // Merge function summaries from this CPG.
         for (_node_id, summary) in &cpg.workspace.function_summaries {
@@ -180,8 +204,8 @@ impl Workspace {
         self.cross_file_callee_params.clear();
         // Remove summaries that came from this file.
         self.evict_summaries_for_file(path);
-        // Invalidate taint cache for this file.
-        self.taint_cache.retain(|(p, _), _| p.as_path() != path);
+        // Invalidate the cached findings for this file.
+        self.findings_cache.remove(path);
         // All remaining files may now have stale cross-file results.
         for p in self.files.keys() {
             self.dirty_files.insert(p.clone());
@@ -377,12 +401,26 @@ impl Workspace {
         findings
     }
 
-    /// Run the rule set using a taint-finding cache for incremental scans.
+    /// Run the rule set using a per-file findings cache for incremental scans.
     ///
-    /// Files in `dirty_files` are re-evaluated; unchanged files return cached findings.
-    /// After scanning, the dirty set is cleared and the cache is updated.
+    /// Files in `dirty_files` (new/changed since the last scan, or affected by a
+    /// cross-file edge change) are re-evaluated; unchanged files reuse the findings
+    /// cached from their last evaluation instead of re-running the whole rule set.
+    /// After scanning, the dirty set is cleared and the cache is refreshed.
+    ///
+    /// If `rule_set` differs from the one the cache was built with (e.g. rules were
+    /// hot-reloaded), the entire cache is invalidated and every file is re-evaluated —
+    /// findings computed under a different rule set must never be served as-is.
     pub fn scan_incremental(&mut self, rule_set: &RuleSet) -> Vec<Finding> {
         let _span = prof::span("query.scan_incremental_total");
+
+        let sig = rule_set_signature(rule_set);
+        if self.findings_cache_rule_set_sig != Some(sig) {
+            self.findings_cache.clear();
+            self.dirty_files.extend(self.files.keys().cloned());
+            self.findings_cache_rule_set_sig = Some(sig);
+        }
+
         let predicate_plans = &rule_set.predicate_plans;
         let predicate_params = &rule_set.predicate_params;
         let cross_file_ctx = CrossFileTaintCtx {
@@ -391,20 +429,23 @@ impl Workspace {
         };
         let cross_file_ref = &cross_file_ctx;
         let dirty = &self.dirty_files;
+        let cache = &self.findings_cache;
 
-        // Collect findings from all files: use cache for clean files, re-run for dirty ones.
+        // Re-evaluate dirty files in parallel; clean files are read straight from cache
+        // (cheap clone of already-computed `Finding`s, no RuleRunner work at all).
         let file_findings: Vec<(PathBuf, Vec<Finding>)> = self
             .files
             .par_iter()
             .map(|(path, file_idx)| {
-                let _span = prof::span("query.scan_file_incremental");
-
                 if !dirty.contains(path) {
-                    // File unchanged — re-use any previously stored findings from the
-                    // taint cache. For search clauses (no per-rule cache), still re-run.
-                    // (Full search-result caching requires a separate cache layer.)
+                    if let Some(cached) = cache.get(path) {
+                        prof::cache_hit("scan_incremental_findings");
+                        return (path.clone(), cached.clone());
+                    }
                 }
+                prof::cache_miss("scan_incremental_findings");
 
+                let _span = prof::span("query.scan_file_incremental");
                 let ctx = EvalContext {
                     cpg: &file_idx.cpg,
                     dfg: &file_idx.dfg,
@@ -429,15 +470,10 @@ impl Workspace {
             })
             .collect();
 
-        // Flatten and update taint cache with new findings for dirty files.
-        let mut all_findings = Vec::new();
+        // Flatten and refresh the per-file cache with the (possibly reused) results.
+        let mut all_findings = Vec::with_capacity(file_findings.iter().map(|(_, f)| f.len()).sum());
         for (path, findings) in file_findings {
-            // Update cache keyed by (path, rule_id).
-            for finding in &findings {
-                self.taint_cache
-                    .entry((path.clone(), finding.rule_id.clone()))
-                    .or_default();
-            }
+            self.findings_cache.insert(path, findings.clone());
             all_findings.extend(findings);
         }
 
