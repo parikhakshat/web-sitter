@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use rayon::prelude::*;
 use web_sitter::{CallSite, Cpg, IrNode, IrNodeKind, LiteralKind, NodeId};
 use web_profiler as prof;
+use crate::alias::AliasIndex;
 use crate::ast::{CmpOp, Literal, TypeExpr};
 use crate::cfg::FunctionCfg;
 use crate::dfg::DfgIndex;
@@ -11,6 +12,9 @@ use crate::ir::{
     SearchPlan,
 };
 use crate::finding::{Finding, FindingLocation};
+use crate::nullability::NullabilityIndex;
+use crate::size_tracking::{AllocSizeIndex, SizeValue};
+use crate::symbolic::SymbolicEval;
 use crate::taint::{CrossFileTaintCtx, EndpointRegistry, TaintEngine};
 
 // ── Eval context ──────────────────────────────────────────────────────────────
@@ -19,6 +23,12 @@ pub struct EvalContext<'a> {
     pub cpg: &'a Cpg,
     pub dfg: &'a DfgIndex,
     pub cfg_cache: &'a HashMap<NodeId, FunctionCfg>,
+    /// Pointer alias analysis (built from POINTS_TO edges).
+    pub alias: &'a AliasIndex,
+    /// Buffer / allocation size index.
+    pub sizes: &'a AllocSizeIndex,
+    /// Null-value propagation index.
+    pub nullability: &'a NullabilityIndex,
     pub summaries: &'a HashMap<String, web_sitter::FunctionSummary>,
     pub registry: &'a EndpointRegistry,
     /// Compiled predicates for recursive calls
@@ -783,6 +793,77 @@ impl<'a> RuleRunner<'a> {
                     .and_then(|cs| cs.callee_id)
                     .map(EvalValue::Node)
                     .unwrap_or(EvalValue::Null)
+            }
+
+            // ── Alias / pointer analysis ─────────────────────────────────────
+            "points_to" => {
+                // Returns the first POINTS_TO target for this node, or Null.
+                self.ctx.alias.points_to_set(node_id)
+                    .and_then(|s| s.iter().next().copied())
+                    .map(EvalValue::Node)
+                    .unwrap_or(EvalValue::Null)
+            }
+
+            "alias_target" => {
+                // Synonym for points_to — first POINTS_TO target.
+                self.ctx.alias.points_to_set(node_id)
+                    .and_then(|s| s.iter().next().copied())
+                    .map(EvalValue::Node)
+                    .unwrap_or(EvalValue::Null)
+            }
+
+            "is_pointer" => {
+                // True if this node has any outgoing POINTS_TO edges.
+                EvalValue::Bool(self.ctx.alias.is_pointer(node_id))
+            }
+
+            // ── Size tracking ─────────────────────────────────────────────────
+            "alloc_size" => {
+                // Returns Int(n) for concrete sizes, Str(expr) for symbolic, Null if unknown.
+                match self.ctx.sizes.size_of(node_id) {
+                    SizeValue::Concrete(n) => EvalValue::Int(n),
+                    SizeValue::Symbolic(s) => EvalValue::Str(s),
+                    SizeValue::Unknown => EvalValue::Null,
+                }
+            }
+
+            "has_known_size" => {
+                // True only when a concrete byte count is known.
+                EvalValue::Bool(self.ctx.sizes.concrete_size(node_id).is_some())
+            }
+
+            // ── Nullability ───────────────────────────────────────────────────
+            "may_be_null" => {
+                EvalValue::Bool(self.ctx.nullability.may_be_null(node_id))
+            }
+
+            "null_source" => {
+                // Returns the original null-producing seed node, or Null.
+                self.ctx.nullability.null_origin_of(node_id)
+                    .map(EvalValue::Node)
+                    .unwrap_or(EvalValue::Null)
+            }
+
+            // ── Symbolic / constant-folding evaluation ────────────────────────
+            "eval_int" => {
+                let mut se = SymbolicEval::new(self.ctx.cpg);
+                match se.eval_int(node_id) {
+                    Some(n) => EvalValue::Int(n),
+                    None => EvalValue::Null,
+                }
+            }
+
+            "eval_bool" => {
+                let mut se = SymbolicEval::new(self.ctx.cpg);
+                match se.eval_bool(node_id) {
+                    Some(b) => EvalValue::Bool(b),
+                    None => EvalValue::Null,
+                }
+            }
+
+            "is_const_expr" => {
+                let mut se = SymbolicEval::new(self.ctx.cpg);
+                EvalValue::Bool(se.is_const(node_id))
             }
 
             // ── Language metadata side-table accessors ────────────────────────
