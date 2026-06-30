@@ -14,6 +14,8 @@ use crate::dfg::{
     build_call_graph, build_call_graph_for_functions, build_dataflow_for_functions,
     build_preprocessing_maps, get_func_def_name,
 };
+use crate::call_analysis::{build_interprocedural_dfg, enrich_call_graph};
+use crate::type_inference::build_class_hierarchy;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChangeType {
@@ -913,7 +915,6 @@ impl IncrementalCpgGenerator {
 
                 if let Some(old_subtree_root) = matching_old {
                     consumed_overlapping.insert(old_subtree_root);
-                    collect_subtree_ids(&old_cpg.ast, old_subtree_root, &mut removed_ids);
                     let old_subtree = extract_subtree_cpg(&old_cpg, old_subtree_root);
                     let reuse =
                         stabilize_cpg_ids(&old_subtree, &subtree_cpg, next_id, &kept_deleted_ids);
@@ -923,6 +924,13 @@ impl IncrementalCpgGenerator {
                         &mut subtree_artifacts.id_to_node_ptr,
                         &reuse.remap,
                     );
+                    // Only the old descendant ids `stabilize_cpg_ids` couldn't structurally
+                    // match (i.e. genuinely removed/replaced, like an old call site that no
+                    // longer exists) are deleted. Unmatched-but-still-present old siblings
+                    // (an untouched field/method elsewhere in the same class) keep their id
+                    // and must NOT be swept up — `collect_subtree_ids` over the whole old
+                    // subtree here would also catch those reused ids and erase them later.
+                    removed_ids.extend(reuse.deleted_ids.iter().copied());
                     kept_deleted_ids.extend(reuse.deleted_ids.iter().copied());
                     next_id = reuse.next_id;
                     *self
@@ -986,7 +994,11 @@ impl IncrementalCpgGenerator {
         }
 
         for entry in &old_top_level {
-            if !surviving_old.contains(&entry.node_id) {
+            // Entries reused via the `matching_old` structural-reuse path (tracked in
+            // `consumed_overlapping`) already had their surviving descendant ids removed
+            // from `removed_ids` above; re-collecting their *entire* old subtree here would
+            // wipe out unchanged sibling members (fields/methods) that were just reused.
+            if !surviving_old.contains(&entry.node_id) && !consumed_overlapping.contains(&entry.node_id) {
                 collect_subtree_ids(&old_cpg.ast, entry.node_id, &mut removed_ids);
             }
         }
@@ -1091,19 +1103,36 @@ impl IncrementalCpgGenerator {
                 macro_bodies: cpg_macro_bodies,
                 custom_allocators: old_cpg.c_file.custom_allocators.clone(),
             },
-            cpp_metadata: old_cpg.cpp_metadata.clone(),
-            go_metadata: old_cpg.go_metadata.clone(),
-            python_metadata: old_cpg.python_metadata.clone(),
-            java_metadata: old_cpg.java_metadata.clone(),
-            js_metadata: old_cpg.js_metadata.clone(),
-            ts_metadata: old_cpg.ts_metadata.clone(),
-            rust_metadata: old_cpg.rust_metadata.clone(),
+            // Pruned of deleted nodes here; re-populated for the current (post-edit) AST by
+            // `reenrich_language_metadata` below, which re-runs the same enrich_*_metadata
+            // pass the full-generation pipeline uses — this avoids the context-loss bugs a
+            // subtree-local re-enrichment would have (e.g. Java `package_name` depends on a
+            // sibling `package_declaration` node outside any single edited subtree).
+            cpp_metadata: prune_metadata(&old_cpg.cpp_metadata, &removed_ids),
+            go_metadata: prune_metadata(&old_cpg.go_metadata, &removed_ids),
+            python_metadata: prune_metadata(&old_cpg.python_metadata, &removed_ids),
+            java_metadata: prune_metadata(&old_cpg.java_metadata, &removed_ids),
+            js_metadata: prune_metadata(&old_cpg.js_metadata, &removed_ids),
+            ts_metadata: prune_metadata(&old_cpg.ts_metadata, &removed_ids),
+            rust_metadata: prune_metadata(&old_cpg.rust_metadata, &removed_ids),
             workspace: crate::WorkspaceIndex {
                 cross_file_calls: Vec::new(),
-                class_hierarchy: old_cpg.workspace.class_hierarchy.clone(),
-                function_summaries: old_cpg.workspace.function_summaries.clone(),
+                // class_hierarchy/function_summaries are recomputed wholesale below via
+                // build_class_hierarchy/build_interprocedural_dfg once call_graph/dataflow
+                // are finalized — both are cheap whole-AST passes, same cost paid by a full
+                // parse, and recomputing avoids accumulating stale entries here.
+                class_hierarchy: BTreeMap::new(),
+                function_summaries: BTreeMap::new(),
             },
         };
+
+        // Parity with the full-generation pipeline (`get_node_graph_artifacts`): re-run the
+        // language-specific metadata enrichment pass over the *whole* post-edit AST (cheap,
+        // same cost a full parse always pays) rather than trying to patch in per-subtree
+        // metadata, which would lack context for fields that depend on sibling nodes (e.g.
+        // Java `package_name` from a `package_declaration` outside the edited class).
+        reenrich_language_metadata(&mut cpg, self.source_language);
+
         clear_basic_block_annotations(&mut cpg.ast, Some(&affected_function_ids));
         if !affected_function_ids.is_empty() {
             build_cfg_for_functions_with_start(
@@ -1166,6 +1195,19 @@ impl IncrementalCpgGenerator {
             self.options.macro_aliases.as_ref(),
         );
         cpg.dataflow = new_dataflow;
+
+        // Parity with the full-generation pipeline (`get_node_graph_artifacts`): rebuild
+        // class_hierarchy and language-specific call-graph enrichment (virtual dispatch
+        // flags, super()/this() detection, goroutine/defer tagging, trait-object dispatch,
+        // etc.) and interprocedural function summaries now that call_graph/dataflow are
+        // final. These are whole-AST passes — the same cost a full parse always pays — and
+        // were previously skipped entirely on the incremental path, leaving e.g.
+        // `is_virtual_dispatch`/`class_hierarchy`/`function_summaries` permanently empty or
+        // stale after any incremental edit.
+        build_class_hierarchy(&mut cpg);
+        enrich_call_graph(&mut cpg, self.source_language);
+        build_interprocedural_dfg(&mut cpg);
+
         // Replace cross-file calls for affected functions; keep others.
         // Filter new_xfile to only include edges from actual incremental targets
         // (add_interprocedural_edges may emit edges for non-target functions too).
@@ -2753,6 +2795,61 @@ fn apply_cpg_remap(cpg: &mut Cpg, remap: &BTreeMap<u32, u32>) {
     for edge in &mut cpg.dataflow.edges {
         edge.source = *remap.get(&edge.source).unwrap_or(&edge.source);
         edge.destination = *remap.get(&edge.destination).unwrap_or(&edge.destination);
+    }
+
+    remap_metadata_keys(&mut cpg.cpp_metadata, remap);
+    remap_metadata_keys(&mut cpg.go_metadata, remap);
+    remap_metadata_keys(&mut cpg.python_metadata, remap);
+    remap_metadata_keys(&mut cpg.java_metadata, remap);
+    remap_metadata_keys(&mut cpg.js_metadata, remap);
+    remap_metadata_keys(&mut cpg.ts_metadata, remap);
+    remap_metadata_keys(&mut cpg.rust_metadata, remap);
+}
+
+/// Rewrite a sparse per-language metadata side-table's keys (NodeIds) according to `remap`,
+/// matching the same NodeId remapping applied to `cpg.ast`/`cpg.call_graph`/`cpg.dataflow`.
+fn remap_metadata_keys<V>(map: &mut BTreeMap<NodeId, V>, remap: &BTreeMap<u32, u32>) {
+    if map.is_empty() {
+        return;
+    }
+    let old = std::mem::take(map);
+    for (id, value) in old {
+        let mapped_id = *remap.get(&id).unwrap_or(&id);
+        map.insert(mapped_id, value);
+    }
+}
+
+/// Carry a sparse per-language metadata side-table forward across an incremental edit, dropping
+/// entries for deleted nodes. The carried-forward values for surviving/unaffected nodes are
+/// correct as-is; entries for new/changed nodes get filled in by `reenrich_language_metadata`.
+fn prune_metadata<V: Clone>(
+    old: &BTreeMap<NodeId, V>,
+    removed_ids: &BTreeSet<NodeId>,
+) -> BTreeMap<NodeId, V> {
+    old.iter()
+        .filter(|(id, _)| !removed_ids.contains(id))
+        .map(|(id, v)| (*id, v.clone()))
+        .collect()
+}
+
+/// Re-run the language-specific metadata enrichment pass (same functions
+/// `get_node_graph_artifacts` calls for a full parse) over the whole post-edit AST, so that
+/// incremental edits reflect the same `cpp_metadata`/`java_metadata`/etc. a from-scratch parse
+/// would produce instead of silently keeping pre-edit values.
+fn reenrich_language_metadata(cpg: &mut Cpg, language: SourceLanguage) {
+    use crate::cpg_generator::{
+        enrich_cpp_metadata, enrich_go_metadata, enrich_java_metadata, enrich_js_metadata,
+        enrich_python_metadata, enrich_rust_metadata, enrich_ts_metadata,
+    };
+    match language {
+        SourceLanguage::Cpp => enrich_cpp_metadata(cpg),
+        SourceLanguage::Go => enrich_go_metadata(cpg),
+        SourceLanguage::Python => enrich_python_metadata(cpg),
+        SourceLanguage::Java => enrich_java_metadata(cpg),
+        SourceLanguage::JavaScript => enrich_js_metadata(cpg),
+        SourceLanguage::TypeScript => enrich_ts_metadata(cpg),
+        SourceLanguage::Rust => enrich_rust_metadata(cpg),
+        _ => {}
     }
 }
 

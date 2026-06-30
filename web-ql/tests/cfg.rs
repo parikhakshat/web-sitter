@@ -166,6 +166,72 @@ fn reachability_single_node() {
     assert!(reach.can_reach(0, 0));
 }
 
+#[test]
+fn reachability_empty_graph() {
+    let reach = CfgReachability::compute(&[]);
+    assert_eq!(reach.n, 0);
+    assert!(!reach.can_reach(0, 0));
+}
+
+#[test]
+fn reachability_disconnected_components_dont_cross_reach() {
+    // 0 → 1   and a separate, unreachable pair  2 → 3
+    let succs = vec![vec![1], vec![], vec![3], vec![]];
+    let reach = CfgReachability::compute(&succs);
+    assert!(reach.can_reach(0, 1));
+    assert!(reach.can_reach(2, 3));
+    assert!(!reach.can_reach(0, 2));
+    assert!(!reach.can_reach(0, 3));
+    assert!(!reach.can_reach(2, 0));
+    assert!(!reach.can_reach(2, 1));
+}
+
+#[test]
+fn reachability_multi_node_cycle_reaches_shared_external_sink() {
+    // A 3-node cycle (0 → 1 → 2 → 0) where only node 1 has an edge out to an
+    // external sink (3). Since the cycle is one SCC, every member must reach the
+    // sink, not just the block with the literal outgoing edge — this is exactly
+    // what the SCC-condensation reach computation must get right (all SCC
+    // members share one reach set).
+    let succs = vec![
+        vec![1],    // 0 → 1
+        vec![2, 3], // 1 → 2 (cycle), 1 → 3 (external sink)
+        vec![0],    // 2 → 0 (closes the cycle)
+        vec![],     // 3: sink
+    ];
+    let reach = CfgReachability::compute(&succs);
+    assert!(reach.can_reach(0, 3), "0 should reach the sink via the cycle");
+    assert!(reach.can_reach(1, 3));
+    assert!(reach.can_reach(2, 3), "2 should reach the sink even though only 1 has the direct edge");
+    // All cycle members mutually reach each other.
+    assert!(reach.can_reach(0, 1) && reach.can_reach(1, 2) && reach.can_reach(2, 0));
+    assert!(reach.can_reach(0, 2) && reach.can_reach(1, 0) && reach.can_reach(2, 1));
+    // The sink does not reach back into the cycle.
+    assert!(!reach.can_reach(3, 0));
+    assert!(!reach.can_reach(3, 1));
+}
+
+#[test]
+fn reachability_two_cycles_chained_through_bridge() {
+    // Cycle A {0,1}, bridge block 2, cycle B {3,4}: 0↔1 → 2 → 3↔4
+    let succs = vec![
+        vec![1],    // 0 → 1
+        vec![0, 2], // 1 → 0 (cycle), 1 → 2 (bridge)
+        vec![3],    // 2 → 3
+        vec![4],    // 3 → 4
+        vec![3],    // 4 → 3 (closes cycle B)
+    ];
+    let reach = CfgReachability::compute(&succs);
+    // Cycle A reaches the bridge and all of cycle B.
+    assert!(reach.can_reach(0, 2) && reach.can_reach(1, 2));
+    assert!(reach.can_reach(0, 3) && reach.can_reach(0, 4));
+    assert!(reach.can_reach(1, 3) && reach.can_reach(1, 4));
+    // Cycle B does not reach back through the bridge into cycle A.
+    assert!(!reach.can_reach(3, 0));
+    assert!(!reach.can_reach(4, 1));
+    assert!(!reach.can_reach(2, 0));
+}
+
 // ── FunctionCfg from real CPG ─────────────────────────────────────────────────
 
 #[test]

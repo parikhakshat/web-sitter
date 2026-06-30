@@ -1,11 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use rayon::prelude::*;
-use web_sitter::{CallSite, Cpg, IrNode, IrNodeKind, LiteralKind, NodeId};
+use web_sitter::{Cpg, IrNode, IrNodeKind, LiteralKind, NodeId};
 use web_profiler as prof;
 use crate::alias::AliasIndex;
 use crate::ast::{CmpOp, Literal, TypeExpr};
 use crate::cfg::FunctionCfg;
 use crate::dfg::DfgIndex;
+use crate::kind_index::KindIndex;
 use crate::ir::{
     AstConstraint, BindingEnv, BindingValue, CfgPredicate, CompiledClause, CompiledRule,
     DfgPredicate, FieldConstraint, MethodStep, PlanExpr, QueryPlan, RootBinding, RuleSet,
@@ -23,6 +24,8 @@ pub struct EvalContext<'a> {
     pub cpg: &'a Cpg,
     pub dfg: &'a DfgIndex,
     pub cfg_cache: &'a HashMap<NodeId, FunctionCfg>,
+    /// Node-kind / raw-node-type / call-site index, built once per file.
+    pub kind_index: &'a KindIndex,
     /// Pointer alias analysis (built from POINTS_TO edges).
     pub alias: &'a AliasIndex,
     /// Buffer / allocation size index.
@@ -128,67 +131,65 @@ impl<'a> RuleRunner<'a> {
     ) -> EndpointRegistry {
         let mut merged = EndpointRegistry::new();
 
-        // Helper: evaluate a SearchPlan against the current CPG, collecting all
-        // node IDs from all root bindings across all matching environments.
-        let eval_plan_nodes = |plan: &SearchPlan| -> Vec<NodeId> {
-            let envs = self.eval_search(plan);
-            let mut ids = Vec::new();
-            for env in &envs {
-                for binding in &plan.root_bindings {
-                    if let Some(BindingValue::Node(nid)) = env.get(&binding.name) {
-                        ids.push(*nid);
+        // Resolve one endpoint ref: prefer a named plan (evaluated against the current
+        // CPG) over forwarding pre-resolved base-registry entries.
+        let resolve_one = |endpoint_ref: &crate::ir::TaintEndpointRef,
+                            named_plans: &HashMap<String, SearchPlan>|
+         -> (String, Vec<NodeId>) {
+            let nodes = if let Some(plan) = named_plans.get(&endpoint_ref.name) {
+                let envs = self.eval_search(plan);
+                let mut ids = Vec::new();
+                for env in &envs {
+                    for binding in &plan.root_bindings {
+                        if let Some(BindingValue::Node(nid)) = env.get(&binding.name) {
+                            ids.push(*nid);
+                        }
                     }
                 }
-            }
-            ids.sort_unstable();
-            ids.dedup();
-            ids
+                ids.sort_unstable();
+                ids.dedup();
+                ids
+            } else {
+                self.ctx.registry
+                    .resolve(endpoint_ref, self.ctx.cpg)
+                    .into_iter()
+                    .map(|r| r.node)
+                    .collect()
+            };
+            (endpoint_ref.name.clone(), nodes)
         };
 
-        // Resolve each source endpoint: prefer named plan over base registry.
-        for src_ref in &spec.sources {
-            if let Some(plan) = rule_set.source_plans.get(&src_ref.name) {
-                let nodes = eval_plan_nodes(plan);
-                merged.register_static(src_ref.name.clone(), nodes);
-            } else {
-                // Forward base registry entries for this name by pre-resolving them.
-                let base_nodes: Vec<NodeId> = self.ctx.registry
-                    .resolve(src_ref, self.ctx.cpg)
-                    .into_iter()
-                    .map(|r| r.node)
-                    .collect();
-                merged.register_static(src_ref.name.clone(), base_nodes);
-            }
-        }
+        // Sources, sinks, and sanitizers are fully independent of each other — and
+        // each endpoint ref within a category is independent too — so resolve all
+        // three categories concurrently, then merge sequentially (EndpointRegistry's
+        // register_static takes &mut self).
+        let (sources, (sinks, sanitizers)) = rayon::join(
+            || {
+                spec.sources
+                    .par_iter()
+                    .map(|r| resolve_one(r, &rule_set.source_plans))
+                    .collect::<Vec<_>>()
+            },
+            || {
+                rayon::join(
+                    || {
+                        spec.sinks
+                            .par_iter()
+                            .map(|r| resolve_one(r, &rule_set.sink_plans))
+                            .collect::<Vec<_>>()
+                    },
+                    || {
+                        spec.sanitizers
+                            .par_iter()
+                            .map(|r| resolve_one(r, &rule_set.sanitizer_plans))
+                            .collect::<Vec<_>>()
+                    },
+                )
+            },
+        );
 
-        // Resolve each sink endpoint.
-        for sink_ref in &spec.sinks {
-            if let Some(plan) = rule_set.sink_plans.get(&sink_ref.name) {
-                let nodes = eval_plan_nodes(plan);
-                merged.register_static(sink_ref.name.clone(), nodes);
-            } else {
-                let base_nodes: Vec<NodeId> = self.ctx.registry
-                    .resolve(sink_ref, self.ctx.cpg)
-                    .into_iter()
-                    .map(|r| r.node)
-                    .collect();
-                merged.register_static(sink_ref.name.clone(), base_nodes);
-            }
-        }
-
-        // Resolve each sanitizer endpoint.
-        for san_ref in &spec.sanitizers {
-            if let Some(plan) = rule_set.sanitizer_plans.get(&san_ref.name) {
-                let nodes = eval_plan_nodes(plan);
-                merged.register_static(san_ref.name.clone(), nodes);
-            } else {
-                let base_nodes: Vec<NodeId> = self.ctx.registry
-                    .resolve(san_ref, self.ctx.cpg)
-                    .into_iter()
-                    .map(|r| r.node)
-                    .collect();
-                merged.register_static(san_ref.name.clone(), base_nodes);
-            }
+        for (name, nodes) in sources.into_iter().chain(sinks).chain(sanitizers) {
+            merged.register_static(name, nodes);
         }
 
         merged
@@ -204,7 +205,7 @@ impl<'a> RuleRunner<'a> {
             let is_last = i == last_idx;
             let mut next_envs = Vec::new();
             for env in &envs {
-                let candidates = candidates_for_binding(self.ctx.cpg, binding);
+                let candidates = candidates_for_binding(self.ctx.kind_index, binding);
                 for node_id in candidates {
                     let mut child = env.child();
                     child.insert(binding.name.clone(), BindingValue::Node(node_id));
@@ -235,7 +236,7 @@ impl<'a> RuleRunner<'a> {
             QueryPlan::Not(inner) => !self.eval_plan(inner, env),
 
             QueryPlan::Exists { var, kinds, body } => {
-                let candidates = nodes_of_kinds(self.ctx.cpg, kinds);
+                let candidates = self.ctx.kind_index.nodes_of_kinds(kinds);
                 candidates.into_iter().any(|node_id| {
                     let mut child = env.child();
                     child.insert(var.clone(), BindingValue::Node(node_id));
@@ -244,7 +245,7 @@ impl<'a> RuleRunner<'a> {
             }
 
             QueryPlan::Forall { var, kinds, body } => {
-                let candidates = nodes_of_kinds(self.ctx.cpg, kinds);
+                let candidates = self.ctx.kind_index.nodes_of_kinds(kinds);
                 candidates.into_iter().all(|node_id| {
                     let mut child = env.child();
                     child.insert(var.clone(), BindingValue::Node(node_id));
@@ -306,9 +307,12 @@ impl<'a> RuleRunner<'a> {
                         };
                         child.insert(param_name.to_owned(), binding);
                     }
-                    // Clone the plan to satisfy borrow checker (pred_plan borrow ends before child use)
-                    let plan = pred_plan.clone();
-                    self.eval_plan(&plan, &child)
+                    // `pred_plan` borrows from `self.ctx.predicate_plans: &'a HashMap<...>`,
+                    // an externally-owned reference with its own lifetime 'a — not a borrow
+                    // of `self` itself — so it can be passed straight into the recursive
+                    // `eval_plan` call without cloning the whole QueryPlan subtree on every
+                    // predicate call (recursive predicates used to pay this on every level).
+                    self.eval_plan(pred_plan, &child)
                 } else {
                     false
                 }
@@ -746,7 +750,7 @@ impl<'a> RuleRunner<'a> {
 
             "callee_name" => {
                 // Simple (unqualified) callee name for this Call node.
-                callee_site_for_node(self.ctx.cpg, node_id)
+                self.ctx.kind_index.call_site_for_node(node_id)
                     .map(|cs| EvalValue::Str(cs.callee.clone()))
                     .unwrap_or_else(|| {
                         node.name.as_deref().map(|s| EvalValue::Str(s.to_owned())).unwrap_or(EvalValue::Null)
@@ -756,7 +760,7 @@ impl<'a> RuleRunner<'a> {
             "qualified_callee" => {
                 // Fully-qualified callee name (e.g. "std::string::append", "com.example.Foo.bar").
                 // Falls back to simple callee name when no qualified form is available.
-                callee_site_for_node(self.ctx.cpg, node_id)
+                self.ctx.kind_index.call_site_for_node(node_id)
                     .map(|cs| {
                         let name = cs.qualified_callee.as_deref().unwrap_or(cs.callee.as_str());
                         EvalValue::Str(name.to_owned())
@@ -768,7 +772,7 @@ impl<'a> RuleRunner<'a> {
 
             "callee_kind" => {
                 // Returns the callee kind string for this Call node.
-                callee_site_for_node(self.ctx.cpg, node_id)
+                self.ctx.kind_index.call_site_for_node(node_id)
                     .map(|cs| {
                         use web_sitter::FunctionKind;
                         let kind_str = match cs.callee_kind {
@@ -884,7 +888,7 @@ impl<'a> RuleRunner<'a> {
                 // Returns the resolved declaration node for this Call or identifier node.
                 // Uses the already-resolved callee_id from the call graph, which avoids
                 // a linear scan and correctly handles qualified names.
-                callee_site_for_node(self.ctx.cpg, node_id)
+                self.ctx.kind_index.call_site_for_node(node_id)
                     .and_then(|cs| cs.callee_id)
                     .map(EvalValue::Node)
                     .unwrap_or(EvalValue::Null)
@@ -1402,21 +1406,6 @@ fn guard_const_eval(cpg: &Cpg, node_id: NodeId) -> Option<bool> {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Find the `CallSite` record in the call graph that corresponds to the given call-expression
-/// node ID. The call graph is keyed by function_def NodeId; each entry has a `calls` list
-/// with `CallSite.call_site = Some(call_expr_node_id)`. This is the canonical way to look
-/// up call-site metadata (callee name, qualified name, kind, resolved ID) for a Call node.
-fn callee_site_for_node<'a>(cpg: &'a Cpg, call_node_id: NodeId) -> Option<&'a CallSite> {
-    for entry in cpg.call_graph.values() {
-        for cs in &entry.calls {
-            if cs.call_site == Some(call_node_id) {
-                return Some(cs);
-            }
-        }
-    }
-    None
-}
-
 /// Collect all `ParamDef` nodes for a function/method node, descending into
 /// transparent parameter containers (`parameter_list`, `formal_parameters`,
 /// `function_declarator`) so this works for all supported languages.
@@ -1473,33 +1462,16 @@ fn is_c_void_param(cpg: &Cpg, param_id: NodeId) -> bool {
 }
 
 /// Return candidate node IDs for a root binding, respecting NodeType raw matching.
-fn candidates_for_binding(cpg: &Cpg, binding: &RootBinding) -> Vec<NodeId> {
+fn candidates_for_binding(kind_index: &KindIndex, binding: &RootBinding) -> Vec<NodeId> {
     if !binding.kinds.is_empty() {
-        return nodes_of_kinds(cpg, &binding.kinds);
+        return kind_index.nodes_of_kinds(&binding.kinds);
     }
     // NodeType("raw_ts_kind") — filter by raw node_type string
     if let TypeExpr::NodeType(raw) = &binding.ty {
-        let raw_lc = raw.to_lowercase();
-        return cpg
-            .ast
-            .iter()
-            .filter(|(_, n)| n.node_type == raw_lc || n.node_type == *raw)
-            .map(|(id, _)| *id)
-            .collect();
+        return kind_index.nodes_of_raw_type(raw);
     }
     // Named / unresolved types — fall back to all nodes
-    cpg.ast.keys().copied().collect()
-}
-
-fn nodes_of_kinds(cpg: &Cpg, kinds: &[IrNodeKind]) -> Vec<NodeId> {
-    if kinds.is_empty() {
-        return cpg.ast.keys().copied().collect();
-    }
-    cpg.ast
-        .iter()
-        .filter(|(_, n)| kinds.contains(&n.kind))
-        .map(|(id, _)| *id)
-        .collect()
+    kind_index.nodes_of_kinds(&[])
 }
 
 fn rule_applies_to_language(rule: &CompiledRule, lang: &str) -> bool {

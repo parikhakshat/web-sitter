@@ -369,6 +369,10 @@ pub(crate) fn get_node_graph_artifacts(
     // Iterative DFS — avoids stack overflow on large/deeply-nested files (e.g. sqlite3.c).
     // Stack entry: (node, parent_id, function_id, field_name_in_parent).
     // Node<'_> is Copy so it can be stored directly.
+    // C++: template_declaration is a transparent wrapper whose template_parameter_list
+    // is otherwise discarded. Capture param names keyed by the inner class/function
+    // node's start_byte so enrich_cpp_metadata can attach them after AST nodes exist.
+    let mut cpp_template_params: BTreeMap<u32, Vec<String>> = BTreeMap::new();
     {
         if !root_node.is_named()
             || should_skip(root_node.kind(), &skip_types, options.skip_preproc_nodes)
@@ -395,6 +399,47 @@ pub(crate) fn get_node_graph_artifacts(
             // directly as if it were at the template's parent level (conservative treatment:
             // analyze once without type specialization). template_parameters are skipped.
             if node.kind() == "template_declaration" {
+                // Extract template_parameter_list param names before descending,
+                // so they can be attached to the inner class/function node below.
+                let mut tparams: Vec<String> = Vec::new();
+                let mut ti: usize = 0;
+                while ti < node.child_count() {
+                    if let Some(tchild) = node.child(ti as u32) {
+                        if tchild.kind() == "template_parameter_list" {
+                            let mut pi: usize = 0;
+                            while pi < tchild.child_count() {
+                                if let Some(pchild) = tchild.child(pi as u32) {
+                                    if matches!(
+                                        pchild.kind(),
+                                        "type_parameter_declaration"
+                                            | "variadic_type_parameter_declaration"
+                                    ) {
+                                        let mut qi: usize = 0;
+                                        let mut found = None;
+                                        while qi < pchild.child_count() {
+                                            if let Some(qchild) = pchild.child(qi as u32) {
+                                                if qchild.kind() == "type_identifier" {
+                                                    found = qchild.utf8_text(source).ok().map(|s| s.to_string());
+                                                    break;
+                                                }
+                                            }
+                                            qi += 1;
+                                        }
+                                        if let Some(name) = found {
+                                            tparams.push(name);
+                                        }
+                                    } else if pchild.kind() == "parameter_declaration" {
+                                        if let Some(name) = first_identifier_text(pchild, source) {
+                                            tparams.push(name);
+                                        }
+                                    }
+                                }
+                                pi += 1;
+                            }
+                        }
+                    }
+                    ti += 1;
+                }
                 let child_count = node.child_count();
                 let mut i: usize = 0;
                 while i < child_count {
@@ -409,6 +454,9 @@ pub(crate) fn get_node_graph_artifacts(
                                     | "template_declaration"
                             )
                         {
+                            if !tparams.is_empty() {
+                                cpp_template_params.insert(child.start_byte() as u32, tparams.clone());
+                            }
                             stack.push((child, parent_id, function_id, field_name.clone()));
                         }
                     }
@@ -674,6 +722,20 @@ pub(crate) fn get_node_graph_artifacts(
     // Populates class_context/namespace/is_constructor etc. on AstNode (backward
     // compat) and the sparse cpp_metadata side-table (canonical).
     {
+        if !cpp_template_params.is_empty() {
+            let matches: Vec<(NodeId, Vec<String>)> = cpg
+                .ast
+                .iter()
+                .filter_map(|(&id, n)| {
+                    n.start_byte
+                        .and_then(|sb| cpp_template_params.get(&sb))
+                        .map(|params: &Vec<String>| (id, params.clone()))
+                })
+                .collect();
+            for (id, params) in matches {
+                cpg.cpp_meta_mut(id).template_params = Some(params);
+            }
+        }
         enrich_cpp_metadata(&mut cpg);
     }
 
@@ -1062,7 +1124,7 @@ fn collect_custom_allocators(
 /// Writes to both `AstNode` fields (backward compat) and the sparse
 /// `Cpg::cpp_metadata` side-table (canonical, language-neutral AstNode).
 /// This is a no-op for C files (no class_specifier/namespace_definition nodes).
-fn enrich_cpp_metadata(cpg: &mut crate::Cpg) {
+pub(crate) fn enrich_cpp_metadata(cpg: &mut crate::Cpg) {
     let ast = &cpg.ast;
 
     // ── Extract class name from AST children (not text splitting) ─────────────
@@ -1436,6 +1498,38 @@ fn enrich_cpp_metadata(cpg: &mut crate::Cpg) {
         }
     }
 
+    // ── Populate visibility on class members from access_specifier siblings ────
+    // C++ field_declaration_list children are interleaved: access_specifier nodes
+    // change the current visibility for subsequent members until the next one.
+    for (class_id, _) in &class_nodes {
+        let class_node_type = cpg.ast.get(class_id).map(|n| n.node_type.clone()).unwrap_or_default();
+        let mut current_visibility = if class_node_type == "struct_specifier" { "public" } else { "private" };
+        let body_children = cpg.ast.get(class_id).and_then(|n| {
+            n.children.iter().find_map(|&cid| {
+                let c = cpg.ast.get(&cid)?;
+                if c.node_type == "field_declaration_list" { Some(c.children.clone()) } else { None }
+            })
+        }).unwrap_or_default();
+        for member_id in body_children {
+            let member_type = cpg.ast.get(&member_id).map(|n| n.node_type.clone()).unwrap_or_default();
+            if member_type == "access_specifier" {
+                let text = cpg.ast.get(&member_id).and_then(|n| n.text.clone()).unwrap_or_default();
+                current_visibility = match text.as_str() {
+                    "public" => "public",
+                    "private" => "private",
+                    "protected" => "protected",
+                    _ => current_visibility,
+                };
+                continue;
+            }
+            if let Some(n) = cpg.ast.get_mut(&member_id) {
+                if n.visibility.is_none() {
+                    n.visibility = Some(current_visibility.to_string());
+                }
+            }
+        }
+    }
+
     // Populate name on namespace_definition nodes.
     for (ns_id, ns_name) in &namespace_nodes {
         if let Some(node) = cpg.ast.get_mut(ns_id) {
@@ -1659,7 +1753,7 @@ fn has_child_of_type(node: &AstNode, ast: &BTreeMap<NodeId, AstNode>, ty: &str) 
 
 // ── Go enrichment ─────────────────────────────────────────────────────────────
 
-fn enrich_go_metadata(cpg: &mut Cpg) {
+pub(crate) fn enrich_go_metadata(cpg: &mut Cpg) {
     // Collect all node IDs so we can iterate and mutate.
     let ids: Vec<NodeId> = cpg.ast.keys().copied().collect();
 
@@ -2247,7 +2341,7 @@ fn find_with_alias(node: &AstNode, ast: &BTreeMap<NodeId, AstNode>) -> Option<St
     None
 }
 
-fn enrich_python_metadata(cpg: &mut Cpg) {
+pub(crate) fn enrich_python_metadata(cpg: &mut Cpg) {
     let ids: Vec<NodeId> = cpg.ast.keys().copied().collect();
 
     // Pass 1: set names, operators, ParamDef kinds
@@ -2332,7 +2426,7 @@ fn enrich_python_metadata(cpg: &mut Cpg) {
                         })
                     });
                 // base_classes: children in argument_list that are identifiers or attributes
-                let _base_classes: Vec<String> = node.children.iter().find_map(|&cid| {
+                let base_classes: Vec<String> = node.children.iter().find_map(|&cid| {
                     let child = cpg.ast.get(&cid)?;
                     if child.node_type == "argument_list" {
                         Some(child.children.iter().filter_map(|&gcid| {
@@ -2342,9 +2436,28 @@ fn enrich_python_metadata(cpg: &mut Cpg) {
                         }).collect::<Vec<_>>())
                     } else { None }
                 }).unwrap_or_default();
+                let class_children = node.children.clone();
+                // metaclass: argument_list child `keyword_argument` named "metaclass"
+                let metaclass: Option<String> = class_children.iter().find_map(|&cid| {
+                    let child = cpg.ast.get(&cid)?;
+                    if child.node_type != "argument_list" { return None; }
+                    child.children.iter().find_map(|&gcid| {
+                        let gc = cpg.ast.get(&gcid)?;
+                        if gc.node_type != "keyword_argument" { return None; }
+                        let name_child = gc.children.iter().find_map(|&kid| {
+                            cpg.ast.get(&kid).filter(|k| k.node_type == "identifier")
+                                .and_then(|k| k.text.clone())
+                        })?;
+                        if name_child != "metaclass" { return None; }
+                        gc.children.iter().rev().find_map(|&kid| {
+                            cpg.ast.get(&kid).filter(|k| matches!(k.node_type.as_str(), "identifier" | "attribute"))
+                                .and_then(|k| k.text.clone())
+                        }).filter(|v| v != &name_child)
+                    })
+                });
                 // argument_list = superclass list: convert each identifier/attribute to TypeRef
                 // AND mark the argument_list node itself as TypeRef so it's a direct TypeRef child
-                if let Some(arg_list_id) = node.children.iter().find(|&&cid| {
+                if let Some(arg_list_id) = class_children.iter().find(|&&cid| {
                     cpg.ast.get(&cid).map_or(false, |c| c.node_type == "argument_list")
                 }).copied() {
                     if let Some(n) = cpg.ast.get_mut(&arg_list_id) {
@@ -2364,6 +2477,12 @@ fn enrich_python_metadata(cpg: &mut Cpg) {
                 }
                 if let Some(n) = cpg.ast.get_mut(&node_id) {
                     n.name = class_name;
+                    if !base_classes.is_empty() {
+                        n.base_classes = Some(base_classes);
+                    }
+                }
+                if let Some(mc) = metaclass {
+                    cpg.python_meta_mut(node_id).metaclass = Some(mc);
                 }
             }
 
@@ -2761,8 +2880,19 @@ fn java_annotations_from_modifiers(mods_id: NodeId, ast: &std::collections::BTre
     }).collect()
 }
 
-fn enrich_java_metadata(cpg: &mut Cpg) {
+pub(crate) fn enrich_java_metadata(cpg: &mut Cpg) {
     let ids: Vec<NodeId> = cpg.ast.keys().copied().collect();
+
+    // package_name: text of the top-level package_declaration's scoped_identifier/identifier child.
+    let package_name: Option<String> = ids.iter().find_map(|&id| {
+        let node = cpg.ast.get(&id)?;
+        if node.node_type != "package_declaration" { return None; }
+        node.children.iter().find_map(|&cid| {
+            cpg.ast.get(&cid).filter(|c| {
+                matches!(c.node_type.as_str(), "scoped_identifier" | "identifier")
+            }).and_then(|c| c.text.clone())
+        })
+    });
 
     for &node_id in &ids {
         let node_type = cpg.ast[&node_id].node_type.clone();
@@ -2842,6 +2972,7 @@ fn enrich_java_metadata(cpg: &mut Cpg) {
                 meta.is_interface = is_interface;
                 meta.is_record = is_record;
                 meta.is_abstract = is_abstract;
+                meta.package_name = package_name.clone();
             }
 
             "enum_declaration" => {
@@ -3203,7 +3334,7 @@ fn enrich_java_metadata(cpg: &mut Cpg) {
 
 // ── JavaScript enrichment ─────────────────────────────────────────────────────
 
-fn enrich_js_metadata(cpg: &mut Cpg) {
+pub(crate) fn enrich_js_metadata(cpg: &mut Cpg) {
     let ids: Vec<NodeId> = cpg.ast.keys().copied().collect();
 
     for &node_id in &ids {
@@ -3245,8 +3376,21 @@ fn enrich_js_metadata(cpg: &mut Cpg) {
                                 .and_then(|c| c.text.clone())
                         })
                     });
+                // extends: class_heritage → identifier/member_expression naming the superclass
+                let base_class = node.children.iter().find_map(|&cid| {
+                    let c = cpg.ast.get(&cid)?;
+                    if c.node_type != "class_heritage" { return None; }
+                    c.children.iter().find_map(|&tid| {
+                        cpg.ast.get(&tid).filter(|t| {
+                            matches!(t.node_type.as_str(), "identifier" | "member_expression")
+                        }).and_then(|t| t.text.clone())
+                    })
+                });
                 if let Some(n) = cpg.ast.get_mut(&node_id) {
                     n.name = class_name;
+                    if let Some(bc) = base_class {
+                        n.base_classes = Some(vec![bc]);
+                    }
                 }
             }
 
@@ -3458,7 +3602,7 @@ fn enrich_js_metadata(cpg: &mut Cpg) {
 
 // ── TypeScript enrichment ─────────────────────────────────────────────────────
 
-fn enrich_ts_metadata(cpg: &mut Cpg) {
+pub(crate) fn enrich_ts_metadata(cpg: &mut Cpg) {
     // TypeScript grammar reuses most JS constructs. Start with JS enrichment,
     // then add TS-specific processing.
     enrich_js_metadata(cpg);
@@ -3931,7 +4075,7 @@ fn enrich_ts_metadata(cpg: &mut Cpg) {
 
 // ── Rust enrichment ───────────────────────────────────────────────────────────
 
-fn enrich_rust_metadata(cpg: &mut Cpg) {
+pub(crate) fn enrich_rust_metadata(cpg: &mut Cpg) {
     let ids: Vec<NodeId> = cpg.ast.keys().copied().collect();
 
     for &node_id in &ids {

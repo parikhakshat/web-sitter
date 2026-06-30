@@ -1,7 +1,8 @@
 mod fixtures;
 use fixtures::*;
 use std::path::PathBuf;
-use web_sitter::IrNodeKind;
+use std::sync::Arc;
+use web_sitter::{CrossFileCallEdge, IrNodeKind};
 use web_ql::{
     ir::{CompiledClause, CompiledRule, QueryPlan, RootBinding, RuleSet, SearchPlan},
     ast::{Severity, TypeExpr},
@@ -156,6 +157,73 @@ fn total_nodes_zero_after_all_removed() {
     assert_eq!(ws.total_size_bytes(), 0);
 }
 
+// ── taint registry resolution (named source/sink plans + base registry) ───────
+
+#[test]
+fn scan_taint_rule_with_named_source_and_sink_plans_finds_flow() {
+    // Exercises build_taint_registry resolving BOTH named source/sink plan
+    // definitions (evaluated per-CPG) AND falling back to the base registry for an
+    // unnamed-but-registered endpoint, all in one rule — these resolve concurrently
+    // internally, so this locks in that the merge back into one registry is correct.
+    let mut ws = Workspace::new(empty_registry());
+    let (cpg, _src, _sink) = taint_flow_cpg();
+    ws.upsert_file(path("a.py"), cpg, 1);
+
+    let rule_src = r#"
+        source named_source = find n: Call where n.name == "user_input"
+        sink named_sink = find n: Call where n.name == "execute_sql"
+        rule "sqli" {
+            taint {
+                sources: ["named_source"]
+                sinks: ["named_sink"]
+            }
+        }
+    "#;
+    let rule_set = compile_rules(rule_src).expect("rule should compile");
+    let findings = ws.scan(&rule_set);
+
+    assert_eq!(findings.len(), 1, "should find exactly one taint flow: {findings:?}");
+    assert_eq!(findings[0].rule_id, "sqli");
+}
+
+#[test]
+fn scan_taint_rule_falls_back_to_base_registry_for_unnamed_endpoints() {
+    // No `source`/`sink` definitions in the rule file at all — both endpoint names
+    // must resolve purely via the base EndpointRegistry passed into Workspace::new.
+    let mut registry = empty_registry();
+    registry.register("base_source", |cpg: &web_sitter::Cpg| {
+        cpg.ast
+            .iter()
+            .filter(|(_, n)| n.name.as_deref() == Some("user_input"))
+            .map(|(id, _)| *id)
+            .collect()
+    });
+    registry.register("base_sink", |cpg: &web_sitter::Cpg| {
+        cpg.ast
+            .iter()
+            .filter(|(_, n)| n.name.as_deref() == Some("execute_sql"))
+            .map(|(id, _)| *id)
+            .collect()
+    });
+
+    let mut ws = Workspace::new(registry);
+    let (cpg, _src, _sink) = taint_flow_cpg();
+    ws.upsert_file(path("a.py"), cpg, 1);
+
+    let rule_src = r#"
+        rule "sqli-base" {
+            taint {
+                sources: ["base_source"]
+                sinks: ["base_sink"]
+            }
+        }
+    "#;
+    let rule_set = compile_rules(rule_src).expect("rule should compile");
+    let findings = ws.scan(&rule_set);
+
+    assert_eq!(findings.len(), 1, "should find the flow via base-registry fallback: {findings:?}");
+}
+
 // ── scan ─────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -284,6 +352,208 @@ fn upsert_file_merges_function_summaries() {
 
     ws.upsert_file(path("a.py"), cpg, 1);
     assert!(ws.summaries.contains_key("my_func"), "summaries should be merged");
+}
+
+// ── build_cross_file_edges ──────────────────────────────────────────────────
+
+#[test]
+fn build_cross_file_edges_shares_callee_cpg_via_arc_not_clone() {
+    // The whole point of Arc-wrapping FileIndex.cpg/.dfg is that
+    // Workspace::cross_file_dfgs shares the *same* allocation as the callee file's
+    // own FileIndex entry, instead of deep-cloning the CPG on every
+    // build_cross_file_edges() call. Verify that with Arc::ptr_eq, not just that
+    // the contents happen to be equal (which would also pass with a clone).
+    let mut ws = Workspace::new(empty_registry());
+
+    let callee_node = make_node(1, IrNodeKind::MethodDef, Some("helper"));
+    let callee_cpg = make_cpg_with_ids(vec![(1, callee_node)]);
+    ws.upsert_file(path("callee.py"), callee_cpg, 1);
+
+    let caller_fn = make_node(10, IrNodeKind::MethodDef, Some("main"));
+    let mut call_node = make_node(11, IrNodeKind::Call, Some("helper"));
+    call_node.function_id = Some(10);
+    let mut caller_cpg = make_cpg_with_ids(vec![(10, caller_fn), (11, call_node)]);
+    caller_cpg.workspace.cross_file_calls = vec![CrossFileCallEdge {
+        call_node: 11,
+        caller_fn: 10,
+        callee_name: "helper".to_owned(),
+        qualified_callee: None,
+        arg_positions: vec![],
+    }];
+    ws.upsert_file(path("caller.py"), caller_cpg, 1);
+
+    ws.build_cross_file_edges();
+
+    assert_eq!(
+        ws.cross_file_callee_params.get(&11).map(|v| v.len()),
+        Some(1),
+        "the cross-file call should resolve to exactly one callee"
+    );
+
+    let callee_path = path("callee.py");
+    let shared_cpg = &ws.cross_file_dfgs.get(&callee_path)
+        .expect("callee should be registered in cross_file_dfgs")
+        .1;
+    let owned_cpg = &ws.files.get(&callee_path).expect("callee FileIndex should exist").cpg;
+    assert!(
+        Arc::ptr_eq(shared_cpg, owned_cpg),
+        "cross_file_dfgs should share the same Arc<Cpg> allocation as FileIndex, not a deep clone"
+    );
+
+    let shared_dfg = &ws.cross_file_dfgs.get(&callee_path).unwrap().0;
+    let owned_dfg = &ws.files.get(&callee_path).unwrap().dfg;
+    assert!(
+        Arc::ptr_eq(shared_dfg, owned_dfg),
+        "cross_file_dfgs should share the same Arc<DfgIndex> allocation as FileIndex, not a deep clone"
+    );
+}
+
+#[test]
+fn build_cross_file_edges_resolves_unqualified_callee_name() {
+    let mut ws = Workspace::new(empty_registry());
+
+    let callee_node = make_node(1, IrNodeKind::MethodDef, Some("helper"));
+    let callee_cpg = make_cpg_with_ids(vec![(1, callee_node)]);
+    ws.upsert_file(path("callee.py"), callee_cpg, 1);
+
+    let caller_fn = make_node(10, IrNodeKind::MethodDef, Some("main"));
+    let mut call_node = make_node(11, IrNodeKind::Call, Some("helper"));
+    call_node.function_id = Some(10);
+    let mut caller_cpg = make_cpg_with_ids(vec![(10, caller_fn), (11, call_node)]);
+    caller_cpg.workspace.cross_file_calls = vec![CrossFileCallEdge {
+        call_node: 11,
+        caller_fn: 10,
+        callee_name: "helper".to_owned(),
+        qualified_callee: None,
+        arg_positions: vec![],
+    }];
+    ws.upsert_file(path("caller.py"), caller_cpg, 1);
+
+    ws.build_cross_file_edges();
+
+    let resolved = ws.cross_file_callee_params.get(&11).expect("call should resolve");
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(resolved[0].0, path("callee.py"));
+}
+
+// ── scan_incremental ─────────────────────────────────────────────────────────
+
+#[test]
+fn scan_incremental_matches_full_scan_results() {
+    let mut ws = Workspace::new(empty_registry());
+    for i in 0..3u64 {
+        let (cpg, _) = simple_call_cpg();
+        ws.upsert_file(PathBuf::from(format!("file{i}.py")), cpg, i);
+    }
+    let rule_set = always_true_rule_set();
+
+    let incremental = ws.scan_incremental(&rule_set);
+    assert_eq!(incremental.len(), 3, "3 files x 1 Call each = 3 findings");
+}
+
+#[test]
+fn scan_incremental_clears_dirty_set_after_scan() {
+    let mut ws = Workspace::new(empty_registry());
+    let (cpg, _) = simple_call_cpg();
+    ws.upsert_file(path("a.py"), cpg, 1);
+    assert!(!ws.dirty_files().is_empty(), "newly inserted file should start dirty");
+
+    ws.scan_incremental(&always_true_rule_set());
+    assert!(
+        ws.dirty_files().is_empty(),
+        "dirty set should be empty after a successful incremental scan"
+    );
+}
+
+#[test]
+fn scan_incremental_repeated_scan_with_no_changes_is_stable() {
+    // Re-running scan_incremental with nothing changed (no files dirty) must reuse the
+    // cache and still produce the exact same findings as the first run.
+    let mut ws = Workspace::new(empty_registry());
+    for i in 0..3u64 {
+        let (cpg, _) = simple_call_cpg();
+        ws.upsert_file(PathBuf::from(format!("file{i}.py")), cpg, i);
+    }
+    let rule_set = always_true_rule_set();
+
+    let first = ws.scan_incremental(&rule_set);
+    assert!(ws.dirty_files().is_empty(), "no files should be dirty after the first scan");
+
+    let second = ws.scan_incremental(&rule_set);
+    assert_eq!(
+        first.len(),
+        second.len(),
+        "scanning again with nothing dirty must return the same findings from cache"
+    );
+    assert_eq!(second.len(), 3);
+}
+
+#[test]
+fn scan_incremental_upsert_marks_only_that_file_dirty() {
+    // Precise per-file dirty tracking is what makes the incremental cache safe to use —
+    // updating one file must not force every other file to be marked dirty too.
+    let mut ws = Workspace::new(empty_registry());
+    let (cpg_a, _) = simple_call_cpg();
+    let (cpg_b, _) = simple_call_cpg();
+    ws.upsert_file(path("a.py"), cpg_a, 1);
+    ws.upsert_file(path("b.py"), cpg_b, 2);
+    ws.scan_incremental(&always_true_rule_set());
+    assert!(ws.dirty_files().is_empty());
+
+    let (cpg_a2, _) = simple_call_cpg();
+    ws.upsert_file(path("a.py"), cpg_a2, 99); // only a.py changes
+    assert_eq!(ws.dirty_files().len(), 1, "only the updated file should be dirty");
+    assert!(ws.dirty_files().contains(&path("a.py")));
+    assert!(!ws.dirty_files().contains(&path("b.py")));
+}
+
+#[test]
+fn scan_incremental_reflects_updated_file_content() {
+    let mut ws = Workspace::new(empty_registry());
+    let (cpg_a, _) = simple_call_cpg(); // 1 Call
+    let (cpg_b, _) = simple_call_cpg(); // 1 Call
+    ws.upsert_file(path("a.py"), cpg_a, 1);
+    ws.upsert_file(path("b.py"), cpg_b, 2);
+
+    let rule_set = always_true_rule_set();
+    let first = ws.scan_incremental(&rule_set);
+    assert_eq!(first.len(), 2);
+
+    // Replace a.py with a CPG that has no Call nodes; b.py is untouched.
+    use web_sitter::Cpg;
+    let empty_cpg = Cpg { language: "python".to_owned(), ..Cpg::default() };
+    ws.upsert_file(path("a.py"), empty_cpg, 100);
+
+    let second = ws.scan_incremental(&rule_set);
+    assert_eq!(
+        second.len(),
+        1,
+        "a.py's findings should disappear after its update, b.py's should remain cached"
+    );
+}
+
+#[test]
+fn scan_incremental_invalidates_cache_when_rule_set_changes() {
+    // A rule set swap (e.g. hot-reloaded rules) must not serve findings computed under
+    // the previous rule set for files that weren't otherwise marked dirty.
+    let mut ws = Workspace::new(empty_registry());
+    let (cpg, _) = simple_call_cpg();
+    ws.upsert_file(path("a.py"), cpg, 1);
+
+    let first = ws.scan_incremental(&always_true_rule_set());
+    assert_eq!(first.len(), 1);
+
+    // No file changes — only the rule set differs (empty rule set now).
+    let second = ws.scan_incremental(&empty_rule_set());
+    assert_eq!(
+        second.len(),
+        0,
+        "switching to an empty rule set must not keep serving the old rule set's cached findings"
+    );
+
+    // Switching back to the original rule set (still no file changes) must recompute too.
+    let third = ws.scan_incremental(&always_true_rule_set());
+    assert_eq!(third.len(), 1, "switching rule sets back must recompute, not serve stale cache");
 }
 
 // ── Profiler integration ──────────────────────────────────────────────────────

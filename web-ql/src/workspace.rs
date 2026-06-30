@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use rayon::prelude::*;
 use web_sitter::{Cpg, FunctionSummary, IrNodeKind, NodeId};
 use web_profiler as prof;
@@ -9,9 +10,10 @@ use crate::cfg::FunctionCfg;
 use crate::dfg::DfgIndex;
 use crate::finding::Finding;
 use crate::ir::RuleSet;
+use crate::kind_index::KindIndex;
 use crate::nullability::NullabilityIndex;
 use crate::size_tracking::AllocSizeIndex;
-use crate::taint::{CrossFileTaintCtx, EndpointRegistry, TaintFinding};
+use crate::taint::{CrossFileTaintCtx, EndpointRegistry};
 use crate::engine::{EvalContext, RuleRunner};
 
 // ── File index ────────────────────────────────────────────────────────────────
@@ -19,9 +21,14 @@ use crate::engine::{EvalContext, RuleRunner};
 /// Per-file analysis artifacts cached across incremental scans.
 pub struct FileIndex {
     pub path: PathBuf,
-    pub cpg: Cpg,
-    pub dfg: DfgIndex,
+    /// Arc-wrapped so cross-file taint context (`Workspace::cross_file_dfgs`) can share
+    /// this CPG with other files via a cheap refcount bump instead of a full deep clone.
+    pub cpg: Arc<Cpg>,
+    pub dfg: Arc<DfgIndex>,
     pub cfg_cache: HashMap<NodeId, FunctionCfg>,
+    /// Node-kind / raw-node-type / call-site index — replaces repeated full-AST and
+    /// full-call-graph scans during rule evaluation.
+    pub kind_index: KindIndex,
     /// Pointer alias index (POINTS_TO edges).
     pub alias: AliasIndex,
     /// Buffer / allocation size index.
@@ -40,6 +47,11 @@ impl FileIndex {
         let _span = prof::span("query.index_file");
 
         let size_estimate = estimate_cpg_bytes(&cpg);
+
+        let kind_index = {
+            let _s = prof::span("query.build_kind_index");
+            KindIndex::build(&cpg)
+        };
 
         let dfg = {
             let _s = prof::span("query.build_dfg_index");
@@ -61,13 +73,24 @@ impl FileIndex {
         };
         let nullability = {
             let _s = prof::span("query.build_nullability_index");
-            NullabilityIndex::build(&cpg)
+            NullabilityIndex::build(&cpg, &kind_index)
         };
 
         prof::cache_insert("file_index", size_estimate);
         prof::count("cfg_functions_cached", cfg_cache.len() as u64);
 
-        Self { path, cpg, dfg, cfg_cache, alias, sizes, nullability, content_hash, size_estimate }
+        Self {
+            path,
+            cpg: Arc::new(cpg),
+            dfg: Arc::new(dfg),
+            cfg_cache,
+            kind_index,
+            alias,
+            sizes,
+            nullability,
+            content_hash,
+            size_estimate,
+        }
     }
 }
 
@@ -99,6 +122,24 @@ fn estimate_cpg_bytes(cpg: &Cpg) -> u64 {
     ast_bytes + bb_bytes + dfg_bytes
 }
 
+/// Cheap change-detection signature for a `RuleSet`, used to invalidate
+/// `Workspace::findings_cache` when a different rule set is scanned. Hashes the ordered
+/// set of rule ids plus a per-rule clause count — enough to catch rules being added,
+/// removed, or reordered. It does *not* hash clause bodies, so editing a rule's logic
+/// in place while keeping the same id and clause count would not be detected; callers
+/// that hot-reload rule bodies under a stable id should treat that as a "new rule set"
+/// (e.g. by reconstructing the `RuleSet`) rather than relying on this signature alone.
+fn rule_set_signature(rule_set: &RuleSet) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    rule_set.rules.len().hash(&mut hasher);
+    for rule in &rule_set.rules {
+        rule.id.hash(&mut hasher);
+        rule.clauses.len().hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 // ── Workspace ─────────────────────────────────────────────────────────────────
 
 /// The scanning workspace: manages per-file indexes and orchestrates evaluation.
@@ -115,12 +156,18 @@ pub struct Workspace {
     pub cross_file_callee_params: HashMap<NodeId, Vec<(PathBuf, Vec<NodeId>)>>,
     /// Flat map of (file_path) → (DfgIndex, Cpg) for cross-file taint traversal.
     /// Built by `build_cross_file_edges()` alongside `cross_file_callee_params`.
-    pub cross_file_dfgs: HashMap<PathBuf, (DfgIndex, Cpg)>,
+    /// Arc-wrapped — shares the same indexes already owned by `files`, no cloning.
+    pub cross_file_dfgs: HashMap<PathBuf, (Arc<DfgIndex>, Arc<Cpg>)>,
     /// Files that have been added/changed since the last scan. Used by
     /// `scan_incremental` to skip re-evaluating unchanged files.
     dirty_files: HashSet<PathBuf>,
-    /// Per-(file, rule_id) taint finding cache for incremental scans.
-    taint_cache: HashMap<(PathBuf, String), Vec<TaintFinding>>,
+    /// Per-file finding cache for incremental scans: the full result of the last
+    /// `RuleRunner::run` for a clean file, reused as-is until that file is marked dirty.
+    findings_cache: HashMap<PathBuf, Vec<Finding>>,
+    /// Identity of the rule set used to populate `findings_cache`, so a scan with a
+    /// different rule set (e.g. rules hot-reloaded) invalidates the whole cache instead
+    /// of serving findings computed under a stale rule set.
+    findings_cache_rule_set_sig: Option<u64>,
 }
 
 impl Workspace {
@@ -133,7 +180,8 @@ impl Workspace {
             cross_file_callee_params: HashMap::new(),
             cross_file_dfgs: HashMap::new(),
             dirty_files: HashSet::new(),
-            taint_cache: HashMap::new(),
+            findings_cache: HashMap::new(),
+            findings_cache_rule_set_sig: None,
         }
     }
 
@@ -157,8 +205,8 @@ impl Workspace {
         self.cross_file_callee_params.clear();
         self.cross_file_dfgs.clear();
 
-        // Invalidate any taint cache entries for this file.
-        self.taint_cache.retain(|(p, _), _| p != &path);
+        // Invalidate the cached findings for this file.
+        self.findings_cache.remove(&path);
 
         // Merge function summaries from this CPG.
         for (_node_id, summary) in &cpg.workspace.function_summaries {
@@ -180,8 +228,8 @@ impl Workspace {
         self.cross_file_callee_params.clear();
         // Remove summaries that came from this file.
         self.evict_summaries_for_file(path);
-        // Invalidate taint cache for this file.
-        self.taint_cache.retain(|(p, _), _| p.as_path() != path);
+        // Invalidate the cached findings for this file.
+        self.findings_cache.remove(path);
         // All remaining files may now have stale cross-file results.
         for p in self.files.keys() {
             self.dirty_files.insert(p.clone());
@@ -221,70 +269,82 @@ impl Workspace {
         //   2. class_context::name   (e.g. "Foo::bar")
         //   3. namespace::name       (e.g. "myns::helper")
         //   4. simple name           (e.g. "bar")
+        //
+        // The expensive per-node/per-file scan is independent across files, so it runs
+        // in parallel; only the final merge into one shared map needs to stay sequential
+        // (mirroring each key's original "first wins" vs "always overwrite" precedence).
+        let per_file_keys: Vec<Vec<(String, bool, (PathBuf, Vec<NodeId>))>> = self
+            .files
+            .par_iter()
+            .map(|(path, idx)| {
+                let mut keys: Vec<(String, bool, (PathBuf, Vec<NodeId>))> = Vec::new();
+                for (node_id, node) in &idx.cpg.ast {
+                    if node.kind != IrNodeKind::MethodDef {
+                        continue;
+                    }
+                    let Some(fn_name) = &node.name else { continue };
+
+                    // Collect ParamDef children in order.
+                    let params: Vec<NodeId> = node
+                        .children
+                        .iter()
+                        .filter(|&&child_id| {
+                            idx.cpg
+                                .ast
+                                .get(&child_id)
+                                .map(|n| n.kind == IrNodeKind::ParamDef)
+                                .unwrap_or(false)
+                        })
+                        .copied()
+                        .collect();
+
+                    let entry = (path.clone(), params);
+
+                    // Simple name — lowest priority, first registration wins (`overwrite = false`).
+                    keys.push((fn_name.clone(), false, entry.clone()));
+
+                    // Namespace-qualified name (e.g. "myns::helper").
+                    if let Some(ns) = &node.namespace {
+                        keys.push((format!("{}::{}", ns, fn_name), false, entry.clone()));
+                    }
+
+                    // Class-qualified name (e.g. "Foo::bar").
+                    if let Some(cls) = &node.class_context {
+                        keys.push((format!("{}::{}", cls, fn_name), false, entry.clone()));
+                    }
+
+                    // Fully-qualified name — highest specificity, always overwrites.
+                    if let Some(qname) = &node.qualified_name {
+                        keys.push((qname.clone(), true, entry.clone()));
+                    }
+
+                    // Java fully-qualified class name.
+                    if let Some(java_meta) = idx.cpg.java_metadata.get(node_id) {
+                        if let Some(fqc) = &java_meta.fully_qualified_class {
+                            keys.push((format!("{}.{}", fqc, fn_name), true, entry.clone()));
+                        }
+                    }
+
+                    // Go: package-qualified name (e.g. "encoding/json.Marshal").
+                    if let Some(go_meta) = idx.cpg.go_metadata.get(node_id) {
+                        if let Some(pkg) = &go_meta.package_name {
+                            keys.push((format!("{}.{}", pkg, fn_name), false, entry.clone()));
+                        }
+                        if let Some(qname) = &go_meta.qualified_name {
+                            keys.push((qname.clone(), true, entry.clone()));
+                        }
+                    }
+                }
+                keys
+            })
+            .collect();
+
         let mut fn_to_params: HashMap<String, (PathBuf, Vec<NodeId>)> = HashMap::new();
-
-        for (path, idx) in &self.files {
-            for (node_id, node) in &idx.cpg.ast {
-                if node.kind != IrNodeKind::MethodDef {
-                    continue;
-                }
-                let Some(fn_name) = &node.name else { continue };
-
-                // Collect ParamDef children in order.
-                let params: Vec<NodeId> = node
-                    .children
-                    .iter()
-                    .filter(|&&child_id| {
-                        idx.cpg
-                            .ast
-                            .get(&child_id)
-                            .map(|n| n.kind == IrNodeKind::ParamDef)
-                            .unwrap_or(false)
-                    })
-                    .copied()
-                    .collect();
-
-                let entry = (path.clone(), params);
-
-                // Register under simple name (lowest priority — may be overwritten).
-                fn_to_params.entry(fn_name.clone()).or_insert_with(|| entry.clone());
-
-                // Register under namespace-qualified name (e.g. "myns::helper").
-                if let Some(ns) = &node.namespace {
-                    let ns_key = format!("{}::{}", ns, fn_name);
-                    fn_to_params.entry(ns_key).or_insert_with(|| entry.clone());
-                }
-
-                // Register under class-qualified name (e.g. "Foo::bar").
-                if let Some(cls) = &node.class_context {
-                    let cls_key = format!("{}::{}", cls, fn_name);
-                    fn_to_params.entry(cls_key).or_insert_with(|| entry.clone());
-                }
-
-                // Register under fully-qualified name (highest specificity).
-                if let Some(qname) = &node.qualified_name {
-                    // Fully-qualified name overrides everything — use insert directly.
-                    fn_to_params.insert(qname.clone(), entry.clone());
-                }
-
-                // Also check the language-specific metadata side-tables for Java FQNs.
-                if let Some(java_meta) = idx.cpg.java_metadata.get(node_id) {
-                    if let Some(fqc) = &java_meta.fully_qualified_class {
-                        let java_key = format!("{}.{}", fqc, fn_name);
-                        fn_to_params.insert(java_key, entry.clone());
-                    }
-                }
-
-                // Go: package-qualified name (e.g. "encoding/json.Marshal").
-                if let Some(go_meta) = idx.cpg.go_metadata.get(node_id) {
-                    if let Some(pkg) = &go_meta.package_name {
-                        let go_key = format!("{}.{}", pkg, fn_name);
-                        fn_to_params.entry(go_key).or_insert_with(|| entry.clone());
-                    }
-                    if let Some(qname) = &go_meta.qualified_name {
-                        fn_to_params.insert(qname.clone(), entry.clone());
-                    }
-                }
+        for (key, overwrite, value) in per_file_keys.into_iter().flatten() {
+            if overwrite {
+                fn_to_params.insert(key, value);
+            } else {
+                fn_to_params.entry(key).or_insert(value);
             }
         }
 
@@ -309,8 +369,9 @@ impl Workspace {
         }
 
         // Build the flat DFG map for cross-file taint traversal.
-        // Reuse the already-built DfgIndex from each FileIndex (no double-build).
-        let mut cross_dfgs: HashMap<PathBuf, (DfgIndex, Cpg)> = HashMap::new();
+        // Reuse the already-built DfgIndex/Cpg from each FileIndex — both are Arc-wrapped,
+        // so this is a refcount bump rather than a deep clone of the whole CPG.
+        let mut cross_dfgs: HashMap<PathBuf, (Arc<DfgIndex>, Arc<Cpg>)> = HashMap::new();
         let callee_files: HashSet<PathBuf> = callee_params
             .values()
             .flat_map(|v| v.iter().map(|(f, _)| f.clone()))
@@ -354,6 +415,7 @@ impl Workspace {
                     cpg: &file_idx.cpg,
                     dfg: &file_idx.dfg,
                     cfg_cache: &file_idx.cfg_cache,
+                    kind_index: &file_idx.kind_index,
                     alias: &file_idx.alias,
                     sizes: &file_idx.sizes,
                     nullability: &file_idx.nullability,
@@ -377,12 +439,26 @@ impl Workspace {
         findings
     }
 
-    /// Run the rule set using a taint-finding cache for incremental scans.
+    /// Run the rule set using a per-file findings cache for incremental scans.
     ///
-    /// Files in `dirty_files` are re-evaluated; unchanged files return cached findings.
-    /// After scanning, the dirty set is cleared and the cache is updated.
+    /// Files in `dirty_files` (new/changed since the last scan, or affected by a
+    /// cross-file edge change) are re-evaluated; unchanged files reuse the findings
+    /// cached from their last evaluation instead of re-running the whole rule set.
+    /// After scanning, the dirty set is cleared and the cache is refreshed.
+    ///
+    /// If `rule_set` differs from the one the cache was built with (e.g. rules were
+    /// hot-reloaded), the entire cache is invalidated and every file is re-evaluated —
+    /// findings computed under a different rule set must never be served as-is.
     pub fn scan_incremental(&mut self, rule_set: &RuleSet) -> Vec<Finding> {
         let _span = prof::span("query.scan_incremental_total");
+
+        let sig = rule_set_signature(rule_set);
+        if self.findings_cache_rule_set_sig != Some(sig) {
+            self.findings_cache.clear();
+            self.dirty_files.extend(self.files.keys().cloned());
+            self.findings_cache_rule_set_sig = Some(sig);
+        }
+
         let predicate_plans = &rule_set.predicate_plans;
         let predicate_params = &rule_set.predicate_params;
         let cross_file_ctx = CrossFileTaintCtx {
@@ -391,24 +467,28 @@ impl Workspace {
         };
         let cross_file_ref = &cross_file_ctx;
         let dirty = &self.dirty_files;
+        let cache = &self.findings_cache;
 
-        // Collect findings from all files: use cache for clean files, re-run for dirty ones.
+        // Re-evaluate dirty files in parallel; clean files are read straight from cache
+        // (cheap clone of already-computed `Finding`s, no RuleRunner work at all).
         let file_findings: Vec<(PathBuf, Vec<Finding>)> = self
             .files
             .par_iter()
             .map(|(path, file_idx)| {
-                let _span = prof::span("query.scan_file_incremental");
-
                 if !dirty.contains(path) {
-                    // File unchanged — re-use any previously stored findings from the
-                    // taint cache. For search clauses (no per-rule cache), still re-run.
-                    // (Full search-result caching requires a separate cache layer.)
+                    if let Some(cached) = cache.get(path) {
+                        prof::cache_hit("scan_incremental_findings");
+                        return (path.clone(), cached.clone());
+                    }
                 }
+                prof::cache_miss("scan_incremental_findings");
 
+                let _span = prof::span("query.scan_file_incremental");
                 let ctx = EvalContext {
                     cpg: &file_idx.cpg,
                     dfg: &file_idx.dfg,
                     cfg_cache: &file_idx.cfg_cache,
+                    kind_index: &file_idx.kind_index,
                     alias: &file_idx.alias,
                     sizes: &file_idx.sizes,
                     nullability: &file_idx.nullability,
@@ -429,15 +509,10 @@ impl Workspace {
             })
             .collect();
 
-        // Flatten and update taint cache with new findings for dirty files.
-        let mut all_findings = Vec::new();
+        // Flatten and refresh the per-file cache with the (possibly reused) results.
+        let mut all_findings = Vec::with_capacity(file_findings.iter().map(|(_, f)| f.len()).sum());
         for (path, findings) in file_findings {
-            // Update cache keyed by (path, rule_id).
-            for finding in &findings {
-                self.taint_cache
-                    .entry((path.clone(), finding.rule_id.clone()))
-                    .or_default();
-            }
+            self.findings_cache.insert(path, findings.clone());
             all_findings.extend(findings);
         }
 
