@@ -81,6 +81,85 @@ fn run_rule(rule: CompiledRule, cpg: &web_sitter::Cpg) -> Vec<Finding> {
     runner.run(&rule_set)
 }
 
+/// Like `run_rule`, but lets the caller supply non-empty `predicate_plans` /
+/// `predicate_params` to exercise `QueryPlan::PredicateCall` resolution.
+fn run_rule_with_predicates(
+    rule: CompiledRule,
+    cpg: &web_sitter::Cpg,
+    predicate_plans: HashMap<String, QueryPlan>,
+    predicate_params: HashMap<String, Vec<String>>,
+) -> Vec<Finding> {
+    let dfg = DfgIndex::build(cpg);
+    let cfg_cache: HashMap<u32, FunctionCfg> = HashMap::new();
+    let summaries: HashMap<String, web_sitter::FunctionSummary> = HashMap::new();
+    let registry = empty_registry();
+    let alias = AliasIndex::build(cpg);
+    let sizes = AllocSizeIndex::build(cpg);
+    let kind_index = KindIndex::build(cpg);
+    let nullability = NullabilityIndex::build(cpg, &kind_index);
+    let ctx = EvalContext {
+        cpg,
+        dfg: &dfg,
+        cfg_cache: &cfg_cache,
+        kind_index: &kind_index,
+        alias: &alias,
+        sizes: &sizes,
+        nullability: &nullability,
+        summaries: &summaries,
+        registry: &registry,
+        predicate_plans: &predicate_plans,
+        predicate_params: &predicate_params,
+        cross_file: None,
+    };
+    let runner = RuleRunner::new(ctx);
+    let rule_set = RuleSet::new(vec![rule]);
+    runner.run(&rule_set)
+}
+
+// ── QueryPlan::PredicateCall ────────────────────────────────────────────────
+
+#[test]
+fn predicate_call_resolves_and_evaluates_body() {
+    let (cpg, _) = simple_call_cpg();
+    let mut predicate_plans = HashMap::new();
+    predicate_plans.insert("always_true".to_owned(), QueryPlan::Literal(true));
+
+    let plan = QueryPlan::PredicateCall { name: "always_true".to_owned(), args: vec![] };
+    let rule = search_rule("call-pred", vec![], plan);
+    let findings = run_rule_with_predicates(rule, &cpg, predicate_plans, HashMap::new());
+    assert!(!findings.is_empty(), "PredicateCall to a true-body predicate should match");
+}
+
+#[test]
+fn predicate_call_to_undefined_predicate_is_false() {
+    let (cpg, _) = simple_call_cpg();
+    let plan = QueryPlan::PredicateCall { name: "missing".to_owned(), args: vec![] };
+    let rule = search_rule("call-missing-pred", vec![], plan);
+    let findings = run_rule_with_predicates(rule, &cpg, HashMap::new(), HashMap::new());
+    assert!(findings.is_empty(), "PredicateCall to an unresolved name should evaluate false");
+}
+
+#[test]
+fn predicate_call_nested_two_levels_does_not_panic_or_misresolve() {
+    // predicate `outer` calls predicate `inner`, which is Literal(true). This exercises
+    // looking up `predicate_plans` while already inside a `PredicateCall` evaluation —
+    // the scenario the (now-removed) per-call QueryPlan::clone() existed to "protect"
+    // against. Both lookups borrow the same external `&'a HashMap`, so nested/concurrent
+    // shared borrows are fine without cloning.
+    let (cpg, _) = simple_call_cpg();
+    let mut predicate_plans = HashMap::new();
+    predicate_plans.insert("inner".to_owned(), QueryPlan::Literal(true));
+    predicate_plans.insert(
+        "outer".to_owned(),
+        QueryPlan::PredicateCall { name: "inner".to_owned(), args: vec![] },
+    );
+
+    let plan = QueryPlan::PredicateCall { name: "outer".to_owned(), args: vec![] };
+    let rule = search_rule("call-nested-pred", vec![], plan);
+    let findings = run_rule_with_predicates(rule, &cpg, predicate_plans, HashMap::new());
+    assert!(!findings.is_empty(), "two-level nested PredicateCall should resolve to true");
+}
+
 // ── QueryPlan::Literal ────────────────────────────────────────────────────────
 
 #[test]

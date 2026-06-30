@@ -309,9 +309,12 @@ impl<'a> RuleRunner<'a> {
                         };
                         child.insert(param_name.to_owned(), binding);
                     }
-                    // Clone the plan to satisfy borrow checker (pred_plan borrow ends before child use)
-                    let plan = pred_plan.clone();
-                    self.eval_plan(&plan, &child)
+                    // `pred_plan` borrows from `self.ctx.predicate_plans: &'a HashMap<...>`,
+                    // an externally-owned reference with its own lifetime 'a — not a borrow
+                    // of `self` itself — so it can be passed straight into the recursive
+                    // `eval_plan` call without cloning the whole QueryPlan subtree on every
+                    // predicate call (recursive predicates used to pay this on every level).
+                    self.eval_plan(pred_plan, &child)
                 } else {
                     false
                 }
