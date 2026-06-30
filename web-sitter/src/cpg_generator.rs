@@ -1124,7 +1124,7 @@ fn collect_custom_allocators(
 /// Writes to both `AstNode` fields (backward compat) and the sparse
 /// `Cpg::cpp_metadata` side-table (canonical, language-neutral AstNode).
 /// This is a no-op for C files (no class_specifier/namespace_definition nodes).
-fn enrich_cpp_metadata(cpg: &mut crate::Cpg) {
+pub(crate) fn enrich_cpp_metadata(cpg: &mut crate::Cpg) {
     let ast = &cpg.ast;
 
     // ── Extract class name from AST children (not text splitting) ─────────────
@@ -1753,7 +1753,7 @@ fn has_child_of_type(node: &AstNode, ast: &BTreeMap<NodeId, AstNode>, ty: &str) 
 
 // ── Go enrichment ─────────────────────────────────────────────────────────────
 
-fn enrich_go_metadata(cpg: &mut Cpg) {
+pub(crate) fn enrich_go_metadata(cpg: &mut Cpg) {
     // Collect all node IDs so we can iterate and mutate.
     let ids: Vec<NodeId> = cpg.ast.keys().copied().collect();
 
@@ -2341,7 +2341,7 @@ fn find_with_alias(node: &AstNode, ast: &BTreeMap<NodeId, AstNode>) -> Option<St
     None
 }
 
-fn enrich_python_metadata(cpg: &mut Cpg) {
+pub(crate) fn enrich_python_metadata(cpg: &mut Cpg) {
     let ids: Vec<NodeId> = cpg.ast.keys().copied().collect();
 
     // Pass 1: set names, operators, ParamDef kinds
@@ -2880,7 +2880,7 @@ fn java_annotations_from_modifiers(mods_id: NodeId, ast: &std::collections::BTre
     }).collect()
 }
 
-fn enrich_java_metadata(cpg: &mut Cpg) {
+pub(crate) fn enrich_java_metadata(cpg: &mut Cpg) {
     let ids: Vec<NodeId> = cpg.ast.keys().copied().collect();
 
     // package_name: text of the top-level package_declaration's scoped_identifier/identifier child.
@@ -3334,7 +3334,7 @@ fn enrich_java_metadata(cpg: &mut Cpg) {
 
 // ── JavaScript enrichment ─────────────────────────────────────────────────────
 
-fn enrich_js_metadata(cpg: &mut Cpg) {
+pub(crate) fn enrich_js_metadata(cpg: &mut Cpg) {
     let ids: Vec<NodeId> = cpg.ast.keys().copied().collect();
 
     for &node_id in &ids {
@@ -3602,7 +3602,7 @@ fn enrich_js_metadata(cpg: &mut Cpg) {
 
 // ── TypeScript enrichment ─────────────────────────────────────────────────────
 
-fn enrich_ts_metadata(cpg: &mut Cpg) {
+pub(crate) fn enrich_ts_metadata(cpg: &mut Cpg) {
     // TypeScript grammar reuses most JS constructs. Start with JS enrichment,
     // then add TS-specific processing.
     enrich_js_metadata(cpg);
@@ -4075,7 +4075,7 @@ fn enrich_ts_metadata(cpg: &mut Cpg) {
 
 // ── Rust enrichment ───────────────────────────────────────────────────────────
 
-fn enrich_rust_metadata(cpg: &mut Cpg) {
+pub(crate) fn enrich_rust_metadata(cpg: &mut Cpg) {
     let ids: Vec<NodeId> = cpg.ast.keys().copied().collect();
 
     for &node_id in &ids {
