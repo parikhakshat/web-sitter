@@ -126,46 +126,55 @@ pub struct CfgReachability {
 }
 
 impl CfgReachability {
-    /// Compute reachability via transitive closure (BFS from each node).
-    /// For larger CFGs this should be done with bit-matrix propagation in RPO.
+    /// Compute reachability via SCC condensation: collapse cycles with Tarjan's
+    /// algorithm, then do a single pass over the condensation DAG in the order
+    /// SCCs are completed (which is already reverse-topological — a "sink" SCC
+    /// with no outgoing edges to other components is completed first), unioning
+    /// in each successor SCC's already-finalized reach set. All blocks in the
+    /// same SCC share one reach bitmap (they're mutually reachable, so anything
+    /// reachable from one is reachable from all). O(V+E) total, versus the
+    /// previous all-pairs iterate-to-fixpoint loop which could touch every block
+    /// pair on every round for a cyclic CFG.
     pub fn compute(succs: &[Vec<BlockId>]) -> Self {
         let n = succs.len();
-        let mut reach: Vec<RoaringBitmap> = (0..n as u32)
-            .map(|i| {
-                let mut bm = RoaringBitmap::new();
-                bm.insert(i);
-                bm
-            })
-            .collect();
+        if n == 0 {
+            return Self { reach: vec![], n: 0 };
+        }
 
-        // Propagate in RPO (conservative: iterative until fixed point)
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for b in 0..n {
-                for &s in &succs[b] {
+        let (scc_id, scc_members) = tarjan_sccs(succs);
+        let num_sccs = scc_members.len();
+
+        // scc_members is already in completion order, i.e. reverse-topological:
+        // for any edge u -> v with scc_id[u] != scc_id[v], scc_id[v]'s SCC was
+        // completed (has a lower index here) before scc_id[u]'s. Processing in
+        // this same order guarantees every successor SCC's reach is already
+        // finalized when we need it.
+        let mut scc_reach: Vec<RoaringBitmap> = Vec::with_capacity(num_sccs);
+        for members in &scc_members {
+            let mut bm = RoaringBitmap::new();
+            for &m in members {
+                bm.insert(m as u32);
+            }
+            let mut succ_sccs: HashSet<usize> = HashSet::new();
+            for &m in members {
+                for &s in &succs[m] {
                     let s = s as usize;
-                    if s < n {
-                        // reach[b] |= reach[s]  (forward reachability: b can reach whatever s can)
-                        // Actually we want: for each successor s, reach[b] union= {s} union reach[s]
-                        let additional: Vec<u32> = reach[s]
-                            .iter()
-                            .filter(|&x| !reach[b].contains(x))
-                            .collect();
-                        if !additional.is_empty() {
-                            for x in additional {
-                                reach[b].insert(x);
-                            }
-                            changed = true;
-                        }
-                        if !reach[b].contains(s as u32) {
-                            reach[b].insert(s as u32);
-                            changed = true;
-                        }
+                    if s >= n {
+                        continue;
+                    }
+                    let s_scc = scc_id[s];
+                    if s_scc != scc_id[m] {
+                        succ_sccs.insert(s_scc);
                     }
                 }
             }
+            for s_scc in succ_sccs {
+                bm |= &scc_reach[s_scc];
+            }
+            scc_reach.push(bm);
         }
+
+        let reach: Vec<RoaringBitmap> = (0..n).map(|b| scc_reach[scc_id[b]].clone()).collect();
 
         Self { reach, n }
     }
@@ -547,6 +556,78 @@ impl FunctionCfg {
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
+
+/// Iterative Tarjan's strongly-connected-components algorithm (avoids recursion
+/// depth limits on large/flat CFGs). Returns `(scc_id, scc_members)` where
+/// `scc_id[block]` is the index into `scc_members` of the SCC containing `block`,
+/// and `scc_members` is ordered by SCC *completion* order — which is the same as
+/// reverse-topological order of the condensation DAG (a component with no
+/// outgoing edges to other components is completed, and thus appears, first).
+fn tarjan_sccs(succs: &[Vec<BlockId>]) -> (Vec<usize>, Vec<Vec<usize>>) {
+    let n = succs.len();
+    let mut index_counter = 0usize;
+    let mut indices = vec![usize::MAX; n];
+    let mut lowlink = vec![0usize; n];
+    let mut on_stack = vec![false; n];
+    let mut tarjan_stack: Vec<usize> = Vec::new();
+    let mut scc_id = vec![usize::MAX; n];
+    let mut scc_members: Vec<Vec<usize>> = Vec::new();
+
+    for start in 0..n {
+        if indices[start] != usize::MAX {
+            continue;
+        }
+
+        // Explicit work stack of (node, next successor index to visit) emulates
+        // the recursive DFS without risking stack overflow on long block chains.
+        let mut work: Vec<(usize, usize)> = vec![(start, 0)];
+        indices[start] = index_counter;
+        lowlink[start] = index_counter;
+        index_counter += 1;
+        tarjan_stack.push(start);
+        on_stack[start] = true;
+
+        while let Some(&mut (v, ref mut i)) = work.last_mut() {
+            if *i < succs[v].len() {
+                let w = succs[v][*i] as usize;
+                *i += 1;
+                if w >= n {
+                    continue;
+                }
+                if indices[w] == usize::MAX {
+                    indices[w] = index_counter;
+                    lowlink[w] = index_counter;
+                    index_counter += 1;
+                    tarjan_stack.push(w);
+                    on_stack[w] = true;
+                    work.push((w, 0));
+                } else if on_stack[w] {
+                    lowlink[v] = lowlink[v].min(indices[w]);
+                }
+            } else {
+                work.pop();
+                if let Some(&(parent, _)) = work.last() {
+                    lowlink[parent] = lowlink[parent].min(lowlink[v]);
+                }
+                if lowlink[v] == indices[v] {
+                    let mut members = Vec::new();
+                    loop {
+                        let w = tarjan_stack.pop().expect("SCC stack must contain v");
+                        on_stack[w] = false;
+                        scc_id[w] = scc_members.len();
+                        members.push(w);
+                        if w == v {
+                            break;
+                        }
+                    }
+                    scc_members.push(members);
+                }
+            }
+        }
+    }
+
+    (scc_id, scc_members)
+}
 
 fn reverse_postorder(succs: &[Vec<BlockId>], entry: usize, n: usize) -> Vec<usize> {
     let mut visited = vec![false; n];
