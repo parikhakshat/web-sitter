@@ -626,7 +626,19 @@ impl<'a> RuleRunner<'a> {
                     .first()
                     .and_then(|a| eval_as_index(self.eval_plan_expr(a, env)))
                     .unwrap_or(0);
-                node.children.get(n).copied().map(EvalValue::Node).unwrap_or(EvalValue::Null)
+                // Arguments live inside an argument_list/arguments child for most
+                // languages (C/C++, Java, Go, JS/TS). Find that container first.
+                let arg_id = node.children.iter().find_map(|&cid| {
+                    let child = self.ctx.cpg.ast.get(&cid)?;
+                    if matches!(child.node_type.as_str(), "argument_list" | "arguments") {
+                        child.children.get(n).copied()
+                    } else {
+                        None
+                    }
+                });
+                arg_id.or_else(|| node.children.get(n).copied())
+                    .map(EvalValue::Node)
+                    .unwrap_or(EvalValue::Null)
             }
 
             "arg_count" => EvalValue::Int(node.argument_count.unwrap_or(0) as i64),
@@ -700,30 +712,23 @@ impl<'a> RuleRunner<'a> {
             }
 
             "param" => {
-                // param(n) — nth parameter of a MethodDef (child at index n)
+                // param(n) — nth parameter of a MethodDef.
+                // In C/C++ params are nested: function_definition →
+                // function_declarator → parameter_list → parameter_declaration.
+                // In Java/Go/JS/TS params sit inside formal_parameters or
+                // parameter_list which IS a direct child. We descend up to two
+                // container levels to collect all ParamDef nodes.
                 let n = step
                     .args
                     .first()
                     .and_then(|a| eval_as_index(self.eval_plan_expr(a, env)))
                     .unwrap_or(0);
-                // Parameters are children of kind ParamDef
-                let params: Vec<NodeId> = node.children.iter()
-                    .copied()
-                    .filter(|&child_id| {
-                        self.ctx.cpg.ast.get(&child_id)
-                            .map_or(false, |c| c.kind == IrNodeKind::ParamDef)
-                    })
-                    .collect();
+                let params = collect_param_nodes(self.ctx.cpg, node);
                 params.get(n).copied().map(EvalValue::Node).unwrap_or(EvalValue::Null)
             }
 
             "param_count" => {
-                let count = node.children.iter()
-                    .filter(|&&child_id| {
-                        self.ctx.cpg.ast.get(&child_id)
-                            .map_or(false, |c| c.kind == IrNodeKind::ParamDef)
-                    })
-                    .count();
+                let count = collect_param_nodes(self.ctx.cpg, node).len();
                 EvalValue::Int(count as i64)
             }
 
@@ -1153,6 +1158,42 @@ fn callee_site_for_node<'a>(cpg: &'a Cpg, call_node_id: NodeId) -> Option<&'a Ca
         }
     }
     None
+}
+
+/// Collect all `ParamDef` nodes for a function/method node, descending into
+/// transparent parameter containers (`parameter_list`, `formal_parameters`,
+/// `function_declarator`) so this works for all supported languages.
+fn collect_param_nodes(cpg: &Cpg, fn_node: &IrNode) -> Vec<NodeId> {
+    let mut params: Vec<NodeId> = Vec::new();
+    for &cid in &fn_node.children {
+        let child = match cpg.ast.get(&cid) { Some(c) => c, None => continue };
+        if child.kind == IrNodeKind::ParamDef {
+            params.push(cid);
+        } else if matches!(
+            child.node_type.as_str(),
+            "parameter_list" | "formal_parameters" | "parameters"
+        ) {
+            for &gcid in &child.children {
+                if cpg.ast.get(&gcid).map_or(false, |g| g.kind == IrNodeKind::ParamDef) {
+                    params.push(gcid);
+                }
+            }
+        } else if child.node_type == "function_declarator" {
+            // C/C++: function_definition → function_declarator → parameter_list → params
+            for &gcid in &child.children {
+                if let Some(gc) = cpg.ast.get(&gcid) {
+                    if gc.node_type == "parameter_list" {
+                        for &ggcid in &gc.children {
+                            if cpg.ast.get(&ggcid).map_or(false, |g| g.kind == IrNodeKind::ParamDef) {
+                                params.push(ggcid);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    params
 }
 
 /// Return candidate node IDs for a root binding, respecting NodeType raw matching.

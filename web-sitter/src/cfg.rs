@@ -915,6 +915,7 @@ impl<'a> CfgBuilder<'a> {
 
         let header_bb_id = self.create_bb(func_id);
         let body_bb_id = self.create_bb(func_id);
+        let update_bb_id = self.create_bb(func_id);
         let exit_bb_id = self.create_bb(func_id);
         self.add_successor(&current_bb_id, &header_bb_id);
 
@@ -931,9 +932,11 @@ impl<'a> CfgBuilder<'a> {
             self.add_successor(&header_bb_id, &exit_bb_id);
         }
 
+        // `continue` must jump to the update expression (if any), not the
+        // condition-check header; otherwise the update is skipped each iteration.
         state.break_stack.push((
             BreakKind::Loop,
-            Some(header_bb_id.clone()),
+            Some(update_bb_id.clone()),
             exit_bb_id.clone(),
         ));
         let body_end = body_id
@@ -941,10 +944,11 @@ impl<'a> CfgBuilder<'a> {
             .unwrap_or(body_bb_id.clone());
         state.break_stack.pop();
 
+        self.add_successor(&body_end, &update_bb_id);
         if let Some(update_id) = update_id {
-            self.add_node_to_bb(update_id, &body_end);
+            self.add_node_to_bb(update_id, &update_bb_id);
         }
-        self.add_successor(&body_end, &header_bb_id);
+        self.add_successor(&update_bb_id, &header_bb_id);
 
         exit_bb_id
     }

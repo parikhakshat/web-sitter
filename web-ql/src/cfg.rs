@@ -208,8 +208,15 @@ impl FunctionCfg {
             .filter(|(_, b)| b.function == fn_id)
             .collect();
 
-        // Sort by block ID string for deterministic ordering
-        fn_blocks.sort_by_key(|(id, _)| id.as_str());
+        // Sort by numeric suffix for deterministic ordering that matches
+        // the block creation order (e.g. "bb_5" < "bb_12" < "bb_100").
+        // Lexicographic sort would mis-order these ("bb_100" < "bb_5").
+        fn_blocks.sort_by(|(a, _), (b, _)| {
+            let num = |s: &str| -> u64 {
+                s.rsplit('_').next().and_then(|n| n.parse().ok()).unwrap_or(0)
+            };
+            num(a).cmp(&num(b))
+        });
 
         let n = fn_blocks.len();
 

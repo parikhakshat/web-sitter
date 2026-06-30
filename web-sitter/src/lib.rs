@@ -1363,11 +1363,26 @@ impl Cpg {
     }
 
     /// Returns the `FunctionKind` for a node.
-    /// Checks cpp_metadata first (authoritative), falls back to inferring from
-    /// whether the node has a `function_definition` type.
+    /// Checks each language's metadata side-table in priority order, then falls
+    /// back to inferring from the IrNodeKind.
     pub fn function_kind(&self, node_id: NodeId) -> FunctionKind {
         if let Some(meta) = self.cpp_metadata.get(&node_id) {
             return meta.function_kind;
+        }
+        if let Some(meta) = self.go_metadata.get(&node_id) {
+            if meta.function_kind != FunctionKind::ExternalDecl {
+                return meta.function_kind;
+            }
+        }
+        if let Some(meta) = self.python_metadata.get(&node_id) {
+            if meta.function_kind != FunctionKind::ExternalDecl {
+                return meta.function_kind;
+            }
+        }
+        if let Some(meta) = self.java_metadata.get(&node_id) {
+            if meta.function_kind != FunctionKind::ExternalDecl {
+                return meta.function_kind;
+            }
         }
         if let Some(node) = self.ast.get(&node_id) {
             if node.kind == IrNodeKind::MethodDef
