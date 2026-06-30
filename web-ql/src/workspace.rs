@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use rayon::prelude::*;
 use web_sitter::{Cpg, FunctionSummary, IrNodeKind, NodeId};
 use web_profiler as prof;
@@ -20,8 +21,10 @@ use crate::engine::{EvalContext, RuleRunner};
 /// Per-file analysis artifacts cached across incremental scans.
 pub struct FileIndex {
     pub path: PathBuf,
-    pub cpg: Cpg,
-    pub dfg: DfgIndex,
+    /// Arc-wrapped so cross-file taint context (`Workspace::cross_file_dfgs`) can share
+    /// this CPG with other files via a cheap refcount bump instead of a full deep clone.
+    pub cpg: Arc<Cpg>,
+    pub dfg: Arc<DfgIndex>,
     pub cfg_cache: HashMap<NodeId, FunctionCfg>,
     /// Node-kind / raw-node-type / call-site index — replaces repeated full-AST and
     /// full-call-graph scans during rule evaluation.
@@ -78,8 +81,8 @@ impl FileIndex {
 
         Self {
             path,
-            cpg,
-            dfg,
+            cpg: Arc::new(cpg),
+            dfg: Arc::new(dfg),
             cfg_cache,
             kind_index,
             alias,
@@ -153,7 +156,8 @@ pub struct Workspace {
     pub cross_file_callee_params: HashMap<NodeId, Vec<(PathBuf, Vec<NodeId>)>>,
     /// Flat map of (file_path) → (DfgIndex, Cpg) for cross-file taint traversal.
     /// Built by `build_cross_file_edges()` alongside `cross_file_callee_params`.
-    pub cross_file_dfgs: HashMap<PathBuf, (DfgIndex, Cpg)>,
+    /// Arc-wrapped — shares the same indexes already owned by `files`, no cloning.
+    pub cross_file_dfgs: HashMap<PathBuf, (Arc<DfgIndex>, Arc<Cpg>)>,
     /// Files that have been added/changed since the last scan. Used by
     /// `scan_incremental` to skip re-evaluating unchanged files.
     dirty_files: HashSet<PathBuf>,
@@ -353,8 +357,9 @@ impl Workspace {
         }
 
         // Build the flat DFG map for cross-file taint traversal.
-        // Reuse the already-built DfgIndex from each FileIndex (no double-build).
-        let mut cross_dfgs: HashMap<PathBuf, (DfgIndex, Cpg)> = HashMap::new();
+        // Reuse the already-built DfgIndex/Cpg from each FileIndex — both are Arc-wrapped,
+        // so this is a refcount bump rather than a deep clone of the whole CPG.
+        let mut cross_dfgs: HashMap<PathBuf, (Arc<DfgIndex>, Arc<Cpg>)> = HashMap::new();
         let callee_files: HashSet<PathBuf> = callee_params
             .values()
             .flat_map(|v| v.iter().map(|(f, _)| f.clone()))

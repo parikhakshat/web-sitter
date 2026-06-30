@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::Arc;
 use web_sitter::{Cpg, FunctionSummary, IrNode, IrNodeKind, NodeId};
 use crate::dfg::{DfgIndex, TaintConfig};
 use crate::ir::{TaintEndpointRef, TaintSpec};
@@ -105,8 +106,9 @@ pub struct TaintFinding {
 
 /// Cross-file context for interprocedural DFG traversal.
 pub struct CrossFileTaintCtx<'a> {
-    /// Per-file DFG indexes and CPGs.
-    pub file_dfgs: &'a HashMap<PathBuf, (DfgIndex, Cpg)>,
+    /// Per-file DFG indexes and CPGs. Arc-wrapped — shared with `Workspace::files`
+    /// rather than cloned.
+    pub file_dfgs: &'a HashMap<PathBuf, (Arc<DfgIndex>, Arc<Cpg>)>,
     /// Maps call_node (in the current file) → list of (callee_file, callee_param_node_ids).
     /// Built by `Workspace::build_cross_file_edges()`.
     pub call_to_callee_params: &'a HashMap<NodeId, Vec<(PathBuf, Vec<NodeId>)>>,

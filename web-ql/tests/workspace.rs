@@ -1,7 +1,8 @@
 mod fixtures;
 use fixtures::*;
 use std::path::PathBuf;
-use web_sitter::IrNodeKind;
+use std::sync::Arc;
+use web_sitter::{CrossFileCallEdge, IrNodeKind};
 use web_ql::{
     ir::{CompiledClause, CompiledRule, QueryPlan, RootBinding, RuleSet, SearchPlan},
     ast::{Severity, TypeExpr},
@@ -284,6 +285,88 @@ fn upsert_file_merges_function_summaries() {
 
     ws.upsert_file(path("a.py"), cpg, 1);
     assert!(ws.summaries.contains_key("my_func"), "summaries should be merged");
+}
+
+// ── build_cross_file_edges ──────────────────────────────────────────────────
+
+#[test]
+fn build_cross_file_edges_shares_callee_cpg_via_arc_not_clone() {
+    // The whole point of Arc-wrapping FileIndex.cpg/.dfg is that
+    // Workspace::cross_file_dfgs shares the *same* allocation as the callee file's
+    // own FileIndex entry, instead of deep-cloning the CPG on every
+    // build_cross_file_edges() call. Verify that with Arc::ptr_eq, not just that
+    // the contents happen to be equal (which would also pass with a clone).
+    let mut ws = Workspace::new(empty_registry());
+
+    let callee_node = make_node(1, IrNodeKind::MethodDef, Some("helper"));
+    let callee_cpg = make_cpg_with_ids(vec![(1, callee_node)]);
+    ws.upsert_file(path("callee.py"), callee_cpg, 1);
+
+    let caller_fn = make_node(10, IrNodeKind::MethodDef, Some("main"));
+    let mut call_node = make_node(11, IrNodeKind::Call, Some("helper"));
+    call_node.function_id = Some(10);
+    let mut caller_cpg = make_cpg_with_ids(vec![(10, caller_fn), (11, call_node)]);
+    caller_cpg.workspace.cross_file_calls = vec![CrossFileCallEdge {
+        call_node: 11,
+        caller_fn: 10,
+        callee_name: "helper".to_owned(),
+        qualified_callee: None,
+        arg_positions: vec![],
+    }];
+    ws.upsert_file(path("caller.py"), caller_cpg, 1);
+
+    ws.build_cross_file_edges();
+
+    assert_eq!(
+        ws.cross_file_callee_params.get(&11).map(|v| v.len()),
+        Some(1),
+        "the cross-file call should resolve to exactly one callee"
+    );
+
+    let callee_path = path("callee.py");
+    let shared_cpg = &ws.cross_file_dfgs.get(&callee_path)
+        .expect("callee should be registered in cross_file_dfgs")
+        .1;
+    let owned_cpg = &ws.files.get(&callee_path).expect("callee FileIndex should exist").cpg;
+    assert!(
+        Arc::ptr_eq(shared_cpg, owned_cpg),
+        "cross_file_dfgs should share the same Arc<Cpg> allocation as FileIndex, not a deep clone"
+    );
+
+    let shared_dfg = &ws.cross_file_dfgs.get(&callee_path).unwrap().0;
+    let owned_dfg = &ws.files.get(&callee_path).unwrap().dfg;
+    assert!(
+        Arc::ptr_eq(shared_dfg, owned_dfg),
+        "cross_file_dfgs should share the same Arc<DfgIndex> allocation as FileIndex, not a deep clone"
+    );
+}
+
+#[test]
+fn build_cross_file_edges_resolves_unqualified_callee_name() {
+    let mut ws = Workspace::new(empty_registry());
+
+    let callee_node = make_node(1, IrNodeKind::MethodDef, Some("helper"));
+    let callee_cpg = make_cpg_with_ids(vec![(1, callee_node)]);
+    ws.upsert_file(path("callee.py"), callee_cpg, 1);
+
+    let caller_fn = make_node(10, IrNodeKind::MethodDef, Some("main"));
+    let mut call_node = make_node(11, IrNodeKind::Call, Some("helper"));
+    call_node.function_id = Some(10);
+    let mut caller_cpg = make_cpg_with_ids(vec![(10, caller_fn), (11, call_node)]);
+    caller_cpg.workspace.cross_file_calls = vec![CrossFileCallEdge {
+        call_node: 11,
+        caller_fn: 10,
+        callee_name: "helper".to_owned(),
+        qualified_callee: None,
+        arg_positions: vec![],
+    }];
+    ws.upsert_file(path("caller.py"), caller_cpg, 1);
+
+    ws.build_cross_file_edges();
+
+    let resolved = ws.cross_file_callee_params.get(&11).expect("call should resolve");
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(resolved[0].0, path("callee.py"));
 }
 
 // ── scan_incremental ─────────────────────────────────────────────────────────
