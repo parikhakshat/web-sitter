@@ -21,6 +21,7 @@ pub mod finding;
 pub mod workspace;
 pub mod loader;
 pub mod security_patterns;
+pub mod node_ref;
 
 // Re-export the primary public API surface.
 pub use parser::parse_rule_file;
@@ -31,3 +32,4 @@ pub use finding::Finding;
 pub use ir::RuleSet;
 pub use taint::EndpointRegistry;
 pub use security_patterns::builtin_endpoint_registry;
+pub use node_ref::NodeRef;

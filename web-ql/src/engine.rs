@@ -22,6 +22,9 @@ use crate::taint::{CrossFileTaintCtx, EndpointRegistry, TaintEngine};
 
 pub struct EvalContext<'a> {
     pub cpg: &'a Cpg,
+    /// The file `cpg`/`dfg` were parsed from. Needed to address entries in
+    /// `cross_file`'s workspace-wide, `NodeRef`-keyed map correctly.
+    pub current_file: &'a std::path::Path,
     pub dfg: &'a DfgIndex,
     pub cfg_cache: &'a HashMap<NodeId, FunctionCfg>,
     /// Node-kind / raw-node-type / call-site index, built once per file.
@@ -90,6 +93,7 @@ impl<'a> RuleRunner<'a> {
                                 &merged,
                                 self.ctx.dfg,
                                 self.ctx.cpg,
+                                self.ctx.current_file,
                                 self.ctx.summaries,
                             );
                             if let Some(cf) = self.ctx.cross_file {
@@ -307,6 +311,7 @@ impl<'a> RuleRunner<'a> {
                     self.ctx.registry,
                     self.ctx.dfg,
                     self.ctx.cpg,
+                    self.ctx.current_file,
                     self.ctx.summaries,
                 );
                 if let Some(cf) = self.ctx.cross_file {

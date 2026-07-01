@@ -64,6 +64,7 @@ fn run_rule(rule: CompiledRule, cpg: &web_sitter::Cpg) -> Vec<Finding> {
     let nullability = NullabilityIndex::build(cpg, &kind_index);
     let ctx = EvalContext {
         cpg,
+        current_file: std::path::Path::new("test.c"),
         dfg: &dfg,
         cfg_cache: &cfg_cache,
         kind_index: &kind_index,
@@ -99,6 +100,7 @@ fn run_rule_with_predicates(
     let nullability = NullabilityIndex::build(cpg, &kind_index);
     let ctx = EvalContext {
         cpg,
+        current_file: std::path::Path::new("test.c"),
         dfg: &dfg,
         cfg_cache: &cfg_cache,
         kind_index: &kind_index,
@@ -636,6 +638,7 @@ fn run_multiple_rules_all_findings_collected() {
     let nullability = NullabilityIndex::build(&cpg, &kind_index);
     let ctx = EvalContext {
         cpg: &cpg,
+        current_file: std::path::Path::new("test.c"),
         dfg: &dfg,
         cfg_cache: &cfg_cache,
         kind_index: &kind_index,
@@ -675,6 +678,7 @@ fn empty_rule_set_returns_no_findings() {
     let nullability = NullabilityIndex::build(&cpg, &kind_index);
     let ctx = EvalContext {
         cpg: &cpg,
+        current_file: std::path::Path::new("test.c"),
         dfg: &dfg,
         cfg_cache: &cfg_cache,
         kind_index: &kind_index,
@@ -709,6 +713,7 @@ fn run_rule_with_cfg(rule: CompiledRule, cpg: &web_sitter::Cpg, fn_id: u32) -> V
     let nullability = NullabilityIndex::build(cpg, &kind_index);
     let ctx = EvalContext {
         cpg,
+        current_file: std::path::Path::new("test.c"),
         dfg: &dfg,
         cfg_cache: &cfg_cache,
         kind_index: &kind_index,
@@ -961,6 +966,7 @@ fn cfg_reachable_without_blocked_single_path() {
     let nullability = NullabilityIndex::build(&cpg, &kind_index);
     let ctx = EvalContext {
         cpg: &cpg,
+        current_file: std::path::Path::new("test.c"),
         dfg: &dfg,
         cfg_cache: &cfg_cache,
         kind_index: &kind_index,

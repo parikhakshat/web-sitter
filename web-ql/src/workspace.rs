@@ -12,6 +12,7 @@ use crate::finding::Finding;
 use crate::ir::RuleSet;
 use crate::kind_index::KindIndex;
 use crate::nullability::NullabilityIndex;
+use crate::node_ref::NodeRef;
 use crate::size_tracking::AllocSizeIndex;
 use crate::taint::{CrossFileTaintCtx, EndpointRegistry};
 use crate::engine::{EvalContext, RuleRunner};
@@ -151,9 +152,12 @@ pub struct Workspace {
     /// Which file contributed each summary (for incremental removal).
     summary_source: HashMap<String, PathBuf>,
     pub registry: EndpointRegistry,
-    /// Maps a call_node_id (in a caller file) → list of (callee_file, callee_param_node_ids).
+    /// Maps a call site (`NodeRef`, i.e. caller file + call_node_id) → list of
+    /// (callee_file, callee_param_node_ids). Keyed by `NodeRef` rather than a bare
+    /// `NodeId` because a `NodeId` is only unique within one file's CPG — see
+    /// `NodeRef`'s docs.
     /// Built by `build_cross_file_edges()` after all files are indexed.
-    pub cross_file_callee_params: HashMap<NodeId, Vec<(PathBuf, Vec<NodeId>)>>,
+    pub cross_file_callee_params: HashMap<NodeRef, Vec<(PathBuf, Vec<NodeId>)>>,
     /// Flat map of (file_path) → (DfgIndex, Cpg) for cross-file taint traversal.
     /// Built by `build_cross_file_edges()` alongside `cross_file_callee_params`.
     /// Arc-wrapped — shares the same indexes already owned by `files`, no cloning.
@@ -363,7 +367,9 @@ impl Workspace {
         }
 
         // Resolve cross_file_calls from each file against the multi-key function index.
-        let mut callee_params: HashMap<NodeId, Vec<(PathBuf, Vec<NodeId>)>> = HashMap::new();
+        // Keyed by `NodeRef` (caller file + call_node id) — never a bare `NodeId` —
+        // since the same integer id routinely appears in many different files.
+        let mut callee_params: HashMap<NodeRef, Vec<(PathBuf, Vec<NodeId>)>> = HashMap::new();
         for idx in self.files.values() {
             for edge in &idx.cpg.workspace.cross_file_calls {
                 // Try resolution in specificity order: qualified → class::name → simple.
@@ -375,7 +381,7 @@ impl Workspace {
 
                 if let Some((callee_file, callee_param_nodes)) = resolved {
                     callee_params
-                        .entry(edge.call_node)
+                        .entry(NodeRef::new(idx.path.clone(), edge.call_node))
                         .or_default()
                         .push((callee_file.clone(), callee_param_nodes.clone()));
                 }
@@ -429,12 +435,13 @@ impl Workspace {
 
         self.files
             .par_iter()
-            .flat_map(|(_, file_idx)| {
+            .flat_map(|(path, file_idx)| {
                 let _task = prof::task();
                 let _span = prof::span("query.scan_file");
 
                 let ctx = EvalContext {
                     cpg: &file_idx.cpg,
+                    current_file: path.as_path(),
                     dfg: &file_idx.dfg,
                     cfg_cache: &file_idx.cfg_cache,
                     kind_index: &file_idx.kind_index,
@@ -507,6 +514,7 @@ impl Workspace {
                 let _span = prof::span("query.scan_file_incremental");
                 let ctx = EvalContext {
                     cpg: &file_idx.cpg,
+                    current_file: path.as_path(),
                     dfg: &file_idx.dfg,
                     cfg_cache: &file_idx.cfg_cache,
                     kind_index: &file_idx.kind_index,

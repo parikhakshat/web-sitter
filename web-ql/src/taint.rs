@@ -1,11 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use web_profiler as prof;
 use web_sitter::{Cpg, FunctionSummary, IrNode, IrNodeKind, NodeId};
 use crate::dfg::{DfgIndex, TaintConfig};
 use crate::ir::{TaintEndpointRef, TaintSpec};
+use crate::node_ref::NodeRef;
 
 // ── Taint endpoint resolution ─────────────────────────────────────────────────
 
@@ -125,9 +126,13 @@ pub struct CrossFileTaintCtx<'a> {
     /// Per-file DFG indexes and CPGs. Arc-wrapped — shared with `Workspace::files`
     /// rather than cloned.
     pub file_dfgs: &'a HashMap<PathBuf, (Arc<DfgIndex>, Arc<Cpg>)>,
-    /// Maps call_node (in the current file) → list of (callee_file, callee_param_node_ids).
+    /// Maps a call site (`NodeRef`, i.e. caller file + call_node id) → list of
+    /// (callee_file, callee_param_node_ids), across every file in the workspace.
+    /// Keyed by `NodeRef` rather than a bare `NodeId` — a `NodeId` is only unique
+    /// within one file's CPG, so a workspace-wide map keyed on it alone would
+    /// collide call sites from different files that happen to share an id.
     /// Built by `Workspace::build_cross_file_edges()`.
-    pub call_to_callee_params: &'a HashMap<NodeId, Vec<(PathBuf, Vec<NodeId>)>>,
+    pub call_to_callee_params: &'a HashMap<NodeRef, Vec<(PathBuf, Vec<NodeId>)>>,
 }
 
 // ── Taint engine ──────────────────────────────────────────────────────────────
@@ -136,6 +141,10 @@ pub struct TaintEngine<'a> {
     pub registry: &'a EndpointRegistry,
     pub dfg: &'a DfgIndex,
     pub cpg: &'a Cpg,
+    /// The file this engine's `cpg`/`dfg` belong to. Required to address entries
+    /// in `cross_file.call_to_callee_params`, which is keyed by `NodeRef` (file +
+    /// id) across the whole workspace, not just this file's ids.
+    pub current_file: &'a Path,
     /// Function summaries for interprocedural expansion.
     pub summaries: &'a HashMap<String, FunctionSummary>,
     /// Optional cross-file DFG context for cross-file taint propagation.
@@ -147,9 +156,10 @@ impl<'a> TaintEngine<'a> {
         registry: &'a EndpointRegistry,
         dfg: &'a DfgIndex,
         cpg: &'a Cpg,
+        current_file: &'a Path,
         summaries: &'a HashMap<String, FunctionSummary>,
     ) -> Self {
-        Self { registry, dfg, cpg, summaries, cross_file: None }
+        Self { registry, dfg, cpg, current_file, summaries, cross_file: None }
     }
 
     pub fn with_cross_file(mut self, ctx: &'a CrossFileTaintCtx<'a>) -> Self {
@@ -392,11 +402,19 @@ impl<'a> TaintEngine<'a> {
         let Some(ctx) = self.cross_file else { return false };
         let _span = prof::span("taint.expand_cross_file");
         let mut changed = false;
+        let mut examined: u64 = 0;
 
-        // `call_to_callee_params` is already the sparse set of call sites with a
-        // resolved cross-file callee (built once by `Workspace::build_cross_file_edges`)
-        // — iterate it directly instead of rescanning every node in the AST.
-        for (node_id, callee_list) in ctx.call_to_callee_params {
+        // `call_to_callee_params` spans every file in the workspace (keyed by
+        // `NodeRef`, i.e. caller file + call_node id), so filter down to just this
+        // engine's file before doing anything with the bare `NodeId` — comparing
+        // `node_id` against `self.cpg` (this file's CPG) for an entry that actually
+        // belongs to a different caller file would silently resolve the wrong node.
+        for (node_ref, callee_list) in ctx.call_to_callee_params {
+            if node_ref.file != *self.current_file {
+                continue;
+            }
+            examined += 1;
+            let node_id = &node_ref.id;
             // NOTE: do NOT gate on `result.tainted.contains(node_id)` here — the
             // whole point of this pass is to *determine* whether the call node
             // becomes tainted (via a tainted argument reaching a tainted return
@@ -453,7 +471,7 @@ impl<'a> TaintEngine<'a> {
             }
         }
 
-        prof::count("taint.expand_cross_file.call_sites_examined", ctx.call_to_callee_params.len() as u64);
+        prof::count("taint.expand_cross_file.call_sites_examined", examined);
         changed
     }
 
@@ -760,7 +778,7 @@ mod tests {
         summaries.insert("wrap2".to_owned(), summary_with_taint_return("wrap2", 0));
 
         let registry = EndpointRegistry::new();
-        let engine = TaintEngine::new(&registry, &dfg, &cpg, &summaries);
+        let engine = TaintEngine::new(&registry, &dfg, &cpg, std::path::Path::new("test.c"), &summaries);
 
         let mut result = dfg.propagate_taint(&[SOURCE], &TaintConfig {
             sanitizer_nodes: &HashSet::new(),
@@ -801,7 +819,7 @@ mod tests {
         summaries.insert("wrap1".to_owned(), summary_with_taint_return("wrap1", 0));
 
         let registry = EndpointRegistry::new();
-        let engine = TaintEngine::new(&registry, &dfg, &cpg, &summaries);
+        let engine = TaintEngine::new(&registry, &dfg, &cpg, std::path::Path::new("test.c"), &summaries);
 
         let mut result = crate::dfg::TaintResult {
             tainted: HashSet::from([SOURCE]),

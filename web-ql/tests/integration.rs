@@ -60,6 +60,7 @@ fn run_query(cpg: &web_sitter::Cpg, rule_src: &str) -> Vec<Finding> {
 
     let ctx = EvalContext {
         cpg,
+        current_file: std::path::Path::new("test.c"),
         dfg: &dfg,
         cfg_cache: &cfg_cache,
         kind_index: &kind_index,
