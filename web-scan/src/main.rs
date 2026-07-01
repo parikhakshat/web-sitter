@@ -359,25 +359,23 @@ fn build_cpg(path: &Path, language: SourceLanguage) -> Result<web_sitter::Cpg> {
 // ── Rule loading ──────────────────────────────────────────────────────────────
 
 fn load_all_rules(query_args: &[PathBuf]) -> Result<RuleSet> {
-    let mut all_rules: Vec<web_ql::ir::CompiledRule> = Vec::new();
+    let mut all_sets: Vec<RuleSet> = Vec::new();
 
     for path in query_args {
         if path.is_dir() {
             let sets = load_rules_dir(path)
                 .with_context(|| format!("loading rules from directory {}", path.display()))?;
-            for rs in sets {
-                all_rules.extend(rs.rules);
-            }
+            all_sets.extend(sets);
         } else {
             let rs = load_rules(path)
                 .with_context(|| format!("loading rules from {}", path.display()))?;
-            all_rules.extend(rs.rules);
+            all_sets.push(rs);
         }
     }
 
-    if all_rules.is_empty() {
+    if all_sets.iter().all(|rs| rs.rules.is_empty()) {
         anyhow::bail!("no rules loaded — check your QUERY arguments");
     }
 
-    Ok(RuleSet::new(all_rules))
+    Ok(RuleSet::merge(all_sets))
 }
