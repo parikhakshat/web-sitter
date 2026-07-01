@@ -10,7 +10,7 @@
 
 use std::collections::HashSet;
 
-use web_sitter::{Cpg, NodeId};
+use web_sitter::{Cpg, IrNodeKind, NodeId};
 use web_sitter::{
     CpgGenerator, GraphBuildOptions, IncrementalCpgGenerator, SourceLanguage, compute_edit,
 };
@@ -95,7 +95,6 @@ fn field_initializer_list_no_crash() {
 
 #[test]
 fn field_initializer_list_dfg_edges() {
-    // Phase 2 target: DFG should have edges from constructor params to field identifiers.
     let src = r#"
         struct Point {
             int x;
@@ -116,12 +115,71 @@ fn field_initializer_list_dfg_edges() {
         !ctors.is_empty(),
         "Point(int,int) should be flagged as constructor"
     );
-    // There should be DFG edges (params are used in the initializer)
-    let edge_count = cpg.dataflow.edges.len();
-    assert!(
-        edge_count > 0,
-        "member initializer list should produce DFG edges"
-    );
+
+    // DFG should have a real edge from each constructor param to the field
+    // identifier it initializes: `px` -> `x`, `py` -> `y` — not just "some
+    // edges exist somewhere".
+    // The `parameter_declaration` (ParamDef) node itself carries no DFG edges —
+    // those live on its nested `identifier` leaf child (the actual def site
+    // the DFG builder wires REACHING_DEF edges from), so resolve to that.
+    let param_identifier = |param_name: &str| -> NodeId {
+        let param_id = cpg
+            .ast
+            .iter()
+            .find(|(_, n)| n.kind == IrNodeKind::ParamDef && n.name.as_deref() == Some(param_name))
+            .map(|(&id, _)| id)
+            .unwrap_or_else(|| panic!("{param_name} ParamDef not found"));
+        cpg.ast[&param_id]
+            .children
+            .iter()
+            .find_map(|&cid| {
+                let c = cpg.ast.get(&cid)?;
+                (c.node_type == "identifier" && c.text.as_deref() == Some(param_name)).then_some(cid)
+            })
+            .unwrap_or_else(|| panic!("{param_name} identifier leaf not found"))
+    };
+    let px_id = param_identifier("px");
+    let py_id = param_identifier("py");
+    // `field_identifier` covers both the member declaration (`int x;`) and the
+    // initializer target (`x(px)`) — text-match alone is ambiguous between the
+    // two, so also require the parent to be the `field_initializer` node.
+    let field_init_target = |field_name: &str| -> NodeId {
+        cpg.ast
+            .iter()
+            .find(|(_, n)| {
+                n.node_type == "field_identifier"
+                    && n.text.as_deref() == Some(field_name)
+                    && n.parent_id
+                        .and_then(|pid| cpg.ast.get(&pid))
+                        .map(|p| p.node_type == "field_initializer")
+                        .unwrap_or(false)
+            })
+            .map(|(&id, _)| id)
+            .unwrap_or_else(|| panic!("{field_name} field_initializer target not found"))
+    };
+    let x_field_id = field_init_target("x");
+    let y_field_id = field_init_target("y");
+
+    let reaches = |from: NodeId, to: NodeId| -> bool {
+        let mut visited: HashSet<NodeId> = HashSet::from([from]);
+        let mut queue: std::collections::VecDeque<NodeId> = std::collections::VecDeque::from([from]);
+        while let Some(cur) = queue.pop_front() {
+            if cur == to {
+                return true;
+            }
+            for edge in &cpg.dataflow.edges {
+                if edge.source == cur && visited.insert(edge.destination) {
+                    queue.push_back(edge.destination);
+                }
+            }
+        }
+        false
+    };
+
+    assert!(reaches(px_id, x_field_id), "constructor param `px` should dataflow-reach field `x` through the initializer list");
+    assert!(reaches(py_id, y_field_id), "constructor param `py` should dataflow-reach field `y` through the initializer list");
+    assert!(!reaches(px_id, y_field_id), "`px` must not spuriously reach the unrelated field `y`");
+    assert!(!reaches(py_id, x_field_id), "`py` must not spuriously reach the unrelated field `x`");
 }
 
 #[test]
@@ -348,7 +406,12 @@ fn explicit_object_parameter_no_crash() {
 
 #[test]
 fn explicit_object_parameter_dfg() {
-    // Phase 2 target: deducing-this param should be tracked in DFG like a normal param
+    // Note: this project's pinned tree-sitter-cpp (0.23.4) doesn't parse C++23
+    // deducing-this syntax cleanly — `this Counter& self` produces an ERROR
+    // node for the `Counter&` part (a grammar-level limitation, not something
+    // fixable from CPG-generation code without patching/upgrading the
+    // grammar). Despite that, the `self` identifier itself still parses
+    // correctly and should be tracked exactly like an ordinary parameter.
     let src = r#"
         struct Counter {
             int count;
@@ -366,13 +429,93 @@ fn explicit_object_parameter_dfg() {
     let cpg = cpp_cpg(src);
     assert_cfg_valid(&cpg);
     assert_dfg_valid(&cpg);
-    // Methods should have class_context set
+
+    // Both explicit-object-parameter methods should have class_context set.
     let methods: Vec<_> = cpg
         .ast
         .values()
         .filter(|n| n.node_type == "function_definition" && n.class_context.is_some())
         .collect();
     assert!(!methods.is_empty(), "methods should have class_context");
+
+    // `self` should be a real ParamDef (not swallowed by the grammar's ERROR
+    // recovery), scoped to its own class.
+    let self_params: Vec<_> = cpg
+        .ast
+        .values()
+        .filter(|n| n.kind == IrNodeKind::ParamDef && n.name.as_deref() == Some("self"))
+        .collect();
+    assert_eq!(self_params.len(), 2, "both increment and get_count should have a `self` ParamDef");
+    for p in &self_params {
+        assert_eq!(p.class_context.as_deref(), Some("Counter"), "self's class_context should be Counter");
+    }
+
+    // `self` must actually participate in DFG like a normal parameter: reading
+    // `self.count` in the body should carry a REACHING_DEF edge back to the
+    // `self` parameter's own declaration site, the same way any other param
+    // flows to its uses.
+    let get_count_id = cpg
+        .ast
+        .iter()
+        .find(|(_, n)| n.node_type == "function_definition" && n.name.as_deref() == Some("get_count"))
+        .map(|(&id, _)| id)
+        .expect("get_count MethodDef");
+    let self_def_id = cpg.ast[&get_count_id]
+        .children
+        .iter()
+        .find_map(|&cid| {
+            let c = cpg.ast.get(&cid)?;
+            if c.node_type != "function_declarator" {
+                return None;
+            }
+            let params = field_declarator_params(&cpg, cid)?;
+            params.children.iter().find_map(|&pid| {
+                find_identifier_named(&cpg, pid, "self")
+            })
+        })
+        .expect("self declaration identifier in get_count's param list");
+
+    let self_use_in_body = cpg
+        .ast
+        .iter()
+        .find(|(_, n)| {
+            n.node_type == "identifier"
+                && n.text.as_deref() == Some("self")
+                && n.function_id == Some(get_count_id)
+                && n.parent_id
+                    .and_then(|pid| cpg.ast.get(&pid))
+                    .map(|p| p.node_type == "field_expression")
+                    .unwrap_or(false)
+        })
+        .map(|(&id, _)| id)
+        .expect("self used in `return self.count;`");
+
+    let reaches_directly = cpg
+        .dataflow
+        .edges
+        .iter()
+        .any(|e| e.source == self_def_id && e.destination == self_use_in_body);
+    assert!(
+        reaches_directly,
+        "self ParamDef ({self_def_id}) should have a direct REACHING_DEF edge to its use in the method body ({self_use_in_body})"
+    );
+}
+
+/// The `parameter_list` child of a `function_declarator` node.
+fn field_declarator_params<'a>(cpg: &'a Cpg, function_declarator_id: NodeId) -> Option<&'a web_sitter::AstNode> {
+    cpg.ast[&function_declarator_id].children.iter().find_map(|&cid| {
+        let c = cpg.ast.get(&cid)?;
+        (c.node_type == "parameter_list").then_some(c)
+    })
+}
+
+/// DFS for an `identifier` descendant of `root` whose text matches `name`.
+fn find_identifier_named(cpg: &Cpg, root: NodeId, name: &str) -> Option<NodeId> {
+    let node = cpg.ast.get(&root)?;
+    if node.node_type == "identifier" && node.text.as_deref() == Some(name) {
+        return Some(root);
+    }
+    node.children.iter().find_map(|&cid| find_identifier_named(cpg, cid, name))
 }
 
 // ── module_declaration / export_declaration / import_declaration ──────────────
@@ -569,7 +712,6 @@ fn new_expression_no_crash() {
 
 #[test]
 fn new_expression_alloc_tracked() {
-    // Phase 2 target: new_expression nodes should be tracked in call graph / alloc sites
     let src = r#"
         struct Buffer {
             char* data;
@@ -578,6 +720,7 @@ fn new_expression_alloc_tracked() {
         Buffer* alloc_buffer(int n) {
             Buffer* b = new Buffer;
             b->data = new char[n];
+            int* fixed = new int[16];
             b->size = n;
             return b;
         }
@@ -585,12 +728,35 @@ fn new_expression_alloc_tracked() {
     let cpg = cpp_cpg(src);
     assert_cfg_valid(&cpg);
     assert_dfg_valid(&cpg);
-    // new_expression nodes should appear in AST
+
+    // `new_expression` nodes must be classified as NewExpr and participate in
+    // the call graph as an allocation site (`is_call()` already covers
+    // NewExpr, so this locks that in rather than re-deriving it from scratch).
     let new_nodes: Vec<_> = nodes_of_type(&cpg, "new_expression");
+    assert_eq!(new_nodes.len(), 3, "expected 3 new_expression nodes (Buffer, char[n], int[16])");
+    for (_, n) in &new_nodes {
+        assert_eq!(n.kind, IrNodeKind::NewExpr);
+        assert!(n.is_call(), "NewExpr must be treated as a call site for the call graph");
+    }
+    let alloc_buffer_calls: Vec<&str> = cpg
+        .call_graph
+        .values()
+        .find(|e| e.name == "alloc_buffer")
+        .map(|e| e.calls.iter().map(|c| c.callee.as_str()).collect())
+        .unwrap_or_default();
     assert!(
-        !new_nodes.is_empty(),
-        "new_expression nodes should appear in AST"
+        alloc_buffer_calls.contains(&"Buffer"),
+        "new Buffer should appear as a call-graph allocation site, got: {alloc_buffer_calls:?}"
     );
+
+    // Array-form `new T[expr]` allocation sizes must be tracked the same way
+    // C's `array_declarator` sizes are — constant sizes as `array_size`,
+    // symbolic ones as `array_size_expr` — so the size tracker can reason
+    // about `new[]` buffers exactly like C arrays.
+    let symbolic = new_nodes.iter().find(|(_, n)| n.text.as_deref() == Some("new char[n]")).unwrap().1;
+    assert_eq!(symbolic.array_size_expr.as_deref(), Some("n"), "new char[n] should record array_size_expr == \"n\"");
+    let constant = new_nodes.iter().find(|(_, n)| n.text.as_deref() == Some("new int[16]")).unwrap().1;
+    assert_eq!(constant.array_size, Some(16), "new int[16] should record array_size == 16");
 }
 
 #[test]
@@ -608,22 +774,77 @@ fn delete_expression_no_crash() {
 
 #[test]
 fn delete_expression_tracked() {
-    // Phase 2 target: delete_expression nodes should appear and be tracked as free sites
     let src = r#"
         struct Resource { int id; };
         void release(Resource* r, int* arr) {
             delete r;
             delete[] arr;
         }
+        void use_after_free_pattern() {
+            Resource* p = new Resource();
+            delete p;
+        }
     "#;
     let cpg = cpp_cpg(src);
     assert_cfg_valid(&cpg);
     assert_dfg_valid(&cpg);
-    // delete_expression nodes should appear in AST
+
     let delete_nodes: Vec<_> = nodes_of_type(&cpg, "delete_expression");
+    assert_eq!(delete_nodes.len(), 3, "expected 3 delete_expression nodes");
+    for (_, n) in &delete_nodes {
+        assert_eq!(n.kind, IrNodeKind::DeleteExpr);
+    }
+
+    // Each delete_expression must be a first-class DFG anchor — a DEALLOC edge
+    // landing ON the delete_expression node itself, sourced from the deleted
+    // pointer's use-site identifier — the same way a `free(p)` Call node is
+    // reachable/anchorable in the C UAF/double-free patterns.
+    let delete_ids: HashSet<NodeId> = delete_nodes.iter().map(|&(&id, _)| id).collect();
+    let dealloc_edges: Vec<_> = cpg
+        .dataflow
+        .edges
+        .iter()
+        .filter(|e| e.edge_type == "DEALLOC" && delete_ids.contains(&e.destination))
+        .collect();
+    assert_eq!(
+        dealloc_edges.len(),
+        delete_nodes.len(),
+        "every delete_expression should have exactly one DEALLOC edge landing on it, got {dealloc_edges:?}"
+    );
+
+    // The allocation site should actually reach the matching delete site
+    // through the ordinary pointer dataflow chain plus the new DEALLOC edge —
+    // proving this is real free-site tracking, not an edge dangling in
+    // isolation. `new Resource()` -> `p` (assignment) -> `delete p` (DEALLOC).
+    let new_id = nodes_of_type(&cpg, "new_expression")
+        .into_iter()
+        .find(|(_, n)| n.text.as_deref() == Some("new Resource()"))
+        .map(|(&id, _)| id)
+        .expect("new Resource() should be present");
+    let uaf_delete_id = delete_nodes
+        .iter()
+        .find(|(_, n)| n.text.as_deref() == Some("delete p"))
+        .map(|&(&id, _)| id)
+        .expect("delete p should be present");
+
+    // BFS forward from the allocation over the raw dataflow edges.
+    let mut visited: HashSet<NodeId> = HashSet::from([new_id]);
+    let mut queue: std::collections::VecDeque<NodeId> = std::collections::VecDeque::from([new_id]);
+    let mut reached_delete = false;
+    while let Some(cur) = queue.pop_front() {
+        if cur == uaf_delete_id {
+            reached_delete = true;
+            break;
+        }
+        for edge in &cpg.dataflow.edges {
+            if edge.source == cur && visited.insert(edge.destination) {
+                queue.push_back(edge.destination);
+            }
+        }
+    }
     assert!(
-        !delete_nodes.is_empty(),
-        "delete_expression nodes should appear in AST"
+        reached_delete,
+        "new Resource() should dataflow-reach its `delete p` free site"
     );
 }
 

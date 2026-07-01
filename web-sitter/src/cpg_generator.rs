@@ -645,6 +645,26 @@ pub(crate) fn get_node_graph_artifacts(
                     }
                     j += 1;
                 }
+            } else if node.kind() == "new_expression" {
+                // `new T[expr]` — the array-size expression lives one level down,
+                // inside a `new_declarator` child (whose own text is the bracketed
+                // `[expr]`, so its size is the *child* node's text, not its own).
+                let mut j: usize = 0;
+                while j < node.child_count() {
+                    if let Some(child) = node.child(j as u32) {
+                        if child.kind() == "new_declarator" {
+                            if let Some(size_node) = child.named_child(0) {
+                                let text = size_node.utf8_text(source).unwrap_or_default().to_string();
+                                array_size = text.parse::<i64>().ok();
+                                if array_size.is_none() {
+                                    array_size_expr = Some(text);
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    j += 1;
+                }
             }
 
             let (string_length, text) = if node.kind() == "string_literal" {

@@ -2195,6 +2195,13 @@ fn build_dataflow_impl(
         include_globals,
         &function_map,
     );
+    add_dealloc_edges(
+        graph,
+        &mut edges,
+        affected_function_ids,
+        include_globals,
+        &function_map,
+    );
     add_return_flow_edges(
         graph,
         &mut edges,
@@ -3787,6 +3794,41 @@ fn add_points_to_edges(
                 lhs_var.name,
                 "POINTS_TO",
             );
+        }
+    }
+}
+
+/// For every `delete_expression` (`delete p` / `delete[] p`), emit a DEALLOC
+/// edge from the deleted pointer's use-site identifier to the `delete_expression`
+/// node itself. This makes the delete site a first-class DFG anchor — reachable
+/// (like a `free(p)` `Call` node) from whatever allocation `p` flowed from, via
+/// the pointer's ordinary REACHING_DEF chain plus this final edge — so queries
+/// can treat `delete`/`delete[]` as a free site the same way they already treat
+/// `free()`/`operator delete` calls, instead of `delete_expression` being just
+/// another opaque statement with no dataflow anchor of its own.
+fn add_dealloc_edges(
+    graph: &BTreeMap<NodeId, AstNode>,
+    edges: &mut Vec<DataflowEdge>,
+    affected_function_ids: Option<&BTreeSet<NodeId>>,
+    include_globals: bool,
+    function_map: &BTreeMap<NodeId, NodeId>,
+) {
+    for (&node_id, node) in graph {
+        if node.kind != IrNodeKind::DeleteExpr {
+            continue;
+        }
+        if !node_in_scope(node_id, function_map, affected_function_ids, include_globals) {
+            continue;
+        }
+        // `delete p` / `delete[] p` — the deleted pointer is a direct identifier
+        // child (tree-sitter-cpp doesn't wrap it in any intermediate node).
+        let operand = node.children.iter().find_map(|&cid| {
+            let c = graph.get(&cid)?;
+            matches!(c.node_type.as_str(), "identifier" | "field_identifier").then_some((cid, c))
+        });
+        if let Some((operand_id, operand_node)) = operand {
+            let var_name = operand_node.text.clone().unwrap_or_default();
+            push_edge(edges, operand_id, node_id, var_name, "DEALLOC");
         }
     }
 }
