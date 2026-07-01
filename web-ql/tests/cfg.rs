@@ -307,6 +307,72 @@ fn function_cfg_branching_entry_reaches_all() {
     assert!(cfg.node_reaches(31, 34)); // merge node
 }
 
+// ── feasible_reaches / node_in_dead_branch (memoized) ─────────────────────────
+
+#[test]
+fn feasible_reaches_matches_node_reaches_without_symbolic_condition() {
+    // branching_cfg_cpg's Conditional node has no recorded "condition" field
+    // child, so block_to_condition is empty and feasible_reaches must fall
+    // back to following every successor, exactly like node_reaches.
+    let (cpg, fn_id) = branching_cfg_cpg();
+    let cfg = FunctionCfg::build_for_function(&cpg, fn_id);
+    assert!(cfg.feasible_reaches(31, 32, &cpg));
+    assert!(cfg.feasible_reaches(31, 33, &cpg));
+    assert!(cfg.feasible_reaches(31, 34, &cpg));
+    assert!(!cfg.feasible_reaches(32, 33, &cpg)); // then can't reach else
+}
+
+#[test]
+fn feasible_reaches_is_stable_across_repeated_calls() {
+    // Exercises the memoized `feasible_reach_cache`: the second call for the
+    // same source block must return the same answer as the first (cache-hit
+    // path), not a stale or empty set.
+    let (cpg, fn_id) = branching_cfg_cpg();
+    let cfg = FunctionCfg::build_for_function(&cpg, fn_id);
+    for _ in 0..3 {
+        assert!(cfg.feasible_reaches(31, 34, &cpg));
+        assert!(!cfg.feasible_reaches(34, 31, &cpg));
+    }
+}
+
+#[test]
+fn node_in_dead_branch_false_for_every_node_reachable_from_entry() {
+    // Every node in branching_cfg_cpg is reachable from the entry block, so
+    // none of them should be reported as being in a dead branch.
+    let (cpg, fn_id) = branching_cfg_cpg();
+    let cfg = FunctionCfg::build_for_function(&cpg, fn_id);
+    assert!(!cfg.node_in_dead_branch(31, &cpg));
+    assert!(!cfg.node_in_dead_branch(32, &cpg));
+    assert!(!cfg.node_in_dead_branch(33, &cpg));
+    assert!(!cfg.node_in_dead_branch(34, &cpg));
+}
+
+#[test]
+fn node_in_dead_branch_true_for_disconnected_block() {
+    // bb1 is never listed as a successor of bb0 (entry), so it's structurally
+    // unreachable — the node inside it must be reported as being in a dead branch.
+    use web_sitter::{IrNodeKind, NodeId};
+    const FN_ID: NodeId = 70;
+    const N_ENTRY: NodeId = 71;
+    const N_ORPHAN: NodeId = 72;
+
+    let fn_node = make_node(FN_ID, IrNodeKind::MethodDef, Some("orphan_fn"));
+    let n_entry = make_node_in_fn(N_ENTRY, IrNodeKind::Assign, Some("init"), FN_ID);
+    let n_orphan = make_node_in_fn(N_ORPHAN, IrNodeKind::Return, None, FN_ID);
+
+    let cpg = make_cpg_with_blocks(
+        vec![(FN_ID, fn_node), (N_ENTRY, n_entry), (N_ORPHAN, n_orphan)],
+        FN_ID,
+        vec![
+            ("bb0", vec![N_ENTRY], vec![]),   // entry, no successors
+            ("bb1", vec![N_ORPHAN], vec![]),  // never referenced by bb0 — unreachable
+        ],
+    );
+    let cfg = FunctionCfg::build_for_function(&cpg, FN_ID);
+    assert!(!cfg.node_in_dead_branch(N_ENTRY, &cpg));
+    assert!(cfg.node_in_dead_branch(N_ORPHAN, &cpg));
+}
+
 // ── loop_has_no_exit ──────────────────────────────────────────────────────────
 
 #[test]

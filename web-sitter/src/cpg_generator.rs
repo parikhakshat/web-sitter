@@ -220,7 +220,15 @@ pub fn generate_cpg_from_file(file_path: impl AsRef<Path>) -> Result<Cpg> {
 }
 
 pub fn decode_string_literal(raw_text: &str) -> (String, u32) {
-    let mut text = raw_text.to_string();
+    // Strip a leading language string-prefix before the quote check — e.g.
+    // Rust's `b"..."` (byte string) and `r"..."`/`r#"..."#` (raw string) share
+    // the same "string_literal" tree-sitter node kind as a plain `"..."`, so
+    // without this the prefix letter (and any raw-string hash delimiters) get
+    // counted as literal content instead of being recognized as the quote
+    // boundary. C/C++/Java string literals never carry such a prefix, so this
+    // is a no-op for them (`prefix_len` stays 0).
+    let prefix_len = raw_text.chars().take_while(|c| c.is_ascii_alphabetic()).count();
+    let mut text = raw_text[prefix_len..].trim_matches('#').to_string();
     if text.starts_with('"') && text.ends_with('"') && text.len() >= 2 {
         text = text[1..text.len() - 1].to_string();
     }
@@ -587,7 +595,16 @@ pub(crate) fn get_node_graph_artifacts(
                 }
             }
 
-            let argument_count = if matches!(node.kind(), "call_expression" | "call") {
+            let argument_count = if matches!(
+                node.kind(),
+                // C/C++/Go/JS/TS/Rust free-function calls, and Python's "call".
+                "call_expression" | "call"
+                // Java method calls (`obj.method(...)` / `method(...)`).
+                | "method_invocation"
+                // Rust method calls (`obj.method(...)`) — a distinct grammar node
+                // from Rust's own "call_expression" (free-function/tuple-struct calls).
+                | "method_call_expression"
+            ) {
                 let mut count = None;
                 let mut j: usize = 0;
                 while j < node.child_count() {
@@ -622,6 +639,26 @@ pub(crate) fn get_node_graph_artifacts(
                             array_size = text.parse::<i64>().ok();
                             if array_size.is_none() {
                                 array_size_expr = Some(text);
+                            }
+                            break;
+                        }
+                    }
+                    j += 1;
+                }
+            } else if node.kind() == "new_expression" {
+                // `new T[expr]` — the array-size expression lives one level down,
+                // inside a `new_declarator` child (whose own text is the bracketed
+                // `[expr]`, so its size is the *child* node's text, not its own).
+                let mut j: usize = 0;
+                while j < node.child_count() {
+                    if let Some(child) = node.child(j as u32) {
+                        if child.kind() == "new_declarator" {
+                            if let Some(size_node) = child.named_child(0) {
+                                let text = size_node.utf8_text(source).unwrap_or_default().to_string();
+                                array_size = text.parse::<i64>().ok();
+                                if array_size.is_none() {
+                                    array_size_expr = Some(text);
+                                }
                             }
                             break;
                         }
@@ -1251,6 +1288,37 @@ pub(crate) fn enrich_cpp_metadata(cpg: &mut crate::Cpg) {
         None
     }
 
+    // Full nested-qualified namespace path for a `namespace_definition` node —
+    // e.g. "outer::inner" for `namespace outer { namespace inner { ... } }` —
+    // built by walking up `parent_id` and collecting every enclosing
+    // `namespace_definition`'s own (single-level) name, innermost last.
+    fn namespace_qualified_path(
+        ast: &BTreeMap<NodeId, AstNode>,
+        node_id: NodeId,
+    ) -> Option<String> {
+        let mut parts: Vec<String> = Vec::new();
+        let mut cur = node_id;
+        let mut steps = 0usize;
+        loop {
+            steps += 1;
+            if steps > 64 {
+                break; // guard against malformed parent chains
+            }
+            let node = ast.get(&cur)?;
+            if node.node_type == "namespace_definition" {
+                if let Some(name) = namespace_name_from_node(ast, cur) {
+                    parts.push(name);
+                }
+            }
+            match node.parent_id {
+                Some(p) if p != cur => cur = p,
+                _ => break,
+            }
+        }
+        parts.reverse();
+        if parts.is_empty() { None } else { Some(parts.join("::")) }
+    }
+
     // ── Detect constructor/destructor via AST node types (not text) ────────────
     // Returns (is_constructor, is_destructor) for a function_definition node.
     fn detect_ctor_dtor(ast: &BTreeMap<NodeId, AstNode>, fn_def_id: NodeId) -> (bool, bool) {
@@ -1313,14 +1381,26 @@ pub(crate) fn enrich_cpp_metadata(cpg: &mut crate::Cpg) {
             return false;
         };
         // AST-based check: look for virtual_specifier child or child with text "virtual".
+        // `override`/`final` are also parsed as `virtual_specifier` nodes by
+        // tree-sitter-cpp, but — unlike the explicit `virtual` keyword, which sits
+        // directly on `function_definition` — they're nested one level deeper as a
+        // trailing child of the `function_declarator`, so a direct-children-only
+        // check misses every override that doesn't repeat `virtual` explicitly
+        // (the common style, since `override` alone already implies virtual).
         let has_virtual_child = fn_node.children.iter().any(|&cid| {
-            ast.get(&cid)
-                .map(|c| {
-                    c.node_type == "virtual_specifier"
-                        || c.node_type == "storage_class_specifier"
-                        || c.text.as_deref() == Some("virtual")
-                })
-                .unwrap_or(false)
+            let Some(c) = ast.get(&cid) else { return false };
+            if c.node_type == "virtual_specifier"
+                || c.node_type == "storage_class_specifier"
+                || c.text.as_deref() == Some("virtual")
+            {
+                return true;
+            }
+            if c.node_type == "function_declarator" {
+                return c.children.iter().any(|&gcid| {
+                    ast.get(&gcid).map(|g| g.node_type == "virtual_specifier").unwrap_or(false)
+                });
+            }
+            false
         });
         if has_virtual_child {
             return true;
@@ -1407,6 +1487,22 @@ pub(crate) fn enrich_cpp_metadata(cpg: &mut crate::Cpg) {
         .filter_map(|(id, _)| namespace_name_from_node(ast, *id).map(|name| (*id, name)))
         .collect();
 
+    // Same namespace_definition nodes, but keyed by their FULL nested-qualified
+    // path ("outer::inner") instead of just their own single-level name — used
+    // below to tag descendant function/declaration nodes with the complete
+    // enclosing-namespace context. Sorted by NodeId descending (= innermost
+    // first, since this AST's pre-order DFS always assigns a namespace's own
+    // node a smaller id than anything nested inside it) so the first-wins
+    // `.or_insert_with` in the tagging walk below lets the innermost, most
+    // specific namespace claim its own descendants before an enclosing
+    // namespace's broader subtree walk could otherwise flatten them to just
+    // its own (less specific) name.
+    let mut namespace_nodes_qualified: Vec<(NodeId, String)> = namespace_nodes
+        .iter()
+        .filter_map(|&(id, _)| namespace_qualified_path(ast, id).map(|path| (id, path)))
+        .collect();
+    namespace_nodes_qualified.sort_by(|a, b| b.0.cmp(&a.0));
+
     // Walk all descendants; only record context for function_definition/declaration nodes
     // in the side-table (write to AstNode for backward compat for all nodes).
     for (class_id, class_name) in &class_nodes {
@@ -1427,7 +1523,7 @@ pub(crate) fn enrich_cpp_metadata(cpg: &mut crate::Cpg) {
         }
     }
 
-    for (ns_id, ns_name) in &namespace_nodes {
+    for (ns_id, ns_qualified_name) in &namespace_nodes_qualified {
         let mut stack = vec![*ns_id];
         let mut visited = std::collections::HashSet::new();
         while let Some(nid) = stack.pop() {
@@ -1437,7 +1533,7 @@ pub(crate) fn enrich_cpp_metadata(cpg: &mut crate::Cpg) {
             if nid != *ns_id {
                 namespace_contexts
                     .entry(nid)
-                    .or_insert_with(|| ns_name.clone());
+                    .or_insert_with(|| ns_qualified_name.clone());
             }
             if let Some(node) = ast.get(&nid) {
                 stack.extend(node.children.iter().copied());

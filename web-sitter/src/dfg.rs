@@ -313,6 +313,17 @@ fn build_call_graph_impl(
                 function_name_to_id.entry(qualified).or_insert(node_id);
             }
 
+            // Same for enclosing namespace context, so `math::square()` calls to
+            // a function defined inline inside `namespace math { ... }` resolve
+            // to a `callee_id`, not just a name match — `get_func_def_qualified_name`
+            // above only reconstructs qualification from syntax on an out-of-line
+            // definition (`void math::square(...)`), which an in-namespace-block
+            // definition never has.
+            if let Some(ns_ctx) = graph.get(&node_id).and_then(|n| n.namespace.clone()) {
+                let qualified = format!("{}::{}", ns_ctx, name);
+                function_name_to_id.entry(qualified).or_insert(node_id);
+            }
+
             call_graph.entry(node_id).or_insert_with(|| CallGraphEntry {
                 name,
                 calls: vec![],
@@ -2184,6 +2195,13 @@ fn build_dataflow_impl(
         include_globals,
         &function_map,
     );
+    add_dealloc_edges(
+        graph,
+        &mut edges,
+        affected_function_ids,
+        include_globals,
+        &function_map,
+    );
     add_return_flow_edges(
         graph,
         &mut edges,
@@ -3536,6 +3554,26 @@ fn add_interprocedural_edges(
     let mut function_name_to_id = BTreeMap::<String, NodeId>::new();
     for (fid, entry) in &call_graph {
         function_name_to_id.insert(entry.name.clone(), *fid);
+        // Also register the same namespace/class-qualified keys that
+        // `build_call_graph_impl` uses internally to resolve `callee_id` — this
+        // map is rebuilt from scratch here (short names only) rather than reused,
+        // so without this a namespace- or class-qualified call like
+        // `math::square(y)` or `Foo::bar(y)` would resolve its `callee_id` in the
+        // call graph but still fail this lookup and get misclassified as an
+        // unresolved cross-file call, silently dropping the arg→param DFG edge.
+        if let Some(class_ctx) = graph.get(fid).and_then(|n| n.class_context.clone()) {
+            function_name_to_id
+                .entry(format!("{}::{}", class_ctx, entry.name))
+                .or_insert(*fid);
+        }
+        if let Some(ns_ctx) = graph.get(fid).and_then(|n| n.namespace.clone()) {
+            function_name_to_id
+                .entry(format!("{}::{}", ns_ctx, entry.name))
+                .or_insert(*fid);
+        }
+        if let Some(qname) = get_func_def_qualified_name(graph, *fid) {
+            function_name_to_id.entry(qname).or_insert(*fid);
+        }
     }
 
     // Precompute function_id → sorted param node ids once (O(n_nodes)) so the
@@ -3756,6 +3794,41 @@ fn add_points_to_edges(
                 lhs_var.name,
                 "POINTS_TO",
             );
+        }
+    }
+}
+
+/// For every `delete_expression` (`delete p` / `delete[] p`), emit a DEALLOC
+/// edge from the deleted pointer's use-site identifier to the `delete_expression`
+/// node itself. This makes the delete site a first-class DFG anchor — reachable
+/// (like a `free(p)` `Call` node) from whatever allocation `p` flowed from, via
+/// the pointer's ordinary REACHING_DEF chain plus this final edge — so queries
+/// can treat `delete`/`delete[]` as a free site the same way they already treat
+/// `free()`/`operator delete` calls, instead of `delete_expression` being just
+/// another opaque statement with no dataflow anchor of its own.
+fn add_dealloc_edges(
+    graph: &BTreeMap<NodeId, AstNode>,
+    edges: &mut Vec<DataflowEdge>,
+    affected_function_ids: Option<&BTreeSet<NodeId>>,
+    include_globals: bool,
+    function_map: &BTreeMap<NodeId, NodeId>,
+) {
+    for (&node_id, node) in graph {
+        if node.kind != IrNodeKind::DeleteExpr {
+            continue;
+        }
+        if !node_in_scope(node_id, function_map, affected_function_ids, include_globals) {
+            continue;
+        }
+        // `delete p` / `delete[] p` — the deleted pointer is a direct identifier
+        // child (tree-sitter-cpp doesn't wrap it in any intermediate node).
+        let operand = node.children.iter().find_map(|&cid| {
+            let c = graph.get(&cid)?;
+            matches!(c.node_type.as_str(), "identifier" | "field_identifier").then_some((cid, c))
+        });
+        if let Some((operand_id, operand_node)) = operand {
+            let var_name = operand_node.text.clone().unwrap_or_default();
+            push_edge(edges, operand_id, node_id, var_name, "DEALLOC");
         }
     }
 }

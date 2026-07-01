@@ -463,16 +463,7 @@ impl<'a> RuleRunner<'a> {
 
             CfgPredicate::InDeadBranch { node } => {
                 let Some(n) = env.get_node(node) else { return false };
-                let Some(ir) = self.ctx.cpg.ast.get(&n) else { return false };
-                let Some(fn_id) = ir.function_id else { return false };
-                let Some(cfg) = self.ctx.cfg_cache.get(&fn_id) else { return false };
-                // Find any node in the entry block to use as origin
-                let entry_node = cfg.node_to_block.iter()
-                    .find_map(|(&nid, &bid)| if bid == cfg.entry { Some(nid) } else { None });
-                match entry_node {
-                    Some(en) => !cfg.feasible_reaches(en, n, self.ctx.cpg),
-                    None => false,
-                }
+                self.with_cfg_for_node(n, |cfg| cfg.node_in_dead_branch(n, self.ctx.cpg))
             }
         }
     }

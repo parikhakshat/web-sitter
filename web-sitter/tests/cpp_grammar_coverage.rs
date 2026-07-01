@@ -5,12 +5,10 @@
 //!   2. CFG structural validity (no dangling successor references)
 //!   3. DFG structural validity (no dangling node IDs)
 //!   4. A semantic property specific to that node type
-//!
-//! Tests marked "Phase 2" will fail until the corresponding CPG fixes land.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use web_sitter::{Cpg, NodeId};
+use web_sitter::{Cpg, FunctionKind, IrNodeKind, NodeId};
 use web_sitter::{
     CpgGenerator, GraphBuildOptions, IncrementalCpgGenerator, SourceLanguage, compute_edit,
 };
@@ -95,7 +93,6 @@ fn field_initializer_list_no_crash() {
 
 #[test]
 fn field_initializer_list_dfg_edges() {
-    // Phase 2 target: DFG should have edges from constructor params to field identifiers.
     let src = r#"
         struct Point {
             int x;
@@ -116,12 +113,71 @@ fn field_initializer_list_dfg_edges() {
         !ctors.is_empty(),
         "Point(int,int) should be flagged as constructor"
     );
-    // There should be DFG edges (params are used in the initializer)
-    let edge_count = cpg.dataflow.edges.len();
-    assert!(
-        edge_count > 0,
-        "member initializer list should produce DFG edges"
-    );
+
+    // DFG should have a real edge from each constructor param to the field
+    // identifier it initializes: `px` -> `x`, `py` -> `y` — not just "some
+    // edges exist somewhere".
+    // The `parameter_declaration` (ParamDef) node itself carries no DFG edges —
+    // those live on its nested `identifier` leaf child (the actual def site
+    // the DFG builder wires REACHING_DEF edges from), so resolve to that.
+    let param_identifier = |param_name: &str| -> NodeId {
+        let param_id = cpg
+            .ast
+            .iter()
+            .find(|(_, n)| n.kind == IrNodeKind::ParamDef && n.name.as_deref() == Some(param_name))
+            .map(|(&id, _)| id)
+            .unwrap_or_else(|| panic!("{param_name} ParamDef not found"));
+        cpg.ast[&param_id]
+            .children
+            .iter()
+            .find_map(|&cid| {
+                let c = cpg.ast.get(&cid)?;
+                (c.node_type == "identifier" && c.text.as_deref() == Some(param_name)).then_some(cid)
+            })
+            .unwrap_or_else(|| panic!("{param_name} identifier leaf not found"))
+    };
+    let px_id = param_identifier("px");
+    let py_id = param_identifier("py");
+    // `field_identifier` covers both the member declaration (`int x;`) and the
+    // initializer target (`x(px)`) — text-match alone is ambiguous between the
+    // two, so also require the parent to be the `field_initializer` node.
+    let field_init_target = |field_name: &str| -> NodeId {
+        cpg.ast
+            .iter()
+            .find(|(_, n)| {
+                n.node_type == "field_identifier"
+                    && n.text.as_deref() == Some(field_name)
+                    && n.parent_id
+                        .and_then(|pid| cpg.ast.get(&pid))
+                        .map(|p| p.node_type == "field_initializer")
+                        .unwrap_or(false)
+            })
+            .map(|(&id, _)| id)
+            .unwrap_or_else(|| panic!("{field_name} field_initializer target not found"))
+    };
+    let x_field_id = field_init_target("x");
+    let y_field_id = field_init_target("y");
+
+    let reaches = |from: NodeId, to: NodeId| -> bool {
+        let mut visited: HashSet<NodeId> = HashSet::from([from]);
+        let mut queue: std::collections::VecDeque<NodeId> = std::collections::VecDeque::from([from]);
+        while let Some(cur) = queue.pop_front() {
+            if cur == to {
+                return true;
+            }
+            for edge in &cpg.dataflow.edges {
+                if edge.source == cur && visited.insert(edge.destination) {
+                    queue.push_back(edge.destination);
+                }
+            }
+        }
+        false
+    };
+
+    assert!(reaches(px_id, x_field_id), "constructor param `px` should dataflow-reach field `x` through the initializer list");
+    assert!(reaches(py_id, y_field_id), "constructor param `py` should dataflow-reach field `y` through the initializer list");
+    assert!(!reaches(px_id, y_field_id), "`px` must not spuriously reach the unrelated field `y`");
+    assert!(!reaches(py_id, x_field_id), "`py` must not spuriously reach the unrelated field `x`");
 }
 
 #[test]
@@ -283,7 +339,6 @@ fn operator_overload_parsed_as_function() {
 
 #[test]
 fn operator_overload_in_callgraph() {
-    // Phase 2 target: operator overloads should appear in the call graph with their name
     let src = r#"
         struct MyStr {
             const char* buf;
@@ -295,15 +350,64 @@ fn operator_overload_in_callgraph() {
     let cpg = cpp_cpg_full_text(src);
     assert_cfg_valid(&cpg);
     assert_dfg_valid(&cpg);
-    // The call graph should have entries for functions in the source
     assert!(!cpg.call_graph.is_empty(), "call graph should be non-empty");
-    // operator+ should appear as a defined function in the call graph
     let cg_names: Vec<_> = cpg.call_graph.values().map(|e| e.name.as_str()).collect();
     assert!(
         cg_names
             .iter()
             .any(|n| n.contains("operator+") || n.contains("concat")),
         "operator+ or concat should appear in call graph, got: {cg_names:?}"
+    );
+
+    // `a + b` in `concat` must be resolved as an actual invocation of
+    // `MyStr::operator+`, not left as an opaque binary_expression the call
+    // graph never sees — tree-sitter-cpp parses `a + b` as a plain
+    // binary_expression regardless of overloading, so this has to be inferred
+    // from `a`'s declared type, not read off the parse tree directly.
+    let operator_plus_id = cpg
+        .ast
+        .iter()
+        .find(|(_, n)| n.kind == IrNodeKind::MethodDef && n.name.as_deref() == Some("operator+"))
+        .map(|(&id, _)| id)
+        .expect("operator+ MethodDef should exist");
+    let concat_entry = cpg.call_graph.values().find(|e| e.name == "concat").expect("concat call-graph entry");
+    let op_calls: Vec<_> = concat_entry.calls.iter().filter(|c| c.callee == "operator+").collect();
+    assert_eq!(op_calls.len(), 1, "concat's `a + b` should appear as exactly one operator+ call, got {op_calls:?}");
+    assert_eq!(op_calls[0].callee_id, Some(operator_plus_id), "a + b should resolve callee_id to MyStr::operator+");
+    assert_eq!(op_calls[0].callee_kind, FunctionKind::Internal);
+
+    // The RHS operand `b` should dataflow into operator+'s own parameter
+    // (`other`), the same way a normal call's argument flows to its param.
+    let b_id = cpg
+        .ast
+        .iter()
+        .find(|(_, n)| n.node_type == "identifier" && n.text.as_deref() == Some("b") && n.parent_id
+            .and_then(|pid| cpg.ast.get(&pid))
+            .map(|p| p.node_type == "binary_expression")
+            .unwrap_or(false))
+        .map(|(&id, _)| id)
+        .expect("`b` operand identifier in `a + b`");
+    let other_param_id = cpg
+        .ast
+        .iter()
+        .find(|(_, n)| n.kind == IrNodeKind::ParamDef && n.name.as_deref() == Some("other") && n.function_id == Some(operator_plus_id))
+        .map(|(&id, _)| id)
+        .expect("operator+'s `other` ParamDef");
+    let other_identifier = cpg.ast[&other_param_id]
+        .children
+        .iter()
+        .find_map(|&cid| {
+            let c = cpg.ast.get(&cid)?;
+            (c.node_type == "reference_declarator" || c.node_type == "identifier").then(|| {
+                if c.node_type == "identifier" { cid } else {
+                    *c.children.iter().find(|&&gcid| cpg.ast.get(&gcid).map(|g| g.node_type == "identifier").unwrap_or(false)).unwrap()
+                }
+            })
+        })
+        .expect("other's identifier leaf");
+    assert!(
+        cpg.dataflow.edges.iter().any(|e| e.source == b_id && e.destination == other_identifier),
+        "`b` should have a DFG edge into operator+'s `other` parameter"
     );
 }
 
@@ -348,7 +452,12 @@ fn explicit_object_parameter_no_crash() {
 
 #[test]
 fn explicit_object_parameter_dfg() {
-    // Phase 2 target: deducing-this param should be tracked in DFG like a normal param
+    // Note: this project's pinned tree-sitter-cpp (0.23.4) doesn't parse C++23
+    // deducing-this syntax cleanly — `this Counter& self` produces an ERROR
+    // node for the `Counter&` part (a grammar-level limitation, not something
+    // fixable from CPG-generation code without patching/upgrading the
+    // grammar). Despite that, the `self` identifier itself still parses
+    // correctly and should be tracked exactly like an ordinary parameter.
     let src = r#"
         struct Counter {
             int count;
@@ -366,13 +475,93 @@ fn explicit_object_parameter_dfg() {
     let cpg = cpp_cpg(src);
     assert_cfg_valid(&cpg);
     assert_dfg_valid(&cpg);
-    // Methods should have class_context set
+
+    // Both explicit-object-parameter methods should have class_context set.
     let methods: Vec<_> = cpg
         .ast
         .values()
         .filter(|n| n.node_type == "function_definition" && n.class_context.is_some())
         .collect();
     assert!(!methods.is_empty(), "methods should have class_context");
+
+    // `self` should be a real ParamDef (not swallowed by the grammar's ERROR
+    // recovery), scoped to its own class.
+    let self_params: Vec<_> = cpg
+        .ast
+        .values()
+        .filter(|n| n.kind == IrNodeKind::ParamDef && n.name.as_deref() == Some("self"))
+        .collect();
+    assert_eq!(self_params.len(), 2, "both increment and get_count should have a `self` ParamDef");
+    for p in &self_params {
+        assert_eq!(p.class_context.as_deref(), Some("Counter"), "self's class_context should be Counter");
+    }
+
+    // `self` must actually participate in DFG like a normal parameter: reading
+    // `self.count` in the body should carry a REACHING_DEF edge back to the
+    // `self` parameter's own declaration site, the same way any other param
+    // flows to its uses.
+    let get_count_id = cpg
+        .ast
+        .iter()
+        .find(|(_, n)| n.node_type == "function_definition" && n.name.as_deref() == Some("get_count"))
+        .map(|(&id, _)| id)
+        .expect("get_count MethodDef");
+    let self_def_id = cpg.ast[&get_count_id]
+        .children
+        .iter()
+        .find_map(|&cid| {
+            let c = cpg.ast.get(&cid)?;
+            if c.node_type != "function_declarator" {
+                return None;
+            }
+            let params = field_declarator_params(&cpg, cid)?;
+            params.children.iter().find_map(|&pid| {
+                find_identifier_named(&cpg, pid, "self")
+            })
+        })
+        .expect("self declaration identifier in get_count's param list");
+
+    let self_use_in_body = cpg
+        .ast
+        .iter()
+        .find(|(_, n)| {
+            n.node_type == "identifier"
+                && n.text.as_deref() == Some("self")
+                && n.function_id == Some(get_count_id)
+                && n.parent_id
+                    .and_then(|pid| cpg.ast.get(&pid))
+                    .map(|p| p.node_type == "field_expression")
+                    .unwrap_or(false)
+        })
+        .map(|(&id, _)| id)
+        .expect("self used in `return self.count;`");
+
+    let reaches_directly = cpg
+        .dataflow
+        .edges
+        .iter()
+        .any(|e| e.source == self_def_id && e.destination == self_use_in_body);
+    assert!(
+        reaches_directly,
+        "self ParamDef ({self_def_id}) should have a direct REACHING_DEF edge to its use in the method body ({self_use_in_body})"
+    );
+}
+
+/// The `parameter_list` child of a `function_declarator` node.
+fn field_declarator_params<'a>(cpg: &'a Cpg, function_declarator_id: NodeId) -> Option<&'a web_sitter::AstNode> {
+    cpg.ast[&function_declarator_id].children.iter().find_map(|&cid| {
+        let c = cpg.ast.get(&cid)?;
+        (c.node_type == "parameter_list").then_some(c)
+    })
+}
+
+/// DFS for an `identifier` descendant of `root` whose text matches `name`.
+fn find_identifier_named(cpg: &Cpg, root: NodeId, name: &str) -> Option<NodeId> {
+    let node = cpg.ast.get(&root)?;
+    if node.node_type == "identifier" && node.text.as_deref() == Some(name) {
+        return Some(root);
+    }
+    node.children.iter().find_map(|&cid| find_identifier_named(cpg, cid, name))
 }
 
 // ── module_declaration / export_declaration / import_declaration ──────────────
@@ -490,7 +679,6 @@ fn template_method_in_namespace_qualified_name() {
 
 #[test]
 fn qualified_identifier_call_resolves() {
-    // Phase 2 target: std::string::append call should resolve to qualified name
     let src = r#"
         namespace std {
             struct string {
@@ -511,12 +699,42 @@ fn qualified_identifier_call_resolves() {
     let cpg = cpp_cpg_full_text(src);
     assert_cfg_valid(&cpg);
     assert_dfg_valid(&cpg);
-    // call_expression nodes for append should be present
+
     let calls: Vec<_> = nodes_of_type(&cpg, "call_expression");
     assert!(
         !calls.is_empty(),
         "call_expression nodes should be present for qualified calls"
     );
+
+    // `cmd.append(...)` should resolve past the call-graph name match all the
+    // way to `append`'s own MethodDef inside `std::string`, not just be
+    // recorded as an unresolved/external call by name.
+    let append_id = cpg
+        .ast
+        .iter()
+        .find(|(_, n)| n.node_type == "function_definition" && n.name.as_deref() == Some("append"))
+        .map(|(&id, _)| id)
+        .expect("append MethodDef should exist");
+    let caller = cpg
+        .call_graph
+        .values()
+        .find(|e| e.name == "test_qualified_call")
+        .expect("test_qualified_call call-graph entry");
+    let append_calls: Vec<_> = caller.calls.iter().filter(|c| c.callee == "append").collect();
+    assert_eq!(append_calls.len(), 2, "both cmd.append(...) call sites should be recorded, got {append_calls:?}");
+    for c in &append_calls {
+        assert_eq!(
+            c.callee_id,
+            Some(append_id),
+            "cmd.append(...) should resolve callee_id to append's own MethodDef, not stay unresolved"
+        );
+        assert_eq!(c.callee_kind, FunctionKind::Internal, "resolved call should be classified Internal, got {:?}", c.callee_kind);
+    }
+
+    // `dangerous_sink` has no local definition, so it must stay unresolved —
+    // confirms resolution isn't just blindly marking everything Internal.
+    let sink_call = caller.calls.iter().find(|c| c.callee == "dangerous_sink").expect("dangerous_sink call site");
+    assert_eq!(sink_call.callee_id, None, "dangerous_sink has no definition and must stay unresolved");
 }
 
 #[test]
@@ -569,7 +787,6 @@ fn new_expression_no_crash() {
 
 #[test]
 fn new_expression_alloc_tracked() {
-    // Phase 2 target: new_expression nodes should be tracked in call graph / alloc sites
     let src = r#"
         struct Buffer {
             char* data;
@@ -578,6 +795,7 @@ fn new_expression_alloc_tracked() {
         Buffer* alloc_buffer(int n) {
             Buffer* b = new Buffer;
             b->data = new char[n];
+            int* fixed = new int[16];
             b->size = n;
             return b;
         }
@@ -585,12 +803,35 @@ fn new_expression_alloc_tracked() {
     let cpg = cpp_cpg(src);
     assert_cfg_valid(&cpg);
     assert_dfg_valid(&cpg);
-    // new_expression nodes should appear in AST
+
+    // `new_expression` nodes must be classified as NewExpr and participate in
+    // the call graph as an allocation site (`is_call()` already covers
+    // NewExpr, so this locks that in rather than re-deriving it from scratch).
     let new_nodes: Vec<_> = nodes_of_type(&cpg, "new_expression");
+    assert_eq!(new_nodes.len(), 3, "expected 3 new_expression nodes (Buffer, char[n], int[16])");
+    for (_, n) in &new_nodes {
+        assert_eq!(n.kind, IrNodeKind::NewExpr);
+        assert!(n.is_call(), "NewExpr must be treated as a call site for the call graph");
+    }
+    let alloc_buffer_calls: Vec<&str> = cpg
+        .call_graph
+        .values()
+        .find(|e| e.name == "alloc_buffer")
+        .map(|e| e.calls.iter().map(|c| c.callee.as_str()).collect())
+        .unwrap_or_default();
     assert!(
-        !new_nodes.is_empty(),
-        "new_expression nodes should appear in AST"
+        alloc_buffer_calls.contains(&"Buffer"),
+        "new Buffer should appear as a call-graph allocation site, got: {alloc_buffer_calls:?}"
     );
+
+    // Array-form `new T[expr]` allocation sizes must be tracked the same way
+    // C's `array_declarator` sizes are — constant sizes as `array_size`,
+    // symbolic ones as `array_size_expr` — so the size tracker can reason
+    // about `new[]` buffers exactly like C arrays.
+    let symbolic = new_nodes.iter().find(|(_, n)| n.text.as_deref() == Some("new char[n]")).unwrap().1;
+    assert_eq!(symbolic.array_size_expr.as_deref(), Some("n"), "new char[n] should record array_size_expr == \"n\"");
+    let constant = new_nodes.iter().find(|(_, n)| n.text.as_deref() == Some("new int[16]")).unwrap().1;
+    assert_eq!(constant.array_size, Some(16), "new int[16] should record array_size == 16");
 }
 
 #[test]
@@ -608,22 +849,77 @@ fn delete_expression_no_crash() {
 
 #[test]
 fn delete_expression_tracked() {
-    // Phase 2 target: delete_expression nodes should appear and be tracked as free sites
     let src = r#"
         struct Resource { int id; };
         void release(Resource* r, int* arr) {
             delete r;
             delete[] arr;
         }
+        void use_after_free_pattern() {
+            Resource* p = new Resource();
+            delete p;
+        }
     "#;
     let cpg = cpp_cpg(src);
     assert_cfg_valid(&cpg);
     assert_dfg_valid(&cpg);
-    // delete_expression nodes should appear in AST
+
     let delete_nodes: Vec<_> = nodes_of_type(&cpg, "delete_expression");
+    assert_eq!(delete_nodes.len(), 3, "expected 3 delete_expression nodes");
+    for (_, n) in &delete_nodes {
+        assert_eq!(n.kind, IrNodeKind::DeleteExpr);
+    }
+
+    // Each delete_expression must be a first-class DFG anchor — a DEALLOC edge
+    // landing ON the delete_expression node itself, sourced from the deleted
+    // pointer's use-site identifier — the same way a `free(p)` Call node is
+    // reachable/anchorable in the C UAF/double-free patterns.
+    let delete_ids: HashSet<NodeId> = delete_nodes.iter().map(|&(&id, _)| id).collect();
+    let dealloc_edges: Vec<_> = cpg
+        .dataflow
+        .edges
+        .iter()
+        .filter(|e| e.edge_type == "DEALLOC" && delete_ids.contains(&e.destination))
+        .collect();
+    assert_eq!(
+        dealloc_edges.len(),
+        delete_nodes.len(),
+        "every delete_expression should have exactly one DEALLOC edge landing on it, got {dealloc_edges:?}"
+    );
+
+    // The allocation site should actually reach the matching delete site
+    // through the ordinary pointer dataflow chain plus the new DEALLOC edge —
+    // proving this is real free-site tracking, not an edge dangling in
+    // isolation. `new Resource()` -> `p` (assignment) -> `delete p` (DEALLOC).
+    let new_id = nodes_of_type(&cpg, "new_expression")
+        .into_iter()
+        .find(|(_, n)| n.text.as_deref() == Some("new Resource()"))
+        .map(|(&id, _)| id)
+        .expect("new Resource() should be present");
+    let uaf_delete_id = delete_nodes
+        .iter()
+        .find(|(_, n)| n.text.as_deref() == Some("delete p"))
+        .map(|&(&id, _)| id)
+        .expect("delete p should be present");
+
+    // BFS forward from the allocation over the raw dataflow edges.
+    let mut visited: HashSet<NodeId> = HashSet::from([new_id]);
+    let mut queue: std::collections::VecDeque<NodeId> = std::collections::VecDeque::from([new_id]);
+    let mut reached_delete = false;
+    while let Some(cur) = queue.pop_front() {
+        if cur == uaf_delete_id {
+            reached_delete = true;
+            break;
+        }
+        for edge in &cpg.dataflow.edges {
+            if edge.source == cur && visited.insert(edge.destination) {
+                queue.push_back(edge.destination);
+            }
+        }
+    }
     assert!(
-        !delete_nodes.is_empty(),
-        "delete_expression nodes should appear in AST"
+        reached_delete,
+        "new Resource() should dataflow-reach its `delete p` free site"
     );
 }
 
@@ -719,7 +1015,6 @@ fn virtual_method_flagged_in_base_and_override() {
 
 #[test]
 fn virtual_dispatch_call_edges() {
-    // Phase 2 target: call graph should include CHA edges to override implementations
     let src = r#"
         class Shape {
         public:
@@ -738,19 +1033,52 @@ fn virtual_dispatch_call_edges() {
             Rect(float w, float h) : w(w), h(h) {}
             float area() override { return w * h; }
         };
+        class Square : public Rect {
+        public:
+            Square(float s) : Rect(s, s) {}
+        };
         float compute(Shape* s) {
-            return s->area();  // virtual dispatch — should see Circle::area + Rect::area in CG
+            return s->area();  // virtual dispatch — should see Shape/Circle/Rect::area (+ Square via inherited Rect::area) in CG
         }
     "#;
     let cpg = cpp_cpg(src);
     assert_cfg_valid(&cpg);
     assert_dfg_valid(&cpg);
-    // All override implementations should be in the call graph
     let cg_names: Vec<_> = cpg.call_graph.values().map(|e| e.name.as_str()).collect();
     assert!(
         cg_names.iter().any(|n| n.contains("area")),
         "area implementations should appear in call graph, got: {cg_names:?}"
     );
+
+    // Real class-hierarchy analysis (CHA): `s->area()` through a `Shape*`
+    // must resolve to EVERY override reachable via the hierarchy — Shape's
+    // own definition, Circle::area, and Rect::area — not just whichever one
+    // the generic by-name call-graph resolution happened to pick first.
+    let area_ids_by_class: HashMap<&str, NodeId> = ["Shape", "Circle", "Rect"]
+        .iter()
+        .map(|&class_name| {
+            let id = cpg
+                .ast
+                .iter()
+                .find(|(_, n)| n.kind == IrNodeKind::MethodDef && n.name.as_deref() == Some("area") && n.class_context.as_deref() == Some(class_name))
+                .map(|(&id, _)| id)
+                .unwrap_or_else(|| panic!("{class_name}::area MethodDef not found"));
+            (class_name, id)
+        })
+        .collect();
+
+    let compute_entry = cpg.call_graph.values().find(|e| e.name == "compute").expect("compute call-graph entry");
+    let area_call_targets: HashSet<NodeId> = compute_entry.calls.iter().filter(|c| c.callee == "area").filter_map(|c| c.callee_id).collect();
+
+    for (class_name, method_id) in &area_ids_by_class {
+        assert!(
+            area_call_targets.contains(method_id),
+            "s->area() should include {class_name}::area ({method_id}) as a CHA target; got targets {area_call_targets:?}"
+        );
+    }
+    // Square doesn't override area() itself (inherits Rect::area), so it must
+    // not introduce a spurious 4th target beyond the 3 real definitions.
+    assert_eq!(area_call_targets.len(), 3, "expected exactly 3 CHA targets (Shape/Circle/Rect), got {area_call_targets:?}");
 }
 
 // ── lambda incremental update ─────────────────────────────────────────────────
@@ -778,16 +1106,36 @@ fn lambda_in_incremental_initial_parse() {
     );
 }
 
+/// `(node_type, text)` snapshot of `root` and every descendant, sorted for
+/// order-independent comparison — used to prove a subtree was reused as-is
+/// (untouched by an edit elsewhere), not rebuilt with fresh content.
+fn subtree_snapshot(cpg: &Cpg, root: NodeId) -> Vec<(String, Option<String>)> {
+    let mut out = Vec::new();
+    let mut stack = vec![root];
+    while let Some(id) = stack.pop() {
+        if let Some(n) = cpg.ast.get(&id) {
+            out.push((n.node_type.clone(), n.text.clone()));
+            stack.extend(n.children.iter().copied());
+        }
+    }
+    out.sort();
+    out
+}
+
 #[test]
 fn lambda_in_incremental_update() {
-    // Phase 2 target: editing a lambda body should trigger incremental rebuild of that lambda
+    // A sibling function untouched by the edit, so we can verify the update
+    // is actually scoped rather than a full-file rebuild that happens to
+    // produce equivalent-looking output.
     let src1 = r#"
+        int helper(int a) { return a + 1; }
         int compute() {
             auto fn = [](int x) { return x * 2; };
             return fn(5);
         }
     "#;
     let src2 = r#"
+        int helper(int a) { return a + 1; }
         int compute() {
             auto fn = [](int x) { return x * 3; };
             return fn(5);
@@ -798,25 +1146,61 @@ fn lambda_in_incremental_update() {
         GraphBuildOptions::default(),
     )
     .expect("IncrementalCpgGenerator init");
-    inc.parse_initial(src1.as_bytes()).expect("initial parse");
+    let initial = inc.parse_initial(src1.as_bytes()).expect("initial parse");
+    let helper_id_before = initial
+        .ast
+        .iter()
+        .find(|(_, n)| n.node_type == "function_definition" && n.name.as_deref() == Some("helper"))
+        .map(|(&id, _)| id)
+        .expect("helper MethodDef before edit");
+    let helper_snapshot_before = subtree_snapshot(initial, helper_id_before);
+
     let edit = compute_edit(src1.as_bytes(), src2.as_bytes()).expect("compute_edit");
     let updated = inc.apply_edit(&edit, src2.as_bytes()).expect("apply_edit");
-    // After update, the AST should still be valid
-    assert!(
-        !updated.ast.is_empty(),
-        "AST must not be empty after lambda edit"
-    );
+
+    assert!(!updated.ast.is_empty(), "AST must not be empty after lambda edit");
     let ast_ids: HashSet<NodeId> = updated.ast.keys().copied().collect();
     for edge in &updated.dataflow.edges {
-        assert!(
-            ast_ids.contains(&edge.source),
-            "DFG edge source dangling after lambda edit"
-        );
-        assert!(
-            ast_ids.contains(&edge.destination),
-            "DFG edge dest dangling after lambda edit"
-        );
+        assert!(ast_ids.contains(&edge.source), "DFG edge source dangling after lambda edit");
+        assert!(ast_ids.contains(&edge.destination), "DFG edge dest dangling after lambda edit");
     }
+
+    // The edit must actually be reflected: the lambda body should now
+    // multiply by 3, not 2.
+    let lambda_body_text = updated
+        .ast
+        .values()
+        .find(|n| n.node_type == "lambda_expression")
+        .and_then(|n| n.text.clone())
+        .unwrap_or_default();
+    let full_fresh = cpp_cpg(src2);
+    let fresh_lambda_text = full_fresh
+        .ast
+        .values()
+        .find(|n| n.node_type == "lambda_expression")
+        .and_then(|n| n.text.clone())
+        .unwrap_or_default();
+    assert_eq!(
+        lambda_body_text, fresh_lambda_text,
+        "incrementally-updated lambda body should match a fresh parse of src2"
+    );
+
+    // The edit must be *scoped*: `helper`, entirely untouched by the diff,
+    // should keep the exact same NodeId with an identical subtree — proof
+    // that editing the lambda didn't trigger a whole-file rebuild that
+    // happens to reassign fresh ids to unrelated, unchanged code.
+    let helper_id_after = updated
+        .ast
+        .iter()
+        .find(|(_, n)| n.node_type == "function_definition" && n.name.as_deref() == Some("helper"))
+        .map(|(&id, _)| id)
+        .expect("helper MethodDef after edit");
+    assert_eq!(helper_id_after, helper_id_before, "helper's NodeId should be stable across an edit that doesn't touch it");
+    let helper_snapshot_after = subtree_snapshot(updated, helper_id_after);
+    assert_eq!(
+        helper_snapshot_before, helper_snapshot_after,
+        "helper's subtree should be byte-for-byte reused, not rebuilt, by an edit scoped to compute()'s lambda"
+    );
 }
 
 // ── structured_binding_declarator (complex) ───────────────────────────────────
