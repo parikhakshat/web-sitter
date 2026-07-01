@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::RwLock;
 use roaring::RoaringBitmap;
 use web_sitter::{BasicBlock, Cpg, IrNodeKind, NodeId};
+use web_profiler as prof;
 use crate::symbolic::{SymbolicEval, SymbolicValue};
 
 /// Unique identifier for a basic block within a function.
@@ -210,6 +212,13 @@ pub struct FunctionCfg {
     /// whose condition-field child lands in that block.  Used by feasible-path
     /// analysis to prune provably-dead edges.
     pub block_to_condition: HashMap<BlockId, NodeId>,
+    /// Memoized symbolic-pruned forward-reachable block sets, keyed by source
+    /// block. `feasible_reaches` (positive reachability) and `InDeadBranch`
+    /// (its negation, checked from the same `entry` source across every
+    /// candidate node in the function) would otherwise re-walk the CFG and
+    /// re-run `SymbolicEval` on every branch guard on every single call —
+    /// mirrors `DfgIndex::reach_cache`'s memoization of `reachable_from`.
+    feasible_reach_cache: RwLock<HashMap<BlockId, HashSet<BlockId>>>,
 }
 
 impl FunctionCfg {
@@ -246,6 +255,7 @@ impl FunctionCfg {
                 entry: 0,
                 exception_blocks: HashSet::new(),
                 block_to_condition: HashMap::new(),
+                feasible_reach_cache: RwLock::new(HashMap::new()),
             };
         }
 
@@ -351,7 +361,10 @@ impl FunctionCfg {
             }
         }
 
-        Self { succs, preds, node_to_block, dom, post_dom, reach, entry, exception_blocks, block_to_condition }
+        Self {
+            succs, preds, node_to_block, dom, post_dom, reach, entry, exception_blocks,
+            block_to_condition, feasible_reach_cache: RwLock::new(HashMap::new()),
+        }
     }
 
     /// True if node `a` dominates node `b` in this function's CFG.
@@ -500,16 +513,39 @@ impl FunctionCfg {
         ) else {
             return false;
         };
+        self.feasible_reachable_blocks(bf, cpg).contains(&bt)
+    }
+
+    /// True if `node` is unreachable from the function entry under symbolic
+    /// branch pruning — i.e. every path to it is provably dead. This is the
+    /// negation of `feasible_reaches(entry, node)`, but goes straight to the
+    /// entry block instead of the `O(|node_to_block|)` scan callers used to do
+    /// to find *some* node in the entry block first.
+    pub fn node_in_dead_branch(&self, node: NodeId, cpg: &Cpg) -> bool {
+        let Some(&block) = self.node_to_block.get(&node) else { return false };
+        !self.feasible_reachable_blocks(self.entry, cpg).contains(&block)
+    }
+
+    /// Symbolic-pruned forward-reachable block set from `from`, memoized in
+    /// `feasible_reach_cache` and reused across every query sharing the same
+    /// source block (in practice, `from == entry` for every `InDeadBranch`
+    /// check in a function, and repeated `CfgReachesFeasible` checks from the
+    /// same guard).
+    fn feasible_reachable_blocks(&self, from: BlockId, cpg: &Cpg) -> HashSet<BlockId> {
+        if let Ok(cache) = self.feasible_reach_cache.read() {
+            if let Some(set) = cache.get(&from) {
+                prof::cache_hit("cfg.feasible_reach_cache");
+                return set.clone();
+            }
+        }
+        prof::cache_miss("cfg.feasible_reach_cache");
 
         let mut visited = HashSet::new();
         let mut queue = VecDeque::new();
-        queue.push_back(bf);
-        visited.insert(bf);
+        queue.push_back(from);
+        visited.insert(from);
 
         while let Some(b) = queue.pop_front() {
-            if b == bt {
-                return true;
-            }
             let succs = &self.succs[b as usize];
             let live: Vec<BlockId> = if succs.len() == 2 {
                 if let Some(&cid) = self.block_to_condition.get(&b) {
@@ -535,7 +571,11 @@ impl FunctionCfg {
                 }
             }
         }
-        false
+
+        if let Ok(mut cache) = self.feasible_reach_cache.write() {
+            cache.insert(from, visited.clone());
+        }
+        visited
     }
 
     /// True if both nodes belong to this function's CFG (same function).
