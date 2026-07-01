@@ -1,0 +1,70 @@
+# Custom wrapper specifications for interprocedural_wrapper_test.c
+#
+# These rules teach the engine about the thin wrapper functions defined in the
+# test file so that CWE rules fire (or are suppressed) correctly for callers.
+#
+# Pattern: one dummy rule entry carrying all wrappers via the 'wrappers:' key.
+# The rule itself never fires (pattern matches a sentinel name that cannot
+# appear in any real code); its sole purpose is wrapper registration.
+
+rules:
+  - id: WRAPPER-TEST-ALIASES
+    cwe: 0
+    severity: info
+    message: "Internal: wrapper alias registration for interprocedural_wrapper_test.c"
+    rule:
+      type: syntax
+      pattern:
+        kind: call_expression
+        text: { equals: "__wrapper_test_sentinel__" }
+    wrappers:
+      # -----------------------------------------------------------------
+      # Memory allocation wrapper
+      # alloc_buf(n) → malloc(n) : single-param, returns heap pointer
+      # -----------------------------------------------------------------
+      - name: alloc_buf
+        kind: memory_wrapper
+        wraps: malloc
+
+      # -----------------------------------------------------------------
+      # Free wrappers
+      # free_ptr(p) frees its first (only) argument.
+      # free_second_param(sentinel, p) frees its second argument; the
+      # arg_mapping list positions -1 at index 0 (skip) and 0 at index 1
+      # meaning: wrapper arg 1 → stdlib free() arg 0.
+      # -----------------------------------------------------------------
+      - name: free_ptr
+        kind: alias
+        wraps: free
+
+      - name: free_second_param
+        kind: alias
+        wraps: free
+        arg_mapping: [-1, 0]
+
+      # -----------------------------------------------------------------
+      # Propagator wrapper
+      # dup_tainted(s) → strdup(s): taint flows from arg 0 to return value.
+      # -----------------------------------------------------------------
+      - name: dup_tainted
+        kind: propagator
+        wraps: strdup
+        flow:
+          src: [0]
+          dst: [-1]
+
+      - name: env_read
+        kind: propagator
+        wraps: getenv
+
+      - name: stdin_read
+        kind: propagator
+        wraps: fgets
+
+      - name: open_path
+        kind: alias
+        wraps: fopen
+
+      - name: unsafe_strcpy
+        kind: alias
+        wraps: strcpy

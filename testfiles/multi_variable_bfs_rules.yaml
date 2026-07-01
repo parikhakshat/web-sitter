@@ -1,0 +1,32 @@
+- id: TEST-DUAL-WRITE-CWE78
+  cwe: 78
+  description: "dual_write taints two output buffers (write_args)"
+  source:
+    kind: call_expression
+    text:
+      equals: dual_write
+    capture: source_call
+  write_args: [1, 2]
+  sink:
+    kind: call_expression
+    text:
+      in: [system, popen]
+    capture: sink_call
+  path_constraints:
+    sanitizers: [validate]
+
+- id: TEST-SINGLE-WRITE-CWE78
+  cwe: 78
+  description: "single_write taints one output buffer (write_args)"
+  source:
+    kind: call_expression
+    text:
+      equals: single_write
+    capture: source_call
+  write_args: [1]
+  sink:
+    kind: call_expression
+    text:
+      equals: system
+    capture: sink_call
+  path_constraints: {}
