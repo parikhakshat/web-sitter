@@ -313,6 +313,17 @@ fn build_call_graph_impl(
                 function_name_to_id.entry(qualified).or_insert(node_id);
             }
 
+            // Same for enclosing namespace context, so `math::square()` calls to
+            // a function defined inline inside `namespace math { ... }` resolve
+            // to a `callee_id`, not just a name match — `get_func_def_qualified_name`
+            // above only reconstructs qualification from syntax on an out-of-line
+            // definition (`void math::square(...)`), which an in-namespace-block
+            // definition never has.
+            if let Some(ns_ctx) = graph.get(&node_id).and_then(|n| n.namespace.clone()) {
+                let qualified = format!("{}::{}", ns_ctx, name);
+                function_name_to_id.entry(qualified).or_insert(node_id);
+            }
+
             call_graph.entry(node_id).or_insert_with(|| CallGraphEntry {
                 name,
                 calls: vec![],
@@ -3536,6 +3547,26 @@ fn add_interprocedural_edges(
     let mut function_name_to_id = BTreeMap::<String, NodeId>::new();
     for (fid, entry) in &call_graph {
         function_name_to_id.insert(entry.name.clone(), *fid);
+        // Also register the same namespace/class-qualified keys that
+        // `build_call_graph_impl` uses internally to resolve `callee_id` — this
+        // map is rebuilt from scratch here (short names only) rather than reused,
+        // so without this a namespace- or class-qualified call like
+        // `math::square(y)` or `Foo::bar(y)` would resolve its `callee_id` in the
+        // call graph but still fail this lookup and get misclassified as an
+        // unresolved cross-file call, silently dropping the arg→param DFG edge.
+        if let Some(class_ctx) = graph.get(fid).and_then(|n| n.class_context.clone()) {
+            function_name_to_id
+                .entry(format!("{}::{}", class_ctx, entry.name))
+                .or_insert(*fid);
+        }
+        if let Some(ns_ctx) = graph.get(fid).and_then(|n| n.namespace.clone()) {
+            function_name_to_id
+                .entry(format!("{}::{}", ns_ctx, entry.name))
+                .or_insert(*fid);
+        }
+        if let Some(qname) = get_func_def_qualified_name(graph, *fid) {
+            function_name_to_id.entry(qname).or_insert(*fid);
+        }
     }
 
     // Precompute function_id → sorted param node ids once (O(n_nodes)) so the
