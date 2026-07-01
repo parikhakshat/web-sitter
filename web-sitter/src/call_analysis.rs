@@ -201,23 +201,164 @@ pub(crate) fn enrich_call_graph_python(cpg: &mut Cpg) {
     }
 }
 
+/// Child of `node` tagged with tree-sitter field name `field`.
+fn field_child<'a>(
+    ast: &'a BTreeMap<NodeId, crate::AstNode>,
+    node: &'a crate::AstNode,
+    field: &str,
+) -> Option<(NodeId, &'a crate::AstNode)> {
+    for (i, &cid) in node.children.iter().enumerate() {
+        if node.field_names.get(i).and_then(|f| f.as_deref()) == Some(field) {
+            if let Some(c) = ast.get(&cid) {
+                return Some((cid, c));
+            }
+        }
+    }
+    None
+}
+
+/// True if `node` (a class member) declares — but does not necessarily
+/// define — `method_name` as `virtual`. Covers both a defining
+/// `function_definition` (`n.is_virtual`, set by `detect_virtual`) and a
+/// prototype-only member declaration (`field_declaration`, e.g.
+/// `virtual void speak();` with no body) which never becomes an
+/// `IrNodeKind::MethodDef` at all — `lift_kind` only classifies
+/// `function_definition` as `MethodDef`, so a header-style virtual
+/// declaration would otherwise be invisible to this check entirely.
+fn declares_virtual_method(ast: &BTreeMap<NodeId, crate::AstNode>, node: &crate::AstNode, method_name: &str) -> bool {
+    if node.kind == IrNodeKind::MethodDef {
+        return node.is_virtual == Some(true) && node.name.as_deref() == Some(method_name);
+    }
+    if node.node_type != "field_declaration" {
+        return false;
+    }
+    let is_virtual_text = node.text.as_deref().map(|t| t.trim_start().starts_with("virtual")).unwrap_or(false);
+    if !is_virtual_text {
+        return false;
+    }
+    // Find a `function_declarator` descendant whose own text is the plain
+    // method name (mirrors how `get_func_def_name`/probing elsewhere reads
+    // it), confirming this prototype is for `method_name` and not some other
+    // member (e.g. a field or a differently-named method) in the same
+    // `field_declaration_list`.
+    let mut stack: Vec<NodeId> = node.children.clone();
+    while let Some(id) = stack.pop() {
+        let Some(n) = ast.get(&id) else { continue };
+        if n.node_type == "function_declarator" {
+            if n.text.as_deref() == Some(method_name) {
+                return true;
+            }
+            // Pointer/reference-returning declarators wrap function_declarator
+            // one level deeper — keep descending instead of stopping here.
+        }
+        stack.extend(n.children.iter().copied());
+    }
+    false
+}
+
+/// True if `class_name` (or any of its transitive base classes, per
+/// `cpg.workspace.class_hierarchy`) declares a virtual method named
+/// `method_name` — the actual condition for dynamic dispatch through a
+/// pointer/reference statically typed as `class_name`.
+fn class_hierarchy_declares_virtual(
+    cpg: &Cpg,
+    class_name: &str,
+    method_name: &str,
+    visited: &mut std::collections::HashSet<String>,
+) -> bool {
+    if !visited.insert(class_name.to_string()) {
+        return false; // cycle guard (shouldn't happen for valid C++, but be safe)
+    }
+    let declares_here = cpg.ast.values().any(|n| {
+        n.class_context.as_deref() == Some(class_name) && declares_virtual_method(&cpg.ast, n, method_name)
+    });
+    if declares_here {
+        return true;
+    }
+    cpg.workspace
+        .class_hierarchy
+        .get(class_name)
+        .into_iter()
+        .flatten()
+        .any(|base| class_hierarchy_declares_virtual(cpg, base.trim(), method_name, visited))
+}
+
 pub(crate) fn enrich_call_graph_cpp(cpg: &mut Cpg) {
-    // Mark calls via pointer/reference on a class receiver as virtual dispatch candidates
-    // when the receiver type is in the class hierarchy as a base class.
-    let subtype_names: std::collections::HashSet<String> = cpg.workspace.class_hierarchy.keys().cloned().collect();
-    let call_ids: Vec<NodeId> = cpg.ast.iter()
-        .filter(|(_, n)| n.is_call() && n.class_context.is_some())
-        .filter(|(id, _)| {
-            cpg.cpp_metadata.get(id)
-                .and_then(|m| m.is_virtual)
-                .unwrap_or(false)
-                || cpg.ast.get(id).and_then(|n| n.class_context.as_deref())
-                    .map(|ctx| subtype_names.contains(ctx))
-                    .unwrap_or(false)
-        })
-        .map(|(id, _)| *id)
-        .collect();
-    for call_id in call_ids {
+    // Map (function_id, variable_name) -> declared class type name, from every
+    // ParamDef whose declared type is a user type (`type_identifier`, e.g.
+    // "Shape" in `Shape* s`) rather than a builtin (`primitive_type`). Pointer/
+    // reference declarators wrap the identifier separately from the type
+    // node, so the type node's own text is already the bare class name — no
+    // `*`/`&` stripping needed.
+    let mut declared_types: HashMap<(NodeId, String), String> = HashMap::new();
+    for node in cpg.ast.values() {
+        if node.kind != IrNodeKind::ParamDef {
+            continue;
+        }
+        let Some(fn_id) = node.function_id else { continue };
+        let Some(var_name) = node.name.clone() else { continue };
+        if let Some((_, type_node)) = field_child(&cpg.ast, node, "type") {
+            if type_node.node_type == "type_identifier" {
+                if let Some(type_name) = &type_node.text {
+                    declared_types.insert((fn_id, var_name), type_name.clone());
+                }
+            }
+        }
+    }
+
+    // For each call, resolve the receiver's declared static type:
+    // - `recv->method()` / `recv.method()` (a `field_expression` callee): the
+    //   receiver is the "argument" field child; if it's a simple identifier,
+    //   look it up in `declared_types` for the call's own enclosing function.
+    // - A bare `method()` (or `this->method()`) called from inside a class's
+    //   own method body: the implicit receiver's static type is that
+    //   enclosing class itself (`class_context`).
+    let mut virtual_dispatch_calls: Vec<NodeId> = Vec::new();
+    for (&call_id, call_node) in &cpg.ast {
+        if !call_node.is_call() {
+            continue;
+        }
+        let Some(fn_id) = call_node.function_id else { continue };
+
+        let member_access = field_child(&cpg.ast, call_node, "function")
+            .filter(|(_, n)| n.node_type == "field_expression")
+            .or_else(|| {
+                call_node
+                    .children
+                    .iter()
+                    .find_map(|&cid| cpg.ast.get(&cid).filter(|n| n.node_type == "field_expression").map(|n| (cid, n)))
+            });
+
+        let (receiver_type, method_name) = if let Some((_, member)) = member_access {
+            let Some((_, field_id_node)) = field_child(&cpg.ast, member, "field") else { continue };
+            let Some(method_name) = field_id_node.text.clone() else { continue };
+            let Some((_, arg_node)) = field_child(&cpg.ast, member, "argument") else { continue };
+            let receiver_type = if arg_node.node_type == "this" {
+                call_node.class_context.clone()
+            } else if arg_node.kind == IrNodeKind::Identifier {
+                arg_node
+                    .text
+                    .as_ref()
+                    .and_then(|name| declared_types.get(&(fn_id, name.clone())).cloned())
+            } else {
+                None
+            };
+            (receiver_type, method_name)
+        } else {
+            // Bare `method()` inside a class's own method body — implicit `this`.
+            let Some(class_ctx) = call_node.class_context.clone() else { continue };
+            let Some(method_name) = call_node.name.clone() else { continue };
+            (Some(class_ctx), method_name)
+        };
+
+        let Some(receiver_type) = receiver_type else { continue };
+        let mut visited = std::collections::HashSet::new();
+        if class_hierarchy_declares_virtual(cpg, &receiver_type, &method_name, &mut visited) {
+            virtual_dispatch_calls.push(call_id);
+        }
+    }
+
+    for call_id in virtual_dispatch_calls {
         cpg.cpp_meta_mut(call_id).is_virtual_dispatch = true;
     }
 }

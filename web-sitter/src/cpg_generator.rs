@@ -1268,6 +1268,37 @@ pub(crate) fn enrich_cpp_metadata(cpg: &mut crate::Cpg) {
         None
     }
 
+    // Full nested-qualified namespace path for a `namespace_definition` node —
+    // e.g. "outer::inner" for `namespace outer { namespace inner { ... } }` —
+    // built by walking up `parent_id` and collecting every enclosing
+    // `namespace_definition`'s own (single-level) name, innermost last.
+    fn namespace_qualified_path(
+        ast: &BTreeMap<NodeId, AstNode>,
+        node_id: NodeId,
+    ) -> Option<String> {
+        let mut parts: Vec<String> = Vec::new();
+        let mut cur = node_id;
+        let mut steps = 0usize;
+        loop {
+            steps += 1;
+            if steps > 64 {
+                break; // guard against malformed parent chains
+            }
+            let node = ast.get(&cur)?;
+            if node.node_type == "namespace_definition" {
+                if let Some(name) = namespace_name_from_node(ast, cur) {
+                    parts.push(name);
+                }
+            }
+            match node.parent_id {
+                Some(p) if p != cur => cur = p,
+                _ => break,
+            }
+        }
+        parts.reverse();
+        if parts.is_empty() { None } else { Some(parts.join("::")) }
+    }
+
     // ── Detect constructor/destructor via AST node types (not text) ────────────
     // Returns (is_constructor, is_destructor) for a function_definition node.
     fn detect_ctor_dtor(ast: &BTreeMap<NodeId, AstNode>, fn_def_id: NodeId) -> (bool, bool) {
@@ -1436,6 +1467,22 @@ pub(crate) fn enrich_cpp_metadata(cpg: &mut crate::Cpg) {
         .filter_map(|(id, _)| namespace_name_from_node(ast, *id).map(|name| (*id, name)))
         .collect();
 
+    // Same namespace_definition nodes, but keyed by their FULL nested-qualified
+    // path ("outer::inner") instead of just their own single-level name — used
+    // below to tag descendant function/declaration nodes with the complete
+    // enclosing-namespace context. Sorted by NodeId descending (= innermost
+    // first, since this AST's pre-order DFS always assigns a namespace's own
+    // node a smaller id than anything nested inside it) so the first-wins
+    // `.or_insert_with` in the tagging walk below lets the innermost, most
+    // specific namespace claim its own descendants before an enclosing
+    // namespace's broader subtree walk could otherwise flatten them to just
+    // its own (less specific) name.
+    let mut namespace_nodes_qualified: Vec<(NodeId, String)> = namespace_nodes
+        .iter()
+        .filter_map(|&(id, _)| namespace_qualified_path(ast, id).map(|path| (id, path)))
+        .collect();
+    namespace_nodes_qualified.sort_by(|a, b| b.0.cmp(&a.0));
+
     // Walk all descendants; only record context for function_definition/declaration nodes
     // in the side-table (write to AstNode for backward compat for all nodes).
     for (class_id, class_name) in &class_nodes {
@@ -1456,7 +1503,7 @@ pub(crate) fn enrich_cpp_metadata(cpg: &mut crate::Cpg) {
         }
     }
 
-    for (ns_id, ns_name) in &namespace_nodes {
+    for (ns_id, ns_qualified_name) in &namespace_nodes_qualified {
         let mut stack = vec![*ns_id];
         let mut visited = std::collections::HashSet::new();
         while let Some(nid) = stack.pop() {
@@ -1466,7 +1513,7 @@ pub(crate) fn enrich_cpp_metadata(cpg: &mut crate::Cpg) {
             if nid != *ns_id {
                 namespace_contexts
                     .entry(nid)
-                    .or_insert_with(|| ns_name.clone());
+                    .or_insert_with(|| ns_qualified_name.clone());
             }
             if let Some(node) = ast.get(&nid) {
                 stack.extend(node.children.iter().copied());

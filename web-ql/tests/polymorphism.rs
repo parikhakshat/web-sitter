@@ -206,16 +206,6 @@ rule "not-dtor" {
 // Virtual dispatch through a base-typed pointer/reference
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// TDD-red: `enrich_call_graph_cpp` (call_analysis.rs) gates `is_virtual_dispatch`
-// on the CALL NODE's own `class_context` — i.e. whether the call site is
-// lexically inside some class's method — not on the receiver's static type.
-// A free function like `compute(Shape* s)` calling `s->area()` has no
-// enclosing class, so `class_context` is `None` and the call is never
-// considered for virtual-dispatch marking at all, regardless of `s`'s type
-// or the target method's virtuality. Fixing this needs real receiver-type
-// tracking (what type is `s`, does that type's vtable have `area`), which
-// this codebase doesn't have yet — left as a known gap rather than patched
-// with another lexical heuristic.
 #[test]
 fn cpp_call_through_base_pointer_is_virtual_dispatch() {
     let cpg = parse_cpp(r#"

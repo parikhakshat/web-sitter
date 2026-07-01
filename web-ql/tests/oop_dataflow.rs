@@ -99,16 +99,6 @@ rule "ns-flow" {
     assert!(!findings.is_empty(), "param `y` should dfg_reach the math::square(y) call");
 }
 
-// TDD-red: `enrich_cpp_metadata`'s namespace-context walk (cpg_generator.rs)
-// assigns each descendant node the *first* enclosing namespace it finds via a
-// first-wins `or_insert`, so for `namespace outer { namespace inner { ... } }`
-// every node under `inner` gets tagged with namespace "outer" only — "inner"
-// is silently dropped. `function_name_to_id` is registered from that single
-// flat `namespace` field, so it only ever gets a key for one level of nesting
-// ("outer::helper") and never composes the full "outer::inner::helper" path
-// the call site actually uses, so `refers_to()` returns Null here. Fixing this
-// needs the namespace-context walk itself to accumulate the full nested path,
-// not just the call-graph qualification lookup — left as a known gap.
 #[test]
 fn cpp_deeply_nested_namespace_call_resolves_callee() {
     let cpg = parse_cpp(r#"
