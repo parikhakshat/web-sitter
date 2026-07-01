@@ -1,22 +1,20 @@
 mod output;
+mod html_report;
 
 use std::collections::HashSet;
-use std::io::Write as _;
+use std::io::{IsTerminal as _, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use tracing::debug;
 
-use web_ql::{EndpointRegistry, RuleSet, Workspace};
+use web_ql::{RuleSet, Workspace};
 use web_ql::loader::{file_hash, load_rules, load_rules_dir};
-use web_sitter::{CpgGenerator, GraphBuildOptions, SourceLanguage, language_from_path};
+use web_sitter::{self, CpgGenerator, GraphBuildOptions, SourceLanguage, language_from_path};
 
-use output::{OutputFormat, render};
+use output::OutputFormat;
 
 // ── CLI definition ────────────────────────────────────────────────────────────
 
@@ -71,7 +69,7 @@ struct ScanArgs {
     #[arg(long)]
     profile: bool,
 
-    /// Write profiling data as JSON to this file
+    /// Write profiling data to this file (JSON by default; a .html companion is also written)
     #[arg(long, value_name = "PATH")]
     profile_output: Option<PathBuf>,
 }
@@ -118,12 +116,34 @@ fn run_scan(args: ScanArgs) -> Result<usize> {
         web_profiler::init();
     }
 
+    let use_progress = std::io::stderr().is_terminal();
+
     let mp = MultiProgress::new();
-    let spinner_style = ProgressStyle::with_template("{spinner:.cyan} {msg}")
-        .unwrap()
-        .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "✓"]);
+    if !use_progress {
+        mp.set_draw_target(indicatif::ProgressDrawTarget::hidden());
+    }
+
+    // Helper: print a status line without interleaving with live bars in TTY mode,
+    // and fall back to eprintln in non-TTY mode (hidden draw target swallows mp.println).
+    macro_rules! status {
+        ($($arg:tt)*) => {{
+            let msg = format!($($arg)*);
+            if use_progress {
+                mp.println(&msg)?;
+            } else {
+                eprintln!("{}", msg);
+            }
+        }};
+    }
+
+    let spinner_style = ProgressStyle::with_template(
+        "  {spinner:.cyan} [{elapsed_precise}] {msg}",
+    )
+    .unwrap()
+    .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "✓"]);
+
     let bar_style = ProgressStyle::with_template(
-        "{spinner:.cyan} {msg} [{bar:35.cyan/blue}] {pos}/{len}",
+        "  {spinner:.cyan} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len}  {per_sec}  eta {eta}  {msg}",
     )
     .unwrap()
     .progress_chars("█▉▊▋▌▍▎▏ ")
@@ -136,10 +156,7 @@ fn run_scan(args: ScanArgs) -> Result<usize> {
     disc_bar.enable_steady_tick(std::time::Duration::from_millis(80));
 
     let source_files = discover_files(&args.repo, &args.exclude)?;
-    disc_bar.finish_with_message(format!(
-        "Discovered {} source files",
-        source_files.len()
-    ));
+    disc_bar.finish_with_message(format!("Discovered {} source files", source_files.len()));
 
     // Stage 2 — CPG generation
     let cpg_bar = mp.add(ProgressBar::new(source_files.len() as u64));
@@ -147,31 +164,29 @@ fn run_scan(args: ScanArgs) -> Result<usize> {
     cpg_bar.set_message("Building CPGs…");
     cpg_bar.enable_steady_tick(std::time::Duration::from_millis(80));
 
+    let _cpg_span = web_profiler::span("stage.cpg_build");
     let registry = web_ql::security_patterns::builtin_endpoint_registry();
     let mut workspace = Workspace::new(registry);
 
-    // Generate CPGs in parallel, then upsert sequentially (workspace needs mut).
     let cpg_results: Vec<(PathBuf, anyhow::Result<web_sitter::Cpg>, u64)> = source_files
         .par_iter()
         .map(|path| {
-            let hash = if args.no_cache {
-                0
-            } else {
-                file_hash(path).unwrap_or(0)
-            };
+            let hash = if args.no_cache { 0 } else { file_hash(path).unwrap_or(0) };
             let lang = language_from_path(path.to_str().unwrap_or(""));
             let result = build_cpg(path, lang);
             (path.clone(), result, hash)
         })
         .inspect(|_| cpg_bar.inc(1))
         .collect();
+    drop(_cpg_span);
+    web_profiler::record_parallel_work(
+        "CPG parse", "stage.cpg_build", "stage.cpg_parse_file", rayon::current_num_threads(),
+    );
 
     let mut cpg_errors = 0usize;
     for (path, result, hash) in cpg_results {
         match result {
-            Ok(cpg) => {
-                workspace.upsert_file(path, cpg, hash);
-            }
+            Ok(cpg) => { workspace.upsert_file(path, cpg, hash); }
             Err(e) => {
                 debug!("CPG error for {}: {e:#}", path.display());
                 cpg_errors += 1;
@@ -182,67 +197,84 @@ fn run_scan(args: ScanArgs) -> Result<usize> {
         "Built CPGs for {} files ({cpg_errors} errors)",
         source_files.len() - cpg_errors
     ));
+    web_profiler::count("files_parsed", (source_files.len() - cpg_errors) as u64);
 
-    // Stage 3 — Cross-file edge resolution
+    // Stage 3 — Taint summarization / cross-file edge resolution
     let edge_bar = mp.add(ProgressBar::new_spinner());
     edge_bar.set_style(spinner_style.clone());
-    edge_bar.set_message("Resolving cross-file edges…");
+    edge_bar.set_message("Summarizing taint & cross-file edges…");
     edge_bar.enable_steady_tick(std::time::Duration::from_millis(80));
 
+    let _edge_span = web_profiler::span("stage.cross_file_edges");
     workspace.build_cross_file_edges();
+    drop(_edge_span);
 
     let n_edges = workspace.cross_file_callee_params.len();
     let n_callee_files = workspace.cross_file_dfgs.len();
     edge_bar.finish_with_message(format!(
-        "Resolved {n_edges} cross-file call edges across {n_callee_files} callee files"
+        "Taint: {n_edges} cross-file call edges, {n_callee_files} callee files indexed"
     ));
 
     // Load rule sets
     let rule_set = load_all_rules(&args.queries)?;
 
-    // Stage 4 — Rule evaluation
+    // Stage 5 — Rule evaluation
     let total_files = workspace.files.len() as u64;
     let scan_bar = mp.add(ProgressBar::new(total_files));
     scan_bar.set_style(
         ProgressStyle::with_template(
-            "{spinner:.cyan} Scanning [{bar:35.cyan/blue}] {pos}/{len}  {msg}",
+            "  {spinner:.cyan} [{elapsed_precise}] [{bar:40.green/blue}] {pos}/{len}  {per_sec}  eta {eta}  {msg}",
         )
         .unwrap()
         .progress_chars("█▉▊▋▌▍▎▏ ")
         .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "✓"]),
     );
     scan_bar.enable_steady_tick(std::time::Duration::from_millis(80));
-    let findings_count = Arc::new(AtomicU64::new(0));
+    scan_bar.set_message("Running rules…");
 
-    // Wrap scan so we can update the bar — scan() is parallel internally.
-    // We hook into rayon via a thread-local ticker using indicatif's rayon feature.
-    let findings = workspace.scan(&rule_set);
-    findings_count.store(findings.len() as u64, Ordering::Relaxed);
-    scan_bar.set_position(total_files);
+    let _scan_span = web_profiler::span("stage.rule_scan");
+    let findings = workspace.scan_with_progress(&rule_set, || {
+        scan_bar.inc(1);
+    });
+    drop(_scan_span);
+    web_profiler::record_parallel_work(
+        "Rule scan", "stage.rule_scan", "query.scan_file", rayon::current_num_threads(),
+    );
     scan_bar.finish_with_message(format!("{} findings", findings.len()));
-
-    mp.clear().ok();
+    web_profiler::count("findings_total", findings.len() as u64);
 
     // Profile output
     if args.profile {
         let report = web_profiler::report();
-        if let Some(ref prof_path) = args.profile_output {
-            let json = serde_json::to_string_pretty(&report)?;
-            std::fs::write(prof_path, &json)
-                .with_context(|| format!("writing profile to {}", prof_path.display()))?;
-            eprintln!("Profile written to {}", prof_path.display());
-        } else {
-            eprintln!("{report}");
-        }
+        let prof_path = args.profile_output
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("profile.json"));
+
+        let json = serde_json::to_string_pretty(&report)?;
+        std::fs::write(&prof_path, &json)
+            .with_context(|| format!("writing profile to {}", prof_path.display()))?;
+        status!("Profile written to {}", prof_path.display());
+
+        let html_path = prof_path.with_extension("html");
+        std::fs::write(&html_path, report.to_html())
+            .with_context(|| format!("writing profile HTML to {}", html_path.display()))?;
+        status!("Profile HTML written to {}", html_path.display());
     }
 
+    // Extract CPG subgraphs for HTML output (no-op for other formats)
+    let cpg_graphs: Option<Vec<Option<web_sitter::CpgSubgraph>>> = if matches!(format, OutputFormat::Html) {
+        Some(findings.iter().map(|f| workspace.extract_cpg_subgraph(f)).collect())
+    } else {
+        None
+    };
+
     // Render and emit output
-    let rendered = render(&findings, &format)?;
+    let rendered = output::render(&findings, &format, &args.repo, args.output.as_deref(), workspace.files.len(), cpg_graphs.as_deref())?;
     match &args.output {
         Some(path) => {
             std::fs::write(path, &rendered)
                 .with_context(|| format!("writing output to {}", path.display()))?;
-            eprintln!("Output written to {}", path.display());
+            status!("Output written to {}", path.display());
         }
         None => {
             std::io::stdout()
@@ -258,8 +290,7 @@ fn run_scan(args: ScanArgs) -> Result<usize> {
 
 fn discover_files(root: &Path, excludes: &[String]) -> Result<Vec<PathBuf>> {
     let known_extensions: HashSet<&str> = [
-        "c", "h", "cpp", "cc", "cxx", "hpp", "go", "py", "java", "js", "mjs", "ts", "tsx",
-        "rs",
+        "c", "h", "cpp", "cc", "cxx", "hpp", "go", "py", "java", "js", "mjs", "ts", "tsx", "rs",
     ]
     .iter()
     .copied()
@@ -291,7 +322,6 @@ fn walk_dir(
 
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
-            // Skip hidden directories and common build/vendor dirs
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if name.starts_with('.') || matches!(name.as_ref(), "target" | "node_modules" | "vendor" | ".git") {
@@ -313,6 +343,7 @@ fn walk_dir(
 // ── CPG generation ────────────────────────────────────────────────────────────
 
 fn build_cpg(path: &Path, language: SourceLanguage) -> Result<web_sitter::Cpg> {
+    let _span = web_profiler::span("stage.cpg_parse_file");
     let mut generator = CpgGenerator::new_for_language(language)
         .with_context(|| format!("creating CPG generator for {}", path.display()))?;
     generator.generate_from_file_with_options(path, GraphBuildOptions::default())

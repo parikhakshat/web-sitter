@@ -34,7 +34,7 @@ pub mod profiler;
 pub mod report;
 pub mod thread_pool;
 
-pub use profiler::{CacheTracker, Profiler, StageSpan, TaskGuard, CacheSnapshot, StageSnapshot};
+pub use profiler::{CacheTracker, Profiler, StageSpan, OwnedStageSpan, TaskGuard, CacheSnapshot, StageSnapshot, ParallelStageSnapshot};
 pub use report::ProfileReport;
 pub use thread_pool::ProfiledPool;
 pub use metrics::{CacheMetrics, CounterSnapshot, StageSummary, ThreadMetrics};
@@ -65,6 +65,19 @@ pub fn global() -> Option<&'static Profiler> {
 /// No-op if the global profiler has not been initialized.
 pub fn span(name: &'static str) -> Option<StageSpan> {
     GLOBAL.get().map(|p| p.span(name))
+}
+
+/// Like [`span`] but accepts a dynamic stage name (e.g. for per-rule timing).
+pub fn span_dyn(name: impl Into<String>) -> Option<OwnedStageSpan> {
+    GLOBAL.get().map(|p| p.span_owned(name))
+}
+
+/// Record that a parallel stage ran with `n_workers` threads.
+/// See [`Profiler::record_parallel_work`] for semantics.
+pub fn record_parallel_work(label: &str, wall_stage: &str, cpu_stage: &str, n_workers: usize) {
+    if let Some(p) = GLOBAL.get() {
+        p.record_parallel_work(label, wall_stage, cpu_stage, n_workers);
+    }
 }
 
 /// Record a cache hit on the named cache.
@@ -110,6 +123,7 @@ pub fn report() -> ProfileReport {
             caches: p.cache_snapshots(),
             counters: p.counter_snapshots(),
             threads: p.thread_metrics(),
+            parallel_stages: p.parallel_stage_snapshots(),
         },
         None => ProfileReport {
             elapsed_secs: 0.0,
@@ -117,6 +131,7 @@ pub fn report() -> ProfileReport {
             caches: vec![],
             counters: vec![],
             threads: ThreadMetrics::default(),
+            parallel_stages: vec![],
         },
     }
 }

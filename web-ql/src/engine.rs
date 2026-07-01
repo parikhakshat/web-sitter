@@ -66,7 +66,7 @@ impl<'a> RuleRunner<'a> {
             .par_iter()
             .filter(|rule| rule_applies_to_language(rule, lang))
             .flat_map(|rule| {
-                let _span = prof::span("query.rule_eval");
+                let _span = prof::span_dyn(format!("rule.{}", rule.id));
                 prof::count("rules_applied", 1);
                 let mut rule_findings = Vec::new();
 

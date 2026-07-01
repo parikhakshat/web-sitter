@@ -253,6 +253,7 @@ fn report_human_readable_contains_sections() {
         caches: p.cache_snapshots(),
         counters: p.counter_snapshots(),
         threads: p.thread_metrics(),
+        parallel_stages: p.parallel_stage_snapshots(),
     };
     let text = report.human_readable();
     assert!(text.contains("Stage Timings"), "missing stage timings section");
@@ -275,6 +276,7 @@ fn report_json_roundtrip() {
         caches: p.cache_snapshots(),
         counters: p.counter_snapshots(),
         threads: p.thread_metrics(),
+        parallel_stages: p.parallel_stage_snapshots(),
     };
     let json = report.to_json();
     assert!(json.contains("\"elapsed_secs\""));
@@ -295,6 +297,7 @@ fn report_display_impl() {
         caches: vec![],
         counters: vec![],
         threads: p.thread_metrics(),
+        parallel_stages: vec![],
     };
     let s = format!("{}", report);
     assert!(s.contains("web-profiler Report"));

@@ -10,6 +10,7 @@ pub(crate) struct Inner {
     pub stages: Mutex<HashMap<String, StageSummary>>,
     pub caches: Mutex<HashMap<String, CacheMetrics>>,
     pub counters: Mutex<HashMap<String, u64>>,
+    pub parallel_stages: Mutex<HashMap<String, ParallelWorkEntry>>,
 
     // Thread-pool tracking (lock-free hot path)
     pub threads_started: AtomicU64,
@@ -31,6 +32,7 @@ impl Inner {
             stages: Mutex::new(HashMap::new()),
             caches: Mutex::new(HashMap::new()),
             counters: Mutex::new(HashMap::new()),
+            parallel_stages: Mutex::new(HashMap::new()),
             threads_started: AtomicU64::new(0),
             tasks_submitted: AtomicU64::new(0),
             tasks_completed: AtomicU64::new(0),
@@ -41,6 +43,12 @@ impl Inner {
             wall_start: Instant::now(),
         }
     }
+}
+
+pub(crate) struct ParallelWorkEntry {
+    pub n_workers: usize,
+    pub wall_stage_name: String,
+    pub cpu_stage_name: String,
 }
 
 // ── Profiler ──────────────────────────────────────────────────────────────────
@@ -64,6 +72,16 @@ impl Profiler {
         StageSpan {
             inner: Arc::clone(&self.inner),
             name,
+            start: Instant::now(),
+        }
+    }
+
+    /// Like [`span`] but accepts a dynamic (runtime) stage name. Useful for
+    /// per-rule or per-file timing where the name is not known at compile time.
+    pub fn span_owned(&self, name: impl Into<String>) -> OwnedStageSpan {
+        OwnedStageSpan {
+            inner: Arc::clone(&self.inner),
+            name: name.into(),
             start: Instant::now(),
         }
     }
@@ -114,6 +132,50 @@ impl Profiler {
             v.push(util);
         }
         TaskGuard { inner: Arc::clone(&self.inner) }
+    }
+
+    // ── Parallel stage tracking ───────────────────────────────────────────────
+
+    /// Record that a parallel stage ran with `n_workers` threads.
+    /// `wall_stage` is the name of an existing stage span that measures wall time
+    /// (e.g. one span wrapping the whole `par_iter().collect()`).
+    /// `cpu_stage` is the name of the per-item stage span whose total gives CPU time
+    /// (e.g. the per-file span run in parallel). Both are looked up in the stage map.
+    pub fn record_parallel_work(&self, label: &str, wall_stage: &str, cpu_stage: &str, n_workers: usize) {
+        if let Ok(mut m) = self.inner.parallel_stages.lock() {
+            m.insert(label.to_owned(), ParallelWorkEntry {
+                n_workers,
+                wall_stage_name: wall_stage.to_owned(),
+                cpu_stage_name: cpu_stage.to_owned(),
+            });
+        }
+    }
+
+    pub fn parallel_stage_snapshots(&self) -> Vec<ParallelStageSnapshot> {
+        let parallel = self.inner.parallel_stages.lock().unwrap();
+        let stages = self.inner.stages.lock().unwrap();
+        let mut v: Vec<ParallelStageSnapshot> = parallel.iter().map(|(label, entry)| {
+            let stage_total_nanos = |name: &str| -> u64 {
+                stages.get(name).map(|s| {
+                    if s.hist.count == 0 { 0 } else { s.hist.mean_nanos().saturating_mul(s.hist.count) }
+                }).unwrap_or(0)
+            };
+            let wall_nanos = stage_total_nanos(&entry.wall_stage_name);
+            let cpu_nanos = stage_total_nanos(&entry.cpu_stage_name);
+            let wall_ms = wall_nanos as f64 / 1_000_000.0;
+            let cpu_ms = cpu_nanos as f64 / 1_000_000.0;
+            let max_cpu_ms = wall_ms * entry.n_workers as f64;
+            let efficiency_pct = if max_cpu_ms > 0.0 { (cpu_ms / max_cpu_ms * 100.0).min(100.0) } else { 0.0 };
+            ParallelStageSnapshot {
+                label: label.clone(),
+                n_workers: entry.n_workers,
+                wall_ms,
+                cpu_ms,
+                efficiency_pct,
+            }
+        }).collect();
+        v.sort_by(|a, b| a.label.cmp(&b.label));
+        v
     }
 
     // ── Counters ──────────────────────────────────────────────────────────────
@@ -232,6 +294,28 @@ impl Drop for StageSpan {
     }
 }
 
+// ── OwnedStageSpan ────────────────────────────────────────────────────────────
+
+/// Like `StageSpan` but for dynamically-named stages (e.g. per-rule timing).
+pub struct OwnedStageSpan {
+    pub(crate) inner: Arc<Inner>,
+    pub(crate) name: String,
+    pub(crate) start: Instant,
+}
+
+impl Drop for OwnedStageSpan {
+    fn drop(&mut self) {
+        let nanos = self.start.elapsed().as_nanos() as u64;
+        if let Ok(mut stages) = self.inner.stages.lock() {
+            let name = std::mem::take(&mut self.name);
+            stages
+                .entry(name.clone())
+                .or_insert_with(|| StageSummary::new(name))
+                .record_nanos(nanos);
+        }
+    }
+}
+
 // ── CacheTracker ──────────────────────────────────────────────────────────────
 
 /// Handle for recording cache activity for a specific named cache.
@@ -305,4 +389,13 @@ pub struct CacheSnapshot {
     pub evictions: u64,
     pub bytes_used: u64,
     pub hit_rate_pct: f64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ParallelStageSnapshot {
+    pub label: String,
+    pub n_workers: usize,
+    pub wall_ms: f64,
+    pub cpu_ms: f64,
+    pub efficiency_pct: f64,
 }

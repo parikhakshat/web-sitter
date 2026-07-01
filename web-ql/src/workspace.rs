@@ -1,8 +1,8 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use rayon::prelude::*;
-use web_sitter::{Cpg, FunctionSummary, IrNodeKind, NodeId};
+use web_sitter::{Cpg, CpgEdgeData, CpgNodeData, CpgSubgraph, FunctionSummary, IrNodeKind, NodeId};
 use web_profiler as prof;
 
 use crate::alias::AliasIndex;
@@ -395,6 +395,15 @@ impl Workspace {
     /// independent [`EvalContext`] so there is no cross-file shared mutable state.
     /// Cross-file taint context is read-only and shared across all file evaluations.
     pub fn scan(&self, rule_set: &RuleSet) -> Vec<Finding> {
+        self.scan_with_progress(rule_set, || {})
+    }
+
+    /// Like [`scan`] but calls `on_file()` after each file is processed, allowing
+    /// the caller to drive a progress bar.
+    pub fn scan_with_progress<F>(&self, rule_set: &RuleSet, on_file: F) -> Vec<Finding>
+    where
+        F: Fn() + Sync,
+    {
         let _span = prof::span("query.scan_total");
         let predicate_plans = &rule_set.predicate_plans;
         let predicate_params = &rule_set.predicate_params;
@@ -404,8 +413,7 @@ impl Workspace {
         };
         let cross_file_ref = &cross_file_ctx;
 
-        let findings: Vec<Finding> = self
-            .files
+        self.files
             .par_iter()
             .flat_map(|(_, file_idx)| {
                 let _task = prof::task();
@@ -431,12 +439,11 @@ impl Workspace {
 
                 prof::count("files_scanned", 1);
                 prof::count("findings_emitted", file_findings.len() as u64);
+                on_file();
 
                 file_findings
             })
-            .collect();
-
-        findings
+            .collect()
     }
 
     /// Run the rule set using a per-file findings cache for incremental scans.
@@ -546,4 +553,136 @@ impl Workspace {
     pub fn dirty_files(&self) -> &HashSet<PathBuf> {
         &self.dirty_files
     }
+
+    /// Extract a compact CPG subgraph for visualization of the given finding.
+    ///
+    /// Looks up the file by matching `finding.location.file` against
+    /// `cpg.source_file` (which is the canonicalized absolute path set during
+    /// parsing). Returns `None` if the file is not indexed or the finding has
+    /// no matched nodes.
+    pub fn extract_cpg_subgraph(&self, finding: &Finding) -> Option<CpgSubgraph> {
+        if finding.matched_nodes.is_empty() {
+            return None;
+        }
+        let file_idx = self.files.values().find(|fi| {
+            fi.cpg.source_file.as_deref() == Some(finding.location.file.as_str())
+        })?;
+        Some(build_cpg_subgraph(&file_idx.cpg, &finding.matched_nodes))
+    }
+}
+
+// ── CPG subgraph extraction ───────────────────────────────────────────────────
+
+const SUBGRAPH_MAX_NODES: usize = 200;
+
+fn find_fn_root(cpg: &Cpg, mut nid: NodeId) -> NodeId {
+    for _ in 0..64 {
+        if let Some(node) = cpg.ast.get(&nid) {
+            if matches!(node.kind, IrNodeKind::MethodDef | IrNodeKind::LambdaDef) {
+                return nid;
+            }
+            match node.parent_id {
+                Some(p) => nid = p,
+                None => return nid,
+            }
+        } else {
+            return nid;
+        }
+    }
+    nid
+}
+
+fn build_cpg_subgraph(cpg: &Cpg, matched_nodes: &[NodeId]) -> CpgSubgraph {
+    let mut included: HashSet<NodeId> = HashSet::new();
+
+    // BFS from each function root
+    for &seed in matched_nodes {
+        let root = find_fn_root(cpg, seed);
+        let mut queue: VecDeque<NodeId> = VecDeque::new();
+        queue.push_back(root);
+        while let Some(nid) = queue.pop_front() {
+            if included.len() >= SUBGRAPH_MAX_NODES {
+                break;
+            }
+            if !included.insert(nid) {
+                continue;
+            }
+            if let Some(node) = cpg.ast.get(&nid) {
+                for &child in &node.children {
+                    queue.push_back(child);
+                }
+            }
+        }
+        if included.len() >= SUBGRAPH_MAX_NODES {
+            break;
+        }
+    }
+
+    // If still too many, prune to matched nodes + ancestors + direct children
+    let pruned = included.len() >= SUBGRAPH_MAX_NODES;
+    if pruned {
+        included.clear();
+        for &seed in matched_nodes {
+            included.insert(seed);
+            let mut cur = seed;
+            for _ in 0..24 {
+                if let Some(node) = cpg.ast.get(&cur) {
+                    match node.parent_id {
+                        Some(p) => { included.insert(p); cur = p; }
+                        None => break,
+                    }
+                } else {
+                    break;
+                }
+            }
+            if let Some(node) = cpg.ast.get(&seed) {
+                for &child in &node.children {
+                    included.insert(child);
+                }
+            }
+        }
+    }
+
+    // Build node list
+    let nodes: Vec<CpgNodeData> = included.iter().filter_map(|&id| {
+        let n = cpg.ast.get(&id)?;
+        let text = n.text.as_ref()
+            .map(|t| t.chars().take(60).collect::<String>())
+            .or_else(|| n.name.clone());
+        Some(CpgNodeData {
+            id,
+            node_type: n.node_type.clone(),
+            text,
+            line: n.line,
+            col: n.column,
+            end_line: n.end_line,
+            parent_id: n.parent_id.filter(|p| included.contains(p)),
+        })
+    }).collect();
+
+    // AST edges (parent → child)
+    let mut edges: Vec<CpgEdgeData> = Vec::new();
+    for &id in &included {
+        if let Some(n) = cpg.ast.get(&id) {
+            if let Some(parent) = n.parent_id {
+                if included.contains(&parent) {
+                    edges.push(CpgEdgeData { s: parent, d: id, k: "A".to_string(), v: None });
+                }
+            }
+        }
+    }
+
+    // DFG edges within subgraph
+    for edge in &cpg.dataflow.edges {
+        if included.contains(&edge.source) && included.contains(&edge.destination) {
+            edges.push(CpgEdgeData {
+                s: edge.source,
+                d: edge.destination,
+                k: "D".to_string(),
+                v: if edge.variable.is_empty() { None } else { Some(edge.variable.clone()) },
+            });
+        }
+    }
+
+    CpgSubgraph { nodes, edges, pruned }
 }
