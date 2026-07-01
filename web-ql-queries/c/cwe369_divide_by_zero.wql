@@ -1,12 +1,17 @@
 // CWE-369: Divide by Zero — C
-// Tainted value flows to divisor position.
+// Tainted value flows to divisor position, or the divisor is provably zero.
 
+// `child(1)` is the right-hand operand of a binary expression. The operator
+// itself (`/`, `%`, `==`, `<<`, …) isn't exposed as a queryable field, so we
+// scope to a `/` or `%` character in the source text to exclude unrelated
+// binary ops (comparisons, shifts, bitwise) whose RHS also happens to be 0.
 sink c_divisor = find n: BinaryOp where
-    n.raw_kind() in ["binary_expression", "/", "%"]
+    n.raw_kind() == "binary_expression"
+    and n.text() in /[\/%]/
 
 rule "cwe-369-c-tainted-divisor" {
     severity: medium
-    languages: [c]
+    languages: [c, cpp]
     message: "Divide by zero: tainted value used as divisor without zero check"
     tags: ["divide-by-zero", "cwe-369"]
     taint {
@@ -15,12 +20,20 @@ rule "cwe-369-c-tainted-divisor" {
     }
 }
 
-// Direct zero literal as divisor (compile-time, less common in real bugs)
-rule "cwe-369-c-literal-zero-divisor" {
-    severity: low
-    languages: [c]
-    message: "Division by zero literal"
+// ── Divisor is a statically-known-zero expression (constant folding) ─────────
+// Catches literal zero (`x / 0`), and const-folded expressions that reduce to
+// zero (`x / (2 - 2)`), which the old rule (naively matching any Call whose
+// 2nd argument was an integer literal) never actually detected.
+
+rule "cwe-369-c-const-zero-divisor" {
+    severity: medium
+    languages: [c, cpp]
+    message: "Division by zero: divisor is a constant expression that evaluates to 0"
     tags: ["divide-by-zero", "cwe-369"]
-    find n: Call where
-        n.arg(1) matches Literal { lit_kind: "Integer" }
+    find n: BinaryOp where
+        n.raw_kind() == "binary_expression"
+        and n.text() in /[\/%]/
+        and let rhs = n.child(1) in
+        rhs.is_const_expr()
+        and rhs.eval_int() == 0
 }

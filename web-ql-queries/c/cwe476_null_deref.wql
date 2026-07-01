@@ -13,13 +13,18 @@ pred null_checked(alloc: Call, deref: Node) =
 
 rule "cwe-476-c-alloc-unchecked-deref" {
     severity: high
-    languages: [c]
+    languages: [c, cpp]
     message: "NULL dereference: allocation result used without null check on all paths"
     tags: ["null-dereference", "cwe-476"]
     find alloc: Call, deref: MemberAccess where
         alloc.callee_name() in ["malloc", "calloc", "realloc", "strdup", "strndup",
                                 "getenv", "fopen", "realpath", "strtok"]
         and alloc.cfg_reaches(deref)
+        // The allocation result must actually flow into the dereferenced
+        // receiver — without this, any CFG-reachable pair of an allocation
+        // call and an unrelated `->`/`.` access was flagged.
+        and let recv = deref.receiver() in
+        alloc.dfg_reaches(recv)
         and not null_checked(alloc, deref)
 }
 
@@ -27,23 +32,31 @@ rule "cwe-476-c-alloc-unchecked-deref" {
 
 rule "cwe-476-c-malloc-immediate-subscript" {
     severity: high
-    languages: [c]
+    languages: [c, cpp]
     message: "NULL dereference: allocation result subscripted immediately without null check"
     tags: ["null-dereference", "cwe-476"]
     find alloc: Call, sub: Subscript where
         alloc.callee_name() in ["malloc", "calloc", "realloc", "strdup"]
         and alloc.cfg_reaches(sub)
+        and let base = sub.child(0) in
+        alloc.dfg_reaches(base)
         and not null_checked(alloc, sub)
 }
 
 // ── Taint: externally controlled value flowing to pointer dereference ─────────
+// `"pointer_expression"` (the `*ptr` deref form) lifts to IrNodeKind::UnaryOp,
+// not MemberAccess (confirmed in web-sitter/src/lifter.rs) — binding it under
+// `n: MemberAccess` made that half of the old sink permanently dead, so only
+// `ptr->field` was ever caught and plain `*ptr` dereferences were missed.
+// `Expr` covers both MemberAccess and UnaryOp, so bind there instead.
 
-sink c_ptr_deref_sinks = find n: MemberAccess where
-    n.raw_kind() in ["field_expression", "pointer_expression"]
+sink c_ptr_deref_sinks = find n: Expr where
+    n.raw_kind() == "field_expression"
+    or (n.raw_kind() == "pointer_expression" and n.text() in /^\*/)
 
 rule "cwe-476-c-tainted-null-deref" {
     severity: high
-    languages: [c]
+    languages: [c, cpp]
     message: "NULL dereference: tainted value may be NULL when dereferenced"
     tags: ["null-dereference", "cwe-476"]
     taint {

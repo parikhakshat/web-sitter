@@ -1,14 +1,24 @@
 // CWE-327: Weak Crypto — Python (hashlib, cryptography, PyCrypto)
 
+// The old rule required arg(0) to be a string literal for *every* callee in
+// the list, which is backwards for the explicit-algorithm callees (real code
+// is `hashlib.md5(data)` where `data` is a variable, not a literal — the old
+// condition would miss that entirely) and too broad for `hashlib.new(...)`
+// (it flagged `hashlib.new("sha256")` just as readily as `hashlib.new("md5")`
+// since only literal-ness was checked, not the actual algorithm name).
 rule "cwe-327-python-weak-hash" {
     severity: high
     languages: [python]
     message: "Weak hash: MD5 or SHA-1 used for security-sensitive operation"
     tags: ["weak-crypto", "cwe-327"]
     find n: Call where
-        n.callee_name() in ["md5", "sha1", "hashlib.md5", "hashlib.sha1",
-                            "MD5", "SHA1", "new"]
-        and n.arg(0) matches Literal { lit_kind: "String" }
+        n.callee_name() in ["md5", "sha1", "hashlib.md5", "hashlib.sha1", "MD5", "SHA1"]
+
+    find n: Call where
+        n.callee_name() in ["new", "hashlib.new"]
+        and let alg = n.arg(0) in
+        alg matches Literal { lit_kind: "String" }
+        and alg.string_value() in /(?i)^(md2|md4|md5|sha-?1)$/
 }
 
 rule "cwe-327-python-hardcoded-iv" {

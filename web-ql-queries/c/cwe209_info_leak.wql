@@ -1,13 +1,18 @@
-// CWE-209: Information Exposure Through Error Messages — C
+// CWE-209: Information Exposure Through Error Messages — C / C++
+//
+// The old rule defined a `c_output_sinks` set that was never actually
+// referenced by any rule (dead code), and only covered one narrow shape:
+// `errno`/`strerror` textually nested inside a `printf`/`fprintf`/`perror`
+// call. Generalized into three complementary shapes: the original local
+// pattern, a taint-based flow from error-detail-returning functions to
+// network-facing sinks (the actually dangerous case — internal error detail
+// reaching a remote observer), and pointer-address leaks via `%p`.
 
-sink c_output_sinks = find n: Call where
-    n.callee_name() in ["printf", "fprintf", "sprintf", "snprintf",
-                        "perror", "strerror", "send", "sendto",
-                        "write", "fwrite", "syslog"]
+// ── Error detail (strerror/dlerror/etc.) textually nested in local output ────
 
 rule "cwe-209-c-internal-info-leak" {
     severity: medium
-    languages: [c]
+    languages: [c, cpp]
     message: "Information leak: internal state or errno exposed to output"
     tags: ["information-leak", "cwe-209"]
     find n: Call where
@@ -15,4 +20,68 @@ rule "cwe-209-c-internal-info-leak" {
         and exists(err: Call |
             err.callee_name() in ["strerror", "errno", "__errno_location"]
             and err.has_ancestor(n.id()))
+}
+
+// ── Error-detail-returning function flows into a network-facing sink ─────────
+// The dangerous case: internal error detail (which may reveal file paths,
+// internal hostnames, library versions, or stack layout) reaching a remote
+// observer rather than a local log/console.
+
+source c_error_detail_sources = find n: Call where
+    n.callee_name() in ["strerror", "strerror_r", "dlerror", "gai_strerror", "hstrerror"]
+
+sink c_network_sinks = find n: Call where
+    n.callee_name() in ["send", "sendto", "sendmsg", "write", "writev"]
+
+rule "cwe-209-c-error-detail-network-leak" {
+    severity: high
+    languages: [c, cpp]
+    message: "Information leak: internal error detail flows to a network-facing sink"
+    tags: ["information-leak", "cwe-209"]
+    taint {
+        sources: ["c_error_detail_sources"]
+        sinks:   ["c_network_sinks"]
+    }
+}
+
+// ── Pointer address leaked via a literal "%p" format specifier ───────────────
+// A raw pointer value printed to output defeats ASLR — a well-known,
+// taint-free information-exposure pattern. Scoped by the function's actual
+// format-argument position (see cwe134_format_string.wql for the same
+// per-function position issue).
+
+rule "cwe-209-c-pointer-format-leak-arg0" {
+    severity: medium
+    languages: [c, cpp]
+    message: "Information leak: raw pointer address printed via %p defeats ASLR"
+    tags: ["information-leak", "cwe-209"]
+    find n: Call where
+        n.callee_name() in ["printf", "vprintf"]
+        and let fmt = n.arg(0) in
+        fmt matches Literal { lit_kind: "String" }
+        and fmt.string_value() in /%p/
+}
+
+rule "cwe-209-c-pointer-format-leak-arg1" {
+    severity: medium
+    languages: [c, cpp]
+    message: "Information leak: raw pointer address printed via %p defeats ASLR"
+    tags: ["information-leak", "cwe-209"]
+    find n: Call where
+        n.callee_name() in ["fprintf", "sprintf", "vfprintf", "vsprintf", "syslog"]
+        and let fmt = n.arg(1) in
+        fmt matches Literal { lit_kind: "String" }
+        and fmt.string_value() in /%p/
+}
+
+rule "cwe-209-c-pointer-format-leak-arg2" {
+    severity: medium
+    languages: [c, cpp]
+    message: "Information leak: raw pointer address printed via %p defeats ASLR"
+    tags: ["information-leak", "cwe-209"]
+    find n: Call where
+        n.callee_name() in ["snprintf", "vsnprintf"]
+        and let fmt = n.arg(2) in
+        fmt matches Literal { lit_kind: "String" }
+        and fmt.string_value() in /%p/
 }

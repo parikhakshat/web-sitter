@@ -3,7 +3,7 @@
 
 rule "cwe-617-c-tainted-assert" {
     severity: medium
-    languages: [c]
+    languages: [c, cpp]
     message: "Reachable assertion: tainted input can trigger assert(), causing abort"
     tags: ["reachable-assertion", "dos", "cwe-617"]
     taint {

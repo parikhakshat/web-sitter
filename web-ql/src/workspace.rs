@@ -261,6 +261,19 @@ impl Workspace {
     /// to avoid collisions when multiple classes/namespaces define methods with the same
     /// simple name.
     pub fn build_cross_file_edges(&mut self) {
+        self.build_cross_file_edges_with_progress(|| {});
+    }
+
+    /// Like [`build_cross_file_edges`], but calls `on_file()` after each file's
+    /// (expensive, per-node) key extraction completes, letting the caller drive
+    /// a determinate progress bar for this stage instead of an indefinite spinner
+    /// — this pass runs after all per-file CPGs (and their function summaries)
+    /// are already built, and on a large workspace it can take long enough that
+    /// having zero feedback during it looks like a hang.
+    pub fn build_cross_file_edges_with_progress<F>(&mut self, on_file: F)
+    where
+        F: Fn() + Sync,
+    {
         let _span = prof::span("query.build_cross_file_edges");
 
         // Build a multi-key name → (file, param_node_ids) index from all function defs.
@@ -335,6 +348,7 @@ impl Workspace {
                         }
                     }
                 }
+                on_file();
                 keys
             })
             .collect();

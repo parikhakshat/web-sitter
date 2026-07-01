@@ -200,13 +200,19 @@ fn run_scan(args: ScanArgs) -> Result<usize> {
     web_profiler::count("files_parsed", (source_files.len() - cpg_errors) as u64);
 
     // Stage 3 — Taint summarization / cross-file edge resolution
-    let edge_bar = mp.add(ProgressBar::new_spinner());
-    edge_bar.set_style(spinner_style.clone());
+    //
+    // This runs after every file's own CPG (and per-function taint summary) is
+    // already built in stage 2 — it's the workspace-wide pass that resolves each
+    // call site's callee across file boundaries. On a large codebase it can take
+    // long enough that a bare spinner looks indistinguishable from a hang, so it
+    // gets the same determinate per-file bar as CPG build / rule eval.
+    let edge_bar = mp.add(ProgressBar::new(workspace.files.len() as u64));
+    edge_bar.set_style(bar_style.clone());
     edge_bar.set_message("Summarizing taint & cross-file edges…");
     edge_bar.enable_steady_tick(std::time::Duration::from_millis(80));
 
     let _edge_span = web_profiler::span("stage.cross_file_edges");
-    workspace.build_cross_file_edges();
+    workspace.build_cross_file_edges_with_progress(|| edge_bar.inc(1));
     drop(_edge_span);
 
     let n_edges = workspace.cross_file_callee_params.len();

@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::RwLock;
+use web_profiler as prof;
 use web_sitter::{Cpg, IrNodeKind, NodeId};
 
 // ── DFG index ─────────────────────────────────────────────────────────────────
@@ -72,11 +73,14 @@ impl DfgIndex {
         // Fast path: already cached
         if let Ok(cache) = self.reach_cache.read() {
             if let Some(set) = cache.get(&source) {
+                prof::cache_hit("dfg.reach_cache");
                 return set.clone();
             }
         }
+        prof::cache_miss("dfg.reach_cache");
 
         // Compute via BFS
+        let _span = prof::span("dfg.reachable_from_bfs");
         let mut visited = HashSet::new();
         let mut queue = VecDeque::new();
         queue.push_back(source);
@@ -90,9 +94,14 @@ impl DfgIndex {
                 }
             }
         }
+        prof::count("dfg.reachable_from_bfs.nodes_visited", visited.len() as u64);
 
         // Store in cache (best-effort; ignore poison)
         if let Ok(mut cache) = self.reach_cache.write() {
+            // Rough per-entry footprint: one NodeId (u32) per visited node, plus
+            // the HashSet's own bucket overhead — good enough for cache accounting,
+            // not meant to be exact.
+            prof::cache_insert("dfg.reach_cache", (visited.len() * std::mem::size_of::<NodeId>()) as u64);
             cache.insert(source, visited.clone());
         }
         visited
@@ -138,6 +147,7 @@ impl DfgIndex {
         if from == to {
             return true;
         }
+        let _span = prof::span("dfg.reaches_with_barrier_bfs");
 
         let is_barrier = |node: NodeId| -> bool {
             cpg.ast
@@ -198,6 +208,7 @@ impl DfgIndex {
     /// BFS taint propagation from a set of source nodes, respecting sanitizers.
     /// Returns the set of all tainted nodes.
     pub fn propagate_taint(&self, sources: &[NodeId], cfg: &TaintConfig<'_>) -> TaintResult {
+        let _span = prof::span("dfg.propagate_taint_bfs");
         let mut tainted = HashSet::new();
         let mut sanitized_at = Vec::new();
         let mut queue: VecDeque<(NodeId, u32)> = VecDeque::new();
@@ -240,6 +251,7 @@ impl DfgIndex {
             }
         }
 
+        prof::count("dfg.propagate_taint_bfs.nodes_tainted", tainted.len() as u64);
         TaintResult { tainted, sanitized_at }
     }
 }

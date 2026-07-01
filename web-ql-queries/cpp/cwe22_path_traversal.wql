@@ -1,28 +1,29 @@
-// CWE-22: Path Traversal — C++
+// CWE-22: Path Traversal — C++ STL/filesystem supplement
+//
+// The POSIX-level path-traversal rule (fopen/open/getenv/realpath/etc.) lives
+// in c/cwe22_path_traversal.wql with `languages: [c, cpp]`, since those are
+// the same libc calls in both languages. This file adds only the constructs
+// that don't exist in C: STL stream I/O (std::cin, std::getline, ifstream/
+// ofstream) and std::filesystem path canonicalization.
 
-source cpp_user_input = find n: Call where
-    n.callee_name() in ["getenv", "getline", "cin.getline", "std::getline",
-                        "fgets", "gets", "scanf", "recv", "read"]
+source cpp_stream_input = find n: Call where
+    n.callee_name() in ["getline", "std::getline", "cin.getline", "operator>>"]
 
-sink cpp_file_sinks = find n: Call where
-    n.callee_name() in ["fopen", "open", "ifstream", "ofstream",
-                        "std::ifstream", "std::ofstream", "CreateFile",
-                        "CreateFileA", "CreateFileW", "OpenFile",
-                        "remove", "rename", "unlink", "rmdir", "mkdir"]
+sink cpp_stream_file_sinks = find n: Call where
+    n.callee_name() in ["ifstream", "ofstream", "std::ifstream", "std::ofstream",
+                        "fstream", "std::fstream"]
 
 sanitizer cpp_path_san = find n: Call where
-    n.callee_name() in ["realpath", "canonicalize_file_name",
-                        "std::filesystem::canonical",
-                        "std::filesystem::weakly_canonical"]
+    n.callee_name() in ["std::filesystem::canonical", "std::filesystem::weakly_canonical"]
 
-rule "cwe-22-cpp-path-traversal" {
+rule "cwe-22-cpp-stream-path-traversal" {
     severity: high
     languages: [cpp]
-    message: "Path traversal: user input used in file operation without canonicalization"
+    message: "Path traversal: user input from a stream used to open a file without canonicalization"
     tags: ["path-traversal", "cwe-22"]
     taint {
-        sources: ["cpp_user_input"]
-        sinks:   ["cpp_file_sinks"]
+        sources: ["cpp_stream_input"]
+        sinks:   ["cpp_stream_file_sinks"]
         sanitizers: ["cpp_path_san"]
     }
 }

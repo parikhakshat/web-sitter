@@ -1,9 +1,104 @@
 // CWE-125: Out-of-Bounds Read — C
-// Tainted index/size used in memory read operations.
+//
+// Unified coverage: the old version only caught OOB reads that went through a
+// short, hand-picked list of "read" function names flowing into
+// `c.bounded_copy_ops`. That misses two other major shapes of the same bug:
+//   1. A value that is provably out-of-bounds by static size tracking, with
+//      no taint/external input involved at all (`int a[5]; ... a[9]`).
+//   2. An externally-influenced value used directly as a subscript index
+//      rather than only as an argument to a named "bounded copy" library
+//      call — "externally-influenced" here means the full stdlib I/O
+//      surface, not one narrow hand-picked list.
+//      (A `ParamDef`-driven version of this — flagging any parameter that
+//      reaches a subscript — was tried and dropped: `dfg_reaches` from a
+//      `ParamDef` is intra-procedural only, with no gating on whether the
+//      function is ever called with tainted data, so it matched ordinary,
+//      safe code like `int get(int *arr, int idx) { return arr[idx]; }` in
+//      every function that indexes an array by one of its own parameters —
+//      tens of thousands of findings on a real codebase. `cwe89_sql_injection.wql`
+//      and `cwe674_770_resource_control.wql` ran into and rejected the same
+//      "any parameter" pattern for the same reason.)
+// All three shapes share the same predicates below, so this generalizes
+// rather than special-cases "subscript" as a one-off example.
+//
+// NOTE: raw pointer-arithmetic dereferences (`*(p + i)`) are a related shape
+// of this same bug but aren't covered here — reliably extracting the
+// pointer/offset operands requires walking through the grammar's
+// `parenthesized_expression` wrapper, which needs dedicated verification
+// against the C grammar before encoding as a rule (left as a follow-up
+// rather than shipping unverified child-index assumptions).
+
+// ── Shared taint-source vocabulary ────────────────────────────────────────────
+// Everything that can carry attacker-controlled bytes/length into a program:
+// the full POSIX/libc I/O surface, plus the integer-conversion functions that
+// turn a tainted string into a tainted integer (a very common path to a
+// tainted index: `int i = atoi(argv[1]); buf[i]`).
+
+pred is_external_value_source(n: Call) =
+    n.callee_name() in [
+        "read", "pread", "readv", "preadv",
+        "recv", "recvfrom", "recvmsg", "recvmmsg",
+        "fread", "fgets", "gets", "getchar", "getc", "fgetc",
+        "scanf", "fscanf", "sscanf", "vscanf", "vfscanf", "vsscanf",
+        "getenv", "secure_getenv", "getenv_s",
+        "argv", "getopt", "getopt_long", "getopt_long_only",
+        "getline", "getdelim", "mmap",
+        "accept", "accept4", "getpwnam", "getpwuid", "cuserid", "getlogin",
+        "atoi", "atol", "atoll", "strtol", "strtoul", "strtoll", "strtoull"
+    ]
+
+pred index_guarded(idx: Node, site: Node) =
+    exists(guard: Conditional |
+        idx.dfg_reaches(guard)
+        and guard.dominates(site))
+
+// ── 1. Statically provable OOB subscript — no taint required ─────────────────
+// `array[literal_index]` against a statically known allocation/declaration
+// size (array declarator, `malloc`-family call, or string literal — see
+// web-ql/src/size_tracking.rs).
+
+rule "cwe-125-c-static-oob-subscript" {
+    severity: high
+    languages: [c, cpp]
+    message: "OOB read: subscript index is provably out of bounds for the array's known size"
+    tags: ["oob-read", "cwe-125", "out-of-bounds"]
+    find sub: Subscript where
+        let base = sub.child(0) in
+        let decl = base.refers_to() in
+        let idx = sub.child(1) in
+        decl.has_known_size()
+        and idx.is_const_expr()
+        and idx.eval_int() != null
+        and (idx.eval_int() < 0 or idx.eval_int() >= decl.alloc_size())
+}
+
+// ── 2. Externally-influenced index used in a subscript without a bounds check ─
+// Best-effort: a dominating `Conditional` whose condition is reached by the
+// same tainted value is treated as a guard. It doesn't verify the comparison
+// operator/direction, so it can still under- or over-suppress in edge cases,
+// but it eliminates the common `if (i < len) a[i] = ...;` false positive.
+
+rule "cwe-125-c-tainted-subscript-index" {
+    severity: high
+    languages: [c, cpp]
+    message: "OOB read: externally-influenced value used as array subscript index without a bounds check"
+    tags: ["oob-read", "cwe-125", "out-of-bounds"]
+
+    find src: Call, sub: Subscript where
+        is_external_value_source(src)
+        and let idx = sub.child(1) in
+        src.dfg_reaches(idx)
+        and not index_guarded(idx, sub)
+}
+
+// ── 3. Tainted value controls a bounded-read size/offset argument ────────────
+// e.g. read(fd, buf, tainted_len), memcpy(dst, tainted_src_ptr, n), etc. This
+// is the general library-call surface (the full `c.bounded_copy_ops` set),
+// complementing the raw-subscript cases above.
 
 rule "cwe-125-c-tainted-read-size" {
     severity: high
-    languages: [c]
+    languages: [c, cpp]
     message: "OOB read: tainted value controls read size or index"
     tags: ["oob-read", "cwe-125"]
     taint {
@@ -11,7 +106,3 @@ rule "cwe-125-c-tainted-read-size" {
         sinks:   ["c.bounded_copy_ops"]
     }
 }
-
-// Subscript with tainted index is caught by the taint rule above when the
-// memory read functions are involved. Direct array[tainted_index] patterns
-// require alias-aware DFG that the engine provides via the above taint flow.

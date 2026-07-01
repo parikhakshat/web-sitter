@@ -1,20 +1,21 @@
-// CWE-327: Broken or Risky Cryptographic Algorithm — C / OpenSSL
+// CWE-327: Broken or Risky Cryptographic Algorithm — C / C++ / OpenSSL / Qt
 
 rule "cwe-327-c-weak-hash" {
     severity: high
-    languages: [c]
+    languages: [c, cpp]
     message: "Weak hash: MD5 or SHA-1 should not be used for security purposes"
     tags: ["weak-crypto", "broken-hash", "cwe-327"]
     find n: Call where
         n.callee_name() in ["MD5", "MD5_Init", "MD5_Update", "MD5_Final",
                             "MD5_Transform", "EVP_md5", "CC_MD5",
                             "SHA1", "SHA1_Init", "SHA1_Update", "SHA1_Final",
-                            "EVP_sha1", "CC_SHA1"]
+                            "EVP_sha1", "CC_SHA1",
+                            "QCryptographicHash::Md5", "QCryptographicHash::Sha1"]
 }
 
 rule "cwe-327-c-weak-cipher" {
     severity: critical
-    languages: [c]
+    languages: [c, cpp]
     message: "Weak cipher: DES or RC4 is cryptographically broken"
     tags: ["weak-crypto", "weak-cipher", "cwe-327"]
     find n: Call where
@@ -24,14 +25,27 @@ rule "cwe-327-c-weak-cipher" {
                             "RC4", "RC4_set_key", "EVP_rc4", "EVP_rc4_40"]
 }
 
+// The old rule checked arg(2) for every callee in the list, but these
+// functions don't share a signature: AES_set_encrypt_key(key, bits, ks) has
+// the key material at arg(0); EVP_EncryptInit(ctx, cipher, key, iv) has key
+// at arg(2)/iv at arg(3); EVP_EncryptInit_ex(ctx, cipher, impl, key, iv) has
+// key at arg(3)/iv at arg(4). Checking arg(2) against the wrong signature
+// (e.g. EVP_EncryptInit_ex's `impl` argument, almost never a string literal)
+// meant this never actually matched hardcoded EVP key/iv material.
 rule "cwe-327-c-hardcoded-iv" {
     severity: high
-    languages: [c]
+    languages: [c, cpp]
     message: "Hardcoded IV or key material reduces cryptographic security"
     tags: ["weak-crypto", "hardcoded-key", "cwe-327"]
     find n: Call where
-        n.callee_name() in ["AES_set_encrypt_key", "AES_set_decrypt_key",
-                            "EVP_EncryptInit", "EVP_DecryptInit",
-                            "EVP_EncryptInit_ex", "EVP_DecryptInit_ex"]
-        and n.arg(2) matches Literal { lit_kind: "String" }
+        n.callee_name() in ["AES_set_encrypt_key", "AES_set_decrypt_key"]
+        and n.arg(0) matches Literal { lit_kind: "String" }
+    find n: Call where
+        n.callee_name() in ["EVP_EncryptInit", "EVP_DecryptInit"]
+        and (n.arg(2) matches Literal { lit_kind: "String" }
+             or n.arg(3) matches Literal { lit_kind: "String" })
+    find n: Call where
+        n.callee_name() in ["EVP_EncryptInit_ex", "EVP_DecryptInit_ex"]
+        and (n.arg(3) matches Literal { lit_kind: "String" }
+             or n.arg(4) matches Literal { lit_kind: "String" })
 }

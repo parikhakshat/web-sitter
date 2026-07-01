@@ -192,32 +192,64 @@ impl<'a> RuleRunner<'a> {
             merged.register_static(name, nodes);
         }
 
+        // `merged` only has statically pre-resolved source/sink/sanitizer node
+        // lists so far — it has no propagator closures at all, which would
+        // silently drop both any rule-declared `propagators:` reference AND
+        // the default per-language STDLIB propagators applied in
+        // `TaintEngine::run`. Carry the base registry's propagators over.
+        merged.merge_propagators_from(self.ctx.registry);
+
         merged
     }
 
     // ── Search clause evaluation ──────────────────────────────────────────────
 
     fn eval_search(&self, plan: &SearchPlan) -> Vec<BindingEnv> {
+        // Multi-root patterns (e.g. `find outer: Conditional, inner: Conditional
+        // where outer.has_descendant(inner.id())`) evaluate a cross product of
+        // candidate nodes per binding, so the work is O(product of candidate
+        // counts) — quadratic or worse for patterns with two or more root
+        // bindings over a common, high-population kind. A single file with a
+        // large candidate set can dominate wall time on one thread while every
+        // other (file, rule) task sits idle, since parallelism elsewhere is only
+        // per-file / per-rule. Once the cross product for a binding step is large
+        // enough to be worth the dispatch overhead, evaluate it in parallel so
+        // rayon's work-stealing pool can pull other threads into this one rule.
+        const PARALLEL_THRESHOLD: usize = 64;
+
         let mut envs: Vec<BindingEnv> = vec![BindingEnv::new()];
         let last_idx = plan.root_bindings.len().saturating_sub(1);
 
         for (i, binding) in plan.root_bindings.iter().enumerate() {
             let is_last = i == last_idx;
-            let mut next_envs = Vec::new();
-            for env in &envs {
-                let candidates = candidates_for_binding(self.ctx.kind_index, binding);
-                for node_id in candidates {
-                    let mut child = env.child();
-                    child.insert(binding.name.clone(), BindingValue::Node(node_id));
-                    // Only evaluate the predicate once all root bindings are bound.
-                    // Intermediate bindings are collected unconditionally; the plan
-                    // may reference variables that haven't been added yet.
-                    if !is_last || self.eval_plan(&plan.plan, &child) {
-                        next_envs.push(child);
+            let candidates = candidates_for_binding(self.ctx.kind_index, binding);
+
+            envs = if envs.len().saturating_mul(candidates.len()) >= PARALLEL_THRESHOLD {
+                envs.par_iter()
+                    .flat_map_iter(|env| {
+                        candidates.iter().filter_map(move |&node_id| {
+                            let mut child = env.child();
+                            child.insert(binding.name.clone(), BindingValue::Node(node_id));
+                            // Only evaluate the predicate once all root bindings are bound.
+                            // Intermediate bindings are collected unconditionally; the plan
+                            // may reference variables that haven't been added yet.
+                            (!is_last || self.eval_plan(&plan.plan, &child)).then_some(child)
+                        })
+                    })
+                    .collect()
+            } else {
+                let mut next_envs = Vec::new();
+                for env in &envs {
+                    for &node_id in &candidates {
+                        let mut child = env.child();
+                        child.insert(binding.name.clone(), BindingValue::Node(node_id));
+                        if !is_last || self.eval_plan(&plan.plan, &child) {
+                            next_envs.push(child);
+                        }
                     }
                 }
-            }
-            envs = next_envs;
+                next_envs
+            };
         }
 
         envs
@@ -655,6 +687,11 @@ impl<'a> RuleRunner<'a> {
             "is_none" => EvalValue::Bool(false),
 
             // ── Tree navigation ───────────────────────────────────────────────
+            // `id()` returns the node's own identity as a Node value, so it can be
+            // passed into `has_ancestor(x.id())` / `has_descendant(x.id())` to check
+            // a relationship against one *specific* node, or compared with `==`/`!=`.
+            "id" => EvalValue::Node(node_id),
+
             "parent" => node.parent_id.map(EvalValue::Node).unwrap_or(EvalValue::Null),
 
             "function_id" => node.function_id.map(EvalValue::Node).unwrap_or(EvalValue::Null),
@@ -687,10 +724,22 @@ impl<'a> RuleRunner<'a> {
             }
 
             "has_ancestor" => {
-                let ty_str = step.args.first()
-                    .map(|a| self.eval_plan_expr(a, env))
-                    .and_then(|v| if let EvalValue::Str(s) = v { Some(s) } else { None });
-                EvalValue::Bool(!matches!(self.find_ancestor(node_id, ty_str.as_deref()), EvalValue::Null))
+                // Two overloads: `has_ancestor("type_name")` filters by type, and
+                // `has_ancestor(other.id())` checks whether `other` is specifically
+                // among this node's ancestors — a targeted identity check, not
+                // "does any ancestor exist". These must be distinguished by the
+                // evaluated argument's runtime type, since a `Node` and a `Str` are
+                // semantically different queries.
+                let arg = step.args.first().map(|a| self.eval_plan_expr(a, env));
+                match arg {
+                    Some(EvalValue::Node(target)) => {
+                        EvalValue::Bool(self.ancestor_id_match(node_id, target))
+                    }
+                    Some(EvalValue::Str(ty)) => {
+                        EvalValue::Bool(!matches!(self.find_ancestor(node_id, Some(&ty)), EvalValue::Null))
+                    }
+                    _ => EvalValue::Bool(!matches!(self.find_ancestor(node_id, None), EvalValue::Null)),
+                }
             }
 
             "descendant" => {
@@ -702,10 +751,16 @@ impl<'a> RuleRunner<'a> {
             }
 
             "has_descendant" => {
-                let ty_str = step.args.first()
-                    .map(|a| self.eval_plan_expr(a, env))
-                    .and_then(|v| if let EvalValue::Str(s) = v { Some(s) } else { None });
-                EvalValue::Bool(!matches!(self.find_descendant(node_id, ty_str.as_deref()), EvalValue::Null))
+                let arg = step.args.first().map(|a| self.eval_plan_expr(a, env));
+                match arg {
+                    Some(EvalValue::Node(target)) => {
+                        EvalValue::Bool(self.descendant_id_match(node_id, target))
+                    }
+                    Some(EvalValue::Str(ty)) => {
+                        EvalValue::Bool(!matches!(self.find_descendant(node_id, Some(&ty)), EvalValue::Null))
+                    }
+                    _ => EvalValue::Bool(!matches!(self.find_descendant(node_id, None), EvalValue::Null)),
+                }
             }
 
             "children" => {
@@ -980,6 +1035,40 @@ impl<'a> RuleRunner<'a> {
     }
 
     // ── Tree-walk helpers ─────────────────────────────────────────────────────
+
+    /// True if `target` appears in `node_id`'s parent_id chain. O(depth), not
+    /// O(subtree) — used for `has_ancestor(other.id())` identity checks.
+    fn ancestor_id_match(&self, node_id: NodeId, target: NodeId) -> bool {
+        let mut cur_id = node_id;
+        let mut steps = 0usize;
+        loop {
+            steps += 1;
+            if steps > 512 {
+                break; // guard against malformed parent chains
+            }
+            let Some(cur) = self.ctx.cpg.ast.get(&cur_id) else { break };
+            let Some(parent_id) = cur.parent_id else { break };
+            if parent_id == cur_id {
+                break; // self-loop guard
+            }
+            if parent_id == target {
+                return true;
+            }
+            cur_id = parent_id;
+        }
+        false
+    }
+
+    /// True if `target` is a descendant of `node_id` — equivalent to asking
+    /// whether `node_id` is an ancestor of `target`, so it reuses the same
+    /// O(depth) parent-chain walk from `target` upward instead of a BFS over
+    /// `node_id`'s whole subtree.
+    fn descendant_id_match(&self, node_id: NodeId, target: NodeId) -> bool {
+        if target == node_id {
+            return false; // a node is not its own descendant
+        }
+        self.ancestor_id_match(target, node_id)
+    }
 
     /// Walk up the parent_id chain from `node_id`; return the first ancestor
     /// whose `node_type` matches `ty_str` (case-insensitive). If `ty_str` is

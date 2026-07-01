@@ -2,24 +2,31 @@
 
 // ── CWE-674: Tainted recursion depth ─────────────────────────────────────────
 
+// The old condition only checked "function is recursive AND has some
+// parameter" — true for virtually every recursive function, since it never
+// verified that a parameter actually flows into the recursive call (i.e.
+// that it's a candidate depth/state argument rather than an unrelated one).
 rule "cwe-674-c-tainted-recursive-call" {
     severity: high
-    languages: [c]
+    languages: [c, cpp]
     message: "Uncontrolled recursion: tainted value may control recursion depth"
     tags: ["uncontrolled-recursion", "dos", "cwe-674"]
     find n: MethodDef where
         exists(call: Call |
             call.callee_name() == n.name
-            and call.has_ancestor(n.id()))
-        and exists(param: ParamDef |
-            param.has_ancestor(n.id()))
+            and call.has_ancestor(n.id())
+            and exists(param: ParamDef |
+                param.has_ancestor(n.id())
+                and (let a0 = call.arg(0) in param.dfg_reaches(a0)
+                     or let a1 = call.arg(1) in param.dfg_reaches(a1)
+                     or let a2 = call.arg(2) in param.dfg_reaches(a2))))
 }
 
 // ── CWE-770: Allocation size from external input without limit ────────────────
 
 rule "cwe-770-c-unlimited-alloc" {
     severity: high
-    languages: [c]
+    languages: [c, cpp]
     message: "Resource exhaustion: allocation size derived from external input without upper bound"
     tags: ["resource-exhaustion", "dos", "cwe-770"]
     taint {

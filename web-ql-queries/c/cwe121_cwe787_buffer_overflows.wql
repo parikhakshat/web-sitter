@@ -5,7 +5,7 @@
 
 rule "cwe-121-c-unbounded-string-copy" {
     severity: critical
-    languages: [c]
+    languages: [c, cpp]
     message: "Buffer overflow: unbounded string copy into fixed-size destination"
     tags: ["buffer-overflow", "stack-overflow", "cwe-121", "cwe-787"]
     find n: Call where
@@ -13,11 +13,32 @@ rule "cwe-121-c-unbounded-string-copy" {
                             "wcscpy", "wcscat"]
 }
 
+// ── Copy length provably exceeds the destination's statically known size ──────
+// A concrete, taint-free true positive: no external input is required when the
+// length argument is a compile-time constant larger than the destination
+// buffer's declared/allocated size (e.g. `char buf[8]; memcpy(buf, src, 16);`).
+
+rule "cwe-787-c-static-oob-bounded-copy" {
+    severity: critical
+    languages: [c, cpp]
+    message: "OOB write: copy length exceeds the destination buffer's statically known size"
+    tags: ["oob-write", "buffer-overflow", "cwe-787"]
+    find n: Call where
+        n.callee_name() in ["memcpy", "memmove", "strncpy", "strncat"]
+        and let dst = n.arg(0) in
+        let decl = dst.refers_to() in
+        let len = n.arg(2) in
+        decl.has_known_size()
+        and len.is_const_expr()
+        and len.eval_int() != null
+        and len.eval_int() > decl.alloc_size()
+}
+
 // ── Tainted size to bounded-but-unsafe copy ───────────────────────────────────
 
 rule "cwe-787-c-tainted-copy-size" {
     severity: critical
-    languages: [c]
+    languages: [c, cpp]
     message: "OOB write: tainted size used in memory copy"
     tags: ["oob-write", "buffer-overflow", "cwe-787"]
     taint {
@@ -30,7 +51,7 @@ rule "cwe-787-c-tainted-copy-size" {
 
 rule "cwe-787-c-tainted-alloc-size" {
     severity: critical
-    languages: [c]
+    languages: [c, cpp]
     message: "OOB write: tainted value used as allocation size (potential integer overflow)"
     tags: ["oob-write", "integer-overflow", "cwe-787", "cwe-190"]
     taint {

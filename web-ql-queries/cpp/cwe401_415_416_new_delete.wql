@@ -1,0 +1,88 @@
+// CWE-401: Memory Leak / CWE-415: Double Free / CWE-416: Use After Free — C++ `new`/`delete`
+//
+// c/cwe401_415_416_memory_safety.wql already covers malloc/free (also valid,
+// and common, in C++), and is `languages: [c, cpp]` so it applies here too.
+// This file covers the genuinely C++-specific construct on top of that:
+// `new`/`delete` lift to their own IrNodeKind (NewExpr/DeleteExpr, see
+// web-sitter/src/lifter.rs), a different node shape than a `free()` Call, so
+// they need their own DFG-correlation rules rather than fitting into the
+// existing Call-based ones. Also covers the classic C++-only bug of mixing
+// the two allocator families (new'd memory freed with `free()`, or vice
+// versa), which cannot occur in pure C.
+
+// ── CWE-415: Double delete — ordered by CFG, same pointer via DFG ────────────
+
+rule "cwe-415-cpp-double-delete" {
+    severity: critical
+    languages: [cpp]
+    message: "Double free: delete called twice on the same pointer on a reachable path"
+    tags: ["double-free", "memory-safety", "cwe-415"]
+    find d1: Expr, d2: Expr where
+        d1.raw_kind() == "delete_expression"
+        and d2.raw_kind() == "delete_expression"
+        and d1.id() != d2.id()
+        and d1.cfg_reaches(d2)
+        and let p1 = d1.arg(0) in
+        let p2 = d2.arg(0) in
+        p1.dfg_reaches(p2)
+}
+
+// ── CWE-416: Use after delete — CFG-ordered AND correlated by pointer identity ─
+
+rule "cwe-416-cpp-use-after-delete" {
+    severity: critical
+    languages: [cpp]
+    message: "Use after free: pointer dereferenced after delete on a reachable path"
+    tags: ["use-after-free", "memory-safety", "cwe-416"]
+    find del: Expr, use_node: MemberAccess where
+        del.raw_kind() == "delete_expression"
+        and del.cfg_reaches(use_node)
+        and let freed = del.arg(0) in
+        let ptr = use_node.receiver() in
+        freed.dfg_reaches(ptr)
+    find del: Expr, use_node: Subscript where
+        del.raw_kind() == "delete_expression"
+        and del.cfg_reaches(use_node)
+        and let freed = del.arg(0) in
+        let ptr = use_node.child(0) in
+        freed.dfg_reaches(ptr)
+}
+
+// ── CWE-401: `new` result discarded — memory leak ─────────────────────────────
+
+rule "cwe-401-cpp-new-discarded" {
+    severity: high
+    languages: [cpp]
+    message: "Memory leak: `new` allocation result discarded (not assigned to a variable)"
+    tags: ["memory-leak", "cwe-401"]
+    find n: Expr where
+        n.raw_kind() == "new_expression"
+        and not (n.parent() matches Assign { }
+                 or n.parent() matches LocalDef { }
+                 or n.parent() matches Return { }
+                 or n.parent() matches FieldDef { })
+}
+
+// ── CWE-762: Mismatched allocator/deallocator — new'd memory freed with
+// free(), or malloc'd memory freed with delete. Undefined behavior: the two
+// allocator families track size/bookkeeping differently and mixing them
+// corrupts heap metadata. Only possible in C++, since C has no `new`/`delete`.
+
+rule "cwe-762-cpp-mismatched-alloc-dealloc" {
+    severity: critical
+    languages: [cpp]
+    message: "Mismatched allocation: pointer allocated with `new`/`malloc` is released with the other family's deallocator"
+    tags: ["memory-safety", "cwe-762", "cwe-415"]
+    find alloc: Expr, free_call: Call where
+        alloc.raw_kind() == "new_expression"
+        and free_call.callee_name() in ["free", "cfree", "kfree", "g_free"]
+        and alloc.cfg_reaches(free_call)
+        and let freed = free_call.arg(0) in
+        alloc.dfg_reaches(freed)
+    find alloc: Call, del: Expr where
+        alloc.callee_name() in ["malloc", "calloc", "realloc", "strdup", "strndup"]
+        and del.raw_kind() == "delete_expression"
+        and alloc.cfg_reaches(del)
+        and let freed = del.arg(0) in
+        alloc.dfg_reaches(freed)
+}

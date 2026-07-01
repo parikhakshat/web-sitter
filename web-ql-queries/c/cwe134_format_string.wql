@@ -2,25 +2,51 @@
 // The format argument to printf-family is not a string literal (user-controlled).
 
 // ── Direct check: format arg is not a literal ─────────────────────────────────
+// The format-string argument sits at a different index per function, and the
+// old rule checked `not (arg0 is literal or arg1 is literal)` regardless of
+// which function was called. That's wrong for e.g. `snprintf(buf, sizeof(buf),
+// "literal", ...)`, where the format is arg(2): neither arg0 (buffer, never a
+// literal) nor arg1 (size, never a literal) is a literal, so the old rule
+// flagged nearly every snprintf call as a false positive — even ones whose
+// format string plainly was a literal. Split by the function's actual
+// format-argument position instead.
 
-rule "cwe-134-c-nonliteral-format" {
+rule "cwe-134-c-nonliteral-format-arg0" {
     severity: critical
-    languages: [c]
+    languages: [c, cpp]
     message: "Format string injection: format argument is not a string literal"
     tags: ["format-string", "cwe-134"]
     find n: Call where
-        n.callee_name() in ["printf", "fprintf", "sprintf", "snprintf",
-                            "vprintf", "vfprintf", "vsprintf", "vsnprintf",
-                            "syslog", "err", "warn", "errx", "warnx"]
-        and not (n.arg(0) matches Literal { lit_kind: "String" }
-                 or n.arg(1) matches Literal { lit_kind: "String" })
+        n.callee_name() in ["printf", "vprintf", "warn", "warnx"]
+        and not n.arg(0) matches Literal { lit_kind: "String" }
+}
+
+rule "cwe-134-c-nonliteral-format-arg1" {
+    severity: critical
+    languages: [c, cpp]
+    message: "Format string injection: format argument is not a string literal"
+    tags: ["format-string", "cwe-134"]
+    find n: Call where
+        n.callee_name() in ["fprintf", "sprintf", "vfprintf", "vsprintf",
+                            "syslog", "err", "errx"]
+        and not n.arg(1) matches Literal { lit_kind: "String" }
+}
+
+rule "cwe-134-c-nonliteral-format-arg2" {
+    severity: critical
+    languages: [c, cpp]
+    message: "Format string injection: format argument is not a string literal"
+    tags: ["format-string", "cwe-134"]
+    find n: Call where
+        n.callee_name() in ["snprintf", "vsnprintf"]
+        and not n.arg(2) matches Literal { lit_kind: "String" }
 }
 
 // ── Taint flow: external input reaches format position ────────────────────────
 
 rule "cwe-134-c-tainted-format" {
     severity: critical
-    languages: [c]
+    languages: [c, cpp]
     message: "Format string injection: tainted data reaches format argument"
     tags: ["format-string", "cwe-134"]
     taint {

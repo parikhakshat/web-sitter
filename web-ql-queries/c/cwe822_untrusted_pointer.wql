@@ -1,16 +1,27 @@
 // CWE-822: Untrusted Pointer Dereference — C
 // Pointer value from external input used without validation.
 
-sink c_ptr_sink = find n: MemberAccess where
-    n.raw_kind() in ["pointer_expression", "subscript_expression"]
+// NOTE: `subscript_expression` (a[i]) lifts to IrNodeKind::Subscript, a
+// distinct type from MemberAccess (field/pointer access) — the original
+// single `find n: MemberAccess where n.raw_kind() in [..., "subscript_expression"]`
+// could never match subscripts, since the `MemberAccess` binding only seeds
+// MemberAccess-kind nodes. Split into two sinks, both referenced below
+// (`sinks:` accepts multiple endpoints — `or find` alternation inside a
+// single sink/source isn't actually supported by the parser despite being
+// documented, so two named endpoints are used instead).
+sink c_ptr_member_sink = find n: MemberAccess where
+    n.raw_kind() in ["pointer_expression", "field_expression"]
+
+sink c_ptr_subscript_sink = find n: Subscript where
+    n.raw_kind() == "subscript_expression"
 
 rule "cwe-822-c-tainted-pointer-deref" {
     severity: critical
-    languages: [c]
+    languages: [c, cpp]
     message: "Untrusted pointer: externally sourced value used as pointer"
     tags: ["untrusted-pointer", "memory-safety", "cwe-822"]
     taint {
         sources: ["c.io_sources"]
-        sinks:   ["c_ptr_sink"]
+        sinks:   ["c_ptr_member_sink", "c_ptr_subscript_sink"]
     }
 }

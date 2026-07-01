@@ -20,24 +20,35 @@ rule "cwe-476-java-nullable-unchecked-deref" {
                               "getHeader", "getAttribute", "poll", "peek",
                               "orElse", "getNullable"]
         and src.cfg_reaches(deref)
+        // The nullable return value must actually flow into the dereferenced
+        // receiver — without this, the rule fired on any CFG-reachable pair
+        // of a nullable-returning call and an unrelated member access.
+        and src.dfg_reaches(deref)
         and not null_checked(src, deref)
 }
 
 // ── Taint: HTTP parameter used as object without null check ───────────────────
-
-source java_web_input = find n: Call where
-    n.callee_name() in ["getParameter", "getHeader", "getAttribute", "getProperty"]
-
-sink java_method_call = find n: MemberAccess where
-    n.raw_kind() in ["method_invocation", "field_access"]
+// Previously a `taint{}` block whose sink was
+// `find n: MemberAccess where n.raw_kind() in ["method_invocation", "field_access"]`.
+// `"method_invocation"` lifts to IrNodeKind::Call, not MemberAccess, so that
+// half was dead — method calls on a tainted, unchecked receiver were never
+// actually caught, only direct field accesses were. Rewritten as an explicit
+// DFG-reachability check into the call's receiver (`n.receiver()`, the
+// documented accessor for a Call's object/receiver expression), which
+// correctly covers both `tainted.field` and `tainted.method()`.
 
 rule "cwe-476-java-tainted-null-deref" {
     severity: high
     languages: [java]
     message: "Null dereference: HTTP parameter used as object without null check"
     tags: ["null-dereference", "cwe-476"]
-    taint {
-        sources: ["java_web_input"]
-        sinks:   ["java_method_call"]
-    }
+    find src: Call, deref: MemberAccess where
+        src.callee_name() in ["getParameter", "getHeader", "getAttribute", "getProperty"]
+        and src.dfg_reaches(deref)
+        and not null_checked(src, deref)
+    find src: Call, call: Call where
+        src.callee_name() in ["getParameter", "getHeader", "getAttribute", "getProperty"]
+        and let recv = call.receiver() in
+        src.dfg_reaches(recv)
+        and not null_checked(src, call)
 }

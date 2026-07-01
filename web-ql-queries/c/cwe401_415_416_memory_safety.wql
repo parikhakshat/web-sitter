@@ -4,7 +4,7 @@
 
 rule "cwe-415-c-double-free" {
     severity: critical
-    languages: [c]
+    languages: [c, cpp]
     message: "Double free: free() called twice on the same pointer on a reachable path"
     tags: ["double-free", "memory-safety", "cwe-415"]
     find f1: Call, f2: Call where
@@ -17,24 +17,39 @@ rule "cwe-415-c-double-free" {
             a1.dfg_reaches(a2)
 }
 
-// ── CWE-416: Use after free — ordered by CFG reachability ────────────────────
+// ── CWE-416: Use after free — CFG-ordered AND correlated by pointer identity ──
+// The old version fired on *any* dereference reachable after *any* free() in
+// the same function, regardless of which pointer was freed — a huge source of
+// false positives (two unrelated pointers, one freed and one dereferenced,
+// would both trigger). Require the freed argument to actually DFG-reach the
+// pointer being dereferenced/subscripted.
 
 rule "cwe-416-c-use-after-free" {
     severity: critical
-    languages: [c]
+    languages: [c, cpp]
     message: "Use after free: pointer dereferenced after free() on a reachable path"
     tags: ["use-after-free", "memory-safety", "cwe-416"]
     find free_call: Call, use_node: MemberAccess where
         free_call.callee_name() in ["free", "cfree", "kfree", "zfree", "g_free",
                                     "av_free", "av_freep", "OPENSSL_free"]
         and free_call.cfg_reaches(use_node)
+        and let freed = free_call.arg(0) in
+        let ptr = use_node.receiver() in
+        freed.dfg_reaches(ptr)
+    find free_call: Call, use_node: Subscript where
+        free_call.callee_name() in ["free", "cfree", "kfree", "zfree", "g_free",
+                                    "av_free", "av_freep", "OPENSSL_free"]
+        and free_call.cfg_reaches(use_node)
+        and let freed = free_call.arg(0) in
+        let ptr = use_node.child(0) in
+        freed.dfg_reaches(ptr)
 }
 
 // ── CWE-401: Allocation not assigned — memory discarded ──────────────────────
 
 rule "cwe-401-c-alloc-discarded" {
     severity: high
-    languages: [c]
+    languages: [c, cpp]
     message: "Memory leak: allocation result discarded (not assigned to a variable)"
     tags: ["memory-leak", "cwe-401"]
     find n: Call where

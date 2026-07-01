@@ -2,7 +2,7 @@ mod fixtures;
 use fixtures::*;
 use std::path::PathBuf;
 use std::sync::Arc;
-use web_sitter::{CrossFileCallEdge, IrNodeKind};
+use web_sitter::{CrossFileCallEdge, FunctionSummary, IrNodeKind, ParamEffect};
 use web_ql::{
     ir::{CompiledClause, CompiledRule, QueryPlan, RootBinding, RuleSet, SearchPlan},
     ast::{Severity, TypeExpr},
@@ -571,5 +571,349 @@ fn scan_integrates_with_profiler() {
     assert!(
         report.stages.iter().any(|s| s.name.contains("scan")),
         "profiler should record scan stages"
+    );
+}
+
+#[test]
+fn scan_with_interprocedural_taint_records_dfg_reachability_and_bfs_profiling() {
+    // Same shape as `scan_taint_rule_finds_interprocedural_flow_through_function_summary`
+    // — the point here isn't the finding itself (already covered there) but that
+    // running an interprocedural taint scan actually shows up under the profiler:
+    // the `DfgIndex::reachable_from` cache and the various named BFS spans
+    // (`dfg.propagate_taint_bfs`, `taint.expand_interprocedural`,
+    // `taint.reaches_with_propagators_bfs`) used internally to compute it.
+    web_profiler::init();
+
+    const SOURCE: u32 = 1;
+    const WRAP: u32 = 2;
+    const SINK: u32 = 3;
+
+    let source_call = make_call_node(SOURCE, "get_input", vec![]);
+    let wrap_call = make_call_node(WRAP, "wrap1", vec![SOURCE]);
+    let sink_call = make_call_node(SINK, "execute_sql", vec![]);
+
+    let mut cpg = make_cpg_with_dfg(
+        vec![(SOURCE, source_call), (WRAP, wrap_call), (SINK, sink_call)],
+        vec![(WRAP, SINK, "result")],
+    );
+    let mut param_effects = std::collections::BTreeSet::new();
+    param_effects.insert(ParamEffect::TaintReturn(0));
+    cpg.workspace.function_summaries.insert(
+        100,
+        FunctionSummary {
+            name: "wrap1".to_owned(),
+            param_effects,
+            ..FunctionSummary::default()
+        },
+    );
+
+    let mut ws = Workspace::new(empty_registry());
+    ws.upsert_file(path("a.py"), cpg, 1);
+
+    let rule_src = r#"
+        source src = find n: Call where n.name == "get_input"
+        sink snk = find n: Call where n.name == "execute_sql"
+        rule "interprocedural-profiled" {
+            taint {
+                sources: ["src"]
+                sinks: ["snk"]
+            }
+        }
+        rule "direct-dfg-reaches-profiled" {
+            find a: Call, b: Call where
+                a.name == "wrap1" and b.name == "execute_sql" and a.dfg_reaches(b)
+        }
+    "#;
+    let rule_set = compile_rules(rule_src).expect("rule should compile");
+    let findings = ws.scan(&rule_set);
+    assert_eq!(
+        findings.len(),
+        2,
+        "sanity: both the taint flow and the direct dfg_reaches match should be found: {findings:?}"
+    );
+
+    let report = web_profiler::report();
+    let stage_names: Vec<&str> = report.stages.iter().map(|s| s.name.as_str()).collect();
+    for expected in [
+        "dfg.propagate_taint_bfs",
+        "taint.expand_interprocedural",
+        "taint.reaches_with_propagators_bfs",
+    ] {
+        assert!(
+            stage_names.iter().any(|n| *n == expected),
+            "expected profiler stage `{expected}` to be recorded, got: {stage_names:?}"
+        );
+    }
+
+    let cache_names: Vec<&str> = report.caches.iter().map(|c| c.name.as_str()).collect();
+    assert!(
+        cache_names.iter().any(|n| *n == "dfg.reach_cache"),
+        "expected `dfg.reach_cache` to be tracked as a profiler cache, got: {cache_names:?}"
+    );
+}
+
+// ── Default STDLIB propagator application ──────────────────────────────────────
+
+#[test]
+fn scan_applies_stdlib_propagator_by_default_without_rule_declaring_it() {
+    // getParameter() [1] -> append(1) [2, args=[1]] -> (DFG edge) -> execute_sql() [3]
+    // There is NO direct DFG edge from 1 to 2 — the only link is the Java
+    // stdlib propagator entry for `append` (dst: -1 i.e. return value, src: [0]).
+    // Before wiring per-language STDLIB propagators into the default taint
+    // scan, this taint flow was invisible unless the rule explicitly listed
+    // `propagators: [...]`. The rule below deliberately does not.
+    let src_call = make_call_node(1, "getParameter", vec![]);
+    let append_call = make_call_node(2, "append", vec![1]);
+    let sink_call = make_call_node(3, "execute_sql", vec![]);
+
+    let cpg = make_cpg_with_dfg(
+        vec![(1, src_call), (2, append_call), (3, sink_call)],
+        vec![(2, 3, "result")],
+    );
+    let mut cpg = cpg;
+    cpg.language = "java".to_owned();
+
+    let mut ws = Workspace::new(web_ql::security_patterns::builtin_endpoint_registry());
+    ws.upsert_file(path("A.java"), cpg, 1);
+
+    let rule_src = r#"
+        source java_src = find n: Call where n.name == "getParameter"
+        sink java_sink = find n: Call where n.name == "execute_sql"
+        rule "propagator-default-test" {
+            taint {
+                sources: ["java_src"]
+                sinks: ["java_sink"]
+            }
+        }
+    "#;
+    let rule_set = compile_rules(rule_src).expect("rule should compile");
+    let findings = ws.scan(&rule_set);
+
+    assert_eq!(
+        findings.len(),
+        1,
+        "taint should flow through the stdlib `append` propagator by default: {findings:?}"
+    );
+}
+
+// ── Interprocedural / cross-file BFS-from-seeds integration ───────────────────
+//
+// The taint.rs unit tests exercise `TaintEngine::expand_interprocedural` and
+// `expand_cross_file` directly, bypassing the actual `.wql` rule pipeline. These
+// tests instead go through `compile_rules` + `Workspace::scan`, the same path a
+// real rule file takes, to lock in that BFS-from-seeds actually crosses function
+// and file boundaries end to end — not just at the unit level.
+
+#[test]
+fn scan_taint_rule_finds_interprocedural_flow_through_function_summary() {
+    // get_input() [1] -> wrap1(1) [2] -> (DFG) -> execute_sql() [3]
+    // There is no direct DFG edge from 1 to 2 — `wrap1`'s return value only
+    // becomes tainted via its `FunctionSummary` (TaintReturn(0): "tainted arg 0
+    // taints the return value"), which `expand_interprocedural`'s call-argument
+    // worklist must discover purely from `wrap1(source)` being a call whose
+    // argument is tainted. From there, the ordinary DFG edge wrap1 -> sink
+    // carries the (now-tainted) call node the rest of the way.
+    const SOURCE: u32 = 1;
+    const WRAP: u32 = 2;
+    const SINK: u32 = 3;
+
+    let source_call = make_call_node(SOURCE, "get_input", vec![]);
+    let wrap_call = make_call_node(WRAP, "wrap1", vec![SOURCE]);
+    let sink_call = make_call_node(SINK, "execute_sql", vec![]);
+
+    let mut cpg = make_cpg_with_dfg(
+        vec![(SOURCE, source_call), (WRAP, wrap_call), (SINK, sink_call)],
+        vec![(WRAP, SINK, "result")],
+    );
+    let mut param_effects = std::collections::BTreeSet::new();
+    param_effects.insert(ParamEffect::TaintReturn(0));
+    cpg.workspace.function_summaries.insert(
+        100,
+        FunctionSummary {
+            name: "wrap1".to_owned(),
+            param_effects,
+            ..FunctionSummary::default()
+        },
+    );
+
+    let mut ws = Workspace::new(empty_registry());
+    ws.upsert_file(path("a.py"), cpg, 1);
+
+    let rule_src = r#"
+        source src = find n: Call where n.name == "get_input"
+        sink snk = find n: Call where n.name == "execute_sql"
+        rule "interprocedural" {
+            taint {
+                sources: ["src"]
+                sinks: ["snk"]
+            }
+        }
+    "#;
+    let rule_set = compile_rules(rule_src).expect("rule should compile");
+    let findings = ws.scan(&rule_set);
+
+    assert_eq!(
+        findings.len(),
+        1,
+        "taint should flow interprocedurally through wrap1's function summary: {findings:?}"
+    );
+}
+
+#[test]
+fn scan_taint_rule_finds_cross_file_flow_through_callee_return() {
+    // caller.py: get_input() [1] -> helper(1) [2] -> (DFG) -> execute_sql() [3]
+    // callee.py: fn helper(param) { return param; }  (param [101] -DFG-> return [102])
+    // `helper` is defined in a different file, so the only way the call node [2]
+    // becomes tainted is via `expand_cross_file`: it must resolve the cross-file
+    // call edge, propagate taint into callee.py's own DFG from the matched param
+    // node, see the callee's Return node become tainted, and mark the call site
+    // itself tainted — purely from `Workspace::build_cross_file_edges` metadata,
+    // with no same-file DFG edge bridging [1] to [2] at all.
+    const HELPER_FN: u32 = 100;
+    const PARAM: u32 = 101;
+    const RETURN: u32 = 102;
+
+    let mut helper_fn = make_node(HELPER_FN, IrNodeKind::MethodDef, Some("helper"));
+    let param_node = make_node_in_fn(PARAM, IrNodeKind::ParamDef, Some("param"), HELPER_FN);
+    let return_node = make_node_in_fn(RETURN, IrNodeKind::Return, None, HELPER_FN);
+    helper_fn.children = vec![PARAM];
+
+    let callee_cpg = make_cpg_with_dfg(
+        vec![(HELPER_FN, helper_fn), (PARAM, param_node), (RETURN, return_node)],
+        vec![(PARAM, RETURN, "param")],
+    );
+
+    const CALLER_FN: u32 = 10;
+    const SOURCE: u32 = 1;
+    const CALL: u32 = 2;
+    const SINK: u32 = 3;
+
+    let caller_fn = make_node(CALLER_FN, IrNodeKind::MethodDef, Some("main"));
+    let source_call = make_node_in_fn(SOURCE, IrNodeKind::Call, Some("get_input"), CALLER_FN);
+    let call_node = {
+        let mut n = make_call_node(CALL, "helper", vec![SOURCE]);
+        n.function_id = Some(CALLER_FN);
+        n
+    };
+    let sink_call = make_node_in_fn(SINK, IrNodeKind::Call, Some("execute_sql"), CALLER_FN);
+
+    let mut caller_cpg = make_cpg_with_dfg(
+        vec![
+            (CALLER_FN, caller_fn),
+            (SOURCE, source_call),
+            (CALL, call_node),
+            (SINK, sink_call),
+        ],
+        vec![(CALL, SINK, "result")],
+    );
+    caller_cpg.workspace.cross_file_calls = vec![CrossFileCallEdge {
+        call_node: CALL,
+        caller_fn: CALLER_FN,
+        callee_name: "helper".to_owned(),
+        qualified_callee: None,
+        arg_positions: vec![],
+    }];
+
+    let mut ws = Workspace::new(empty_registry());
+    ws.upsert_file(path("callee.py"), callee_cpg, 1);
+    ws.upsert_file(path("caller.py"), caller_cpg, 1);
+    ws.build_cross_file_edges();
+
+    let rule_src = r#"
+        source src = find n: Call where n.name == "get_input"
+        sink snk = find n: Call where n.name == "execute_sql"
+        rule "cross-file" {
+            taint {
+                sources: ["src"]
+                sinks: ["snk"]
+            }
+        }
+    "#;
+    let rule_set = compile_rules(rule_src).expect("rule should compile");
+    let findings = ws.scan(&rule_set);
+
+    assert_eq!(
+        findings.len(),
+        1,
+        "taint should flow cross-file through helper's callee-side return: {findings:?}"
+    );
+}
+
+#[test]
+fn scan_taint_rule_no_cross_file_flow_when_callee_param_unused() {
+    // Same shape as the passing cross-file test above, but callee.py's `helper`
+    // never routes its param to a Return node (dead parameter) — so the callee
+    // DFG can't taint any Return node, and expand_cross_file must NOT mark the
+    // call site tainted. Without this negative case, a version of
+    // `expand_cross_file` that ignores the callee's actual dataflow (e.g. one
+    // that treats "call resolves cross-file" as sufficient) would pass the
+    // positive test above for the wrong reason.
+    const HELPER_FN: u32 = 100;
+    const PARAM: u32 = 101;
+    const RETURN: u32 = 102;
+
+    let mut helper_fn = make_node(HELPER_FN, IrNodeKind::MethodDef, Some("helper"));
+    let param_node = make_node_in_fn(PARAM, IrNodeKind::ParamDef, Some("param"), HELPER_FN);
+    let return_node = make_node_in_fn(RETURN, IrNodeKind::Return, None, HELPER_FN);
+    helper_fn.children = vec![PARAM];
+
+    // No DFG edge from PARAM to RETURN this time.
+    let callee_cpg = make_cpg_with_dfg(
+        vec![(HELPER_FN, helper_fn), (PARAM, param_node), (RETURN, return_node)],
+        vec![],
+    );
+
+    const CALLER_FN: u32 = 10;
+    const SOURCE: u32 = 1;
+    const CALL: u32 = 2;
+    const SINK: u32 = 3;
+
+    let caller_fn = make_node(CALLER_FN, IrNodeKind::MethodDef, Some("main"));
+    let source_call = make_node_in_fn(SOURCE, IrNodeKind::Call, Some("get_input"), CALLER_FN);
+    let call_node = {
+        let mut n = make_call_node(CALL, "helper", vec![SOURCE]);
+        n.function_id = Some(CALLER_FN);
+        n
+    };
+    let sink_call = make_node_in_fn(SINK, IrNodeKind::Call, Some("execute_sql"), CALLER_FN);
+
+    let mut caller_cpg = make_cpg_with_dfg(
+        vec![
+            (CALLER_FN, caller_fn),
+            (SOURCE, source_call),
+            (CALL, call_node),
+            (SINK, sink_call),
+        ],
+        vec![(CALL, SINK, "result")],
+    );
+    caller_cpg.workspace.cross_file_calls = vec![CrossFileCallEdge {
+        call_node: CALL,
+        caller_fn: CALLER_FN,
+        callee_name: "helper".to_owned(),
+        qualified_callee: None,
+        arg_positions: vec![],
+    }];
+
+    let mut ws = Workspace::new(empty_registry());
+    ws.upsert_file(path("callee.py"), callee_cpg, 1);
+    ws.upsert_file(path("caller.py"), caller_cpg, 1);
+    ws.build_cross_file_edges();
+
+    let rule_src = r#"
+        source src = find n: Call where n.name == "get_input"
+        sink snk = find n: Call where n.name == "execute_sql"
+        rule "cross-file-negative" {
+            taint {
+                sources: ["src"]
+                sinks: ["snk"]
+            }
+        }
+    "#;
+    let rule_set = compile_rules(rule_src).expect("rule should compile");
+    let findings = ws.scan(&rule_set);
+
+    assert!(
+        findings.is_empty(),
+        "no cross-file flow should be reported when the callee never returns the tainted param: {findings:?}"
     );
 }

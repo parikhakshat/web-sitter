@@ -4,7 +4,7 @@
 
 rule "cwe-362-c-toctou-file" {
     severity: high
-    languages: [c]
+    languages: [c, cpp]
     message: "TOCTOU race: file checked then used on the same execution path — state may change"
     tags: ["race-condition", "toctou", "cwe-362"]
     find check: Call, use: Call where
@@ -12,6 +12,12 @@ rule "cwe-362-c-toctou-file" {
         and use.callee_name() in ["open", "fopen", "unlink", "rename", "chmod",
                                   "chown", "execve", "mkdir", "rmdir", "link"]
         and check.cfg_reaches(use)
+        // The check and use must reference the same path — without this, any
+        // access()-then-open()-of-an-unrelated-file pair on the same CFG path
+        // (extremely common) was flagged. Path args are usually string literals
+        // or a single variable/parameter, so a textual compare of the argument
+        // expression is a reasonable proxy for "same resource" here.
+        and check.arg(0).text() == use.arg(0).text()
         // NOTE: suppressing locked regions (a CFG path with a mutex lock between
         // check and use) requires alias(lock.arg, shared_var) — see missing-features.md.
 }
@@ -20,7 +26,7 @@ rule "cwe-362-c-toctou-file" {
 
 rule "cwe-362-c-double-checked-locking" {
     severity: medium
-    languages: [c]
+    languages: [c, cpp]
     message: "Double-checked locking is broken without memory barriers"
     tags: ["race-condition", "double-checked-locking", "cwe-362"]
     find outer: Conditional, inner: Conditional where

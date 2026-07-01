@@ -51,5 +51,12 @@ rule "cwe-369-rust-tainted-divisor" {
     }
 }
 
+// NOTE: `"div_assign"`/`"rem_assign"` aren't real tree-sitter-rust node kinds
+// (verified against its grammar) — the only compound-assignment node type is
+// `compound_assignment_expr`, which lifts to IrNodeKind::Assign, not
+// BinaryOp, so both were dead and `/=`/`%=` divisors went uncaught. The
+// operator itself isn't a queryable field, so scope by a `/`/`%` character
+// in the source text (mirrors the equivalent C fix in cwe369_divide_by_zero.wql).
 sink rust_div_sinks = find n: BinaryOp where
-    n.raw_kind() in ["binary_expression", "div_assign", "rem_assign"]
+    n.raw_kind() == "binary_expression"
+    and n.text() in /[\/%]/

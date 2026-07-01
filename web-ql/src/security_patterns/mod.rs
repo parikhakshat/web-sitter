@@ -79,8 +79,39 @@ pub use c::{
     PTHREAD_FUNCTIONS,
 };
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::LazyLock;
+
+/// Map every `Call` node id in `cpg` to its resolved callee name.
+///
+/// `IrNode::name` is NOT populated for `Call` nodes by every language's
+/// lifter — for C, for example, the callee identifier lives in a separate
+/// child `Identifier` node, and the `Call` node's own `.name` is `None`. The
+/// query engine's `n.callee_name()` (see `engine.rs`) already knows this and
+/// resolves through `cpg.call_graph`'s per-call-site `CallSite.callee`
+/// instead (mirrored here from `KindIndex::build`'s `call_site_by_node`
+/// index). Any code matching taint sources/sinks/propagators by callee name
+/// against `node.name` directly — as this module's registry used to — silently
+/// matches nothing for those languages. Falls back to `node.name` for
+/// languages/node shapes where it *is* populated directly.
+fn callee_names_by_node(cpg: &web_sitter::Cpg) -> HashMap<web_sitter::NodeId, String> {
+    let mut names: HashMap<web_sitter::NodeId, String> = HashMap::new();
+    for entry in cpg.call_graph.values() {
+        for cs in &entry.calls {
+            if let Some(call_id) = cs.call_site {
+                names.insert(call_id, cs.callee.clone());
+            }
+        }
+    }
+    for (&id, node) in &cpg.ast {
+        if node.kind == web_sitter::IrNodeKind::Call {
+            if let Some(name) = &node.name {
+                names.entry(id).or_insert_with(|| name.clone());
+            }
+        }
+    }
+    names
+}
 
 // =============================================================================
 // Combined static lookup maps (all languages)
@@ -438,10 +469,11 @@ pub fn builtin_endpoint_registry() -> crate::taint::EndpointRegistry {
         ($registry:expr, $name:expr, $set:expr) => {{
             let set: &'static [&'static str] = $set;
             $registry.register($name, move |cpg| {
+                let call_names = callee_names_by_node(cpg);
                 cpg.ast.iter()
-                    .filter(|(_, n)| {
+                    .filter(|(id, n)| {
                         n.kind == IrNodeKind::Call &&
-                        n.name.as_deref().map_or(false, |nm| set.contains(&nm))
+                        call_names.get(id).map_or(false, |nm| set.contains(&nm.as_str()))
                     })
                     .map(|(id, _)| *id)
                     .collect()
@@ -454,6 +486,20 @@ pub fn builtin_endpoint_registry() -> crate::taint::EndpointRegistry {
         ($registry:expr, $name:expr, $set:expr) => {
             reg_source!($registry, $name, $set)
         };
+    }
+
+    // ── Helper macro: register a PropagatorSpec table as a named propagator.
+    // Mirrors `add_taint_propagator_edges` in web-sitter/src/dfg.rs (which
+    // wires the base C/POSIX `TAINT_PROPAGATORS` table into DFG edges
+    // automatically), but for the per-language tables in this crate
+    // (CPP_TAINT_PROPAGATORS, JAVA_TAINT_PROPAGATORS, JS_TAINT_PROPAGATORS,
+    // etc.) that web-sitter can't see (wrong crate layer). Those tables were
+    // previously dead: defined but never consulted by anything.
+    macro_rules! reg_propagator {
+        ($registry:expr, $name:expr, $table:expr) => {{
+            let table: &'static [(&'static str, PropagatorSpec)] = $table;
+            $registry.register_propagator($name, move |cpg| propagator_edges_for(cpg, table));
+        }};
     }
 
     // ── C / POSIX / Windows ──────────────────────────────────────────────────
@@ -475,9 +521,16 @@ pub fn builtin_endpoint_registry() -> crate::taint::EndpointRegistry {
     reg_sink!(  registry, "c.resource_closers",   RESOURCE_CLOSERS);
     reg_source!(registry, "c.string_to_int",      STRING_TO_INT_FUNCTIONS);
     reg_source!(registry, "c.privilege",          PRIVILEGE_FUNCTIONS);
+    // Also registered as a named propagator for explicit `propagators:` use;
+    // already applied unconditionally to DFG edges in web-sitter's
+    // add_taint_propagator_edges, so this is redundant-but-harmless there —
+    // the default-application wiring below is what actually matters for the
+    // *other* languages' tables, which have no such DFG-level equivalent.
+    reg_propagator!(registry, "c.propagators", c::C_TAINT_PROPAGATORS);
 
     // ── C++ ──────────────────────────────────────────────────────────────────
     reg_sink!(registry, "cpp.format_sinks", cpp::CPP_FORMAT_SINKS);
+    reg_propagator!(registry, "cpp.propagators", cpp::CPP_TAINT_PROPAGATORS);
     reg_sink!(registry, "cpp.exec_ops",     cpp::CPP_EXEC_OPS);
 
     // ── Java ─────────────────────────────────────────────────────────────────
@@ -494,6 +547,7 @@ pub fn builtin_endpoint_registry() -> crate::taint::EndpointRegistry {
     reg_sink!(  registry, "java.xxe_sinks",               java::JAVA_XXE_SINKS);
     reg_sink!(  registry, "java.template_sinks",          java::JAVA_TEMPLATE_SINKS);
     reg_sink!(  registry, "java.ssrf_sinks",              java::JAVA_SSRF_SINKS);
+    reg_propagator!(registry, "java.propagators",         java::JAVA_TAINT_PROPAGATORS);
 
     // ── JavaScript ───────────────────────────────────────────────────────────
     reg_sink!(  registry, "js.dom_xss_sinks",         javascript::JS_DOM_XSS_SINKS);
@@ -507,12 +561,21 @@ pub fn builtin_endpoint_registry() -> crate::taint::EndpointRegistry {
     reg_sink!(  registry, "js.deserialization_sinks", javascript::JS_DESERIALIZATION_SINKS);
     reg_sink!(  registry, "js.ldap_sinks",            javascript::JS_LDAP_SINKS);
     reg_sink!(  registry, "js.vm_sinks",              javascript::JS_VM_SINKS);
+    reg_propagator!(registry, "js.propagators",       javascript::JS_TAINT_PROPAGATORS);
+    // `Cpg::language` is the full name ("javascript"/"typescript", see
+    // SourceLanguage::as_str in web-sitter/src/cpg_generator.rs), not the
+    // "js"/"ts" short form used by the named sink sets above — register
+    // under both so the `"{lang}.propagators"` auto-apply lookup in
+    // `TaintEngine::run` resolves correctly.
+    reg_propagator!(registry, "javascript.propagators", javascript::JS_TAINT_PROPAGATORS);
 
     // ── TypeScript ───────────────────────────────────────────────────────────
     reg_sink!(  registry, "ts.typeorm_sinks",         typescript::TS_TYPEORM_SINKS);
     reg_sink!(  registry, "ts.prisma_raw_sinks",      typescript::TS_PRISMA_RAW_SINKS);
     reg_sink!(  registry, "ts.angular_bypass_sinks",  typescript::TS_ANGULAR_BYPASS_SINKS);
     reg_source!(registry, "ts.nestjs_sources",        typescript::TS_NESTJS_SOURCES);
+    reg_propagator!(registry, "ts.propagators",       typescript::TS_TAINT_PROPAGATORS);
+    reg_propagator!(registry, "typescript.propagators", typescript::TS_TAINT_PROPAGATORS);
 
     // ── Go ───────────────────────────────────────────────────────────────────
     reg_sink!(  registry, "go.exec_sinks",              go::GO_EXEC_SINKS);
@@ -525,6 +588,7 @@ pub fn builtin_endpoint_registry() -> crate::taint::EndpointRegistry {
     reg_source!(registry, "go.http_request_sources",    go::GO_HTTP_REQUEST_SOURCES);
     reg_source!(registry, "go.read_sources",            go::GO_READ_SOURCES);
     reg_source!(registry, "go.flag_sources",            go::GO_FLAG_SOURCES);
+    reg_propagator!(registry, "go.propagators",         go::GO_TAINT_PROPAGATORS);
 
     // ── Rust ─────────────────────────────────────────────────────────────────
     reg_sink!(  registry, "rust.exec_sinks",   rust::RUST_EXEC_SINKS);
@@ -533,6 +597,67 @@ pub fn builtin_endpoint_registry() -> crate::taint::EndpointRegistry {
     reg_sink!(  registry, "rust.db_sinks",     rust::RUST_DB_SINKS);
     reg_source!(registry, "rust.env_sources",  rust::RUST_ENV_SOURCES);
     reg_source!(registry, "rust.io_sources",   rust::RUST_IO_SOURCES);
+    reg_propagator!(registry, "rust.propagators", rust::RUST_TAINT_PROPAGATORS);
 
     registry
+}
+
+/// Extract `(source_node, dest_node)` taint-propagator edges for every `Call`
+/// node in `cpg` whose callee name matches an entry in `table`. Mirrors the
+/// argument-list extraction convention used throughout the engine (e.g.
+/// `web-ql/src/engine.rs`'s `arg()` method): arguments live inside an
+/// `argument_list`/`arguments` container child when present, else fall back
+/// to the call node's raw children.
+fn propagator_edges_for(
+    cpg: &web_sitter::Cpg,
+    table: &'static [(&'static str, PropagatorSpec)],
+) -> Vec<(web_sitter::NodeId, web_sitter::NodeId)> {
+    use web_sitter::IrNodeKind;
+
+    fn call_arg_nodes(cpg: &web_sitter::Cpg, call_id: web_sitter::NodeId) -> Vec<web_sitter::NodeId> {
+        let Some(node) = cpg.ast.get(&call_id) else { return Vec::new() };
+        for &cid in &node.children {
+            if let Some(child) = cpg.ast.get(&cid) {
+                if matches!(child.node_type.as_str(), "argument_list" | "arguments") {
+                    return child.children.clone();
+                }
+            }
+        }
+        node.children.clone()
+    }
+
+    let call_names = callee_names_by_node(cpg);
+    let mut edges = Vec::new();
+    for (&call_id, node) in cpg.ast.iter() {
+        if node.kind != IrNodeKind::Call {
+            continue;
+        }
+        let Some(name) = call_names.get(&call_id) else { continue };
+        let Some((_, spec)) = table.iter().find(|(n, _)| *n == name.as_str()) else { continue };
+
+        let args = call_arg_nodes(cpg, call_id);
+        let dst_node = if spec.dst >= 0 {
+            match args.get(spec.dst as usize) {
+                Some(&n) => n,
+                None => continue,
+            }
+        } else {
+            // -1: return value is the destination, represented by the call
+            // node itself (matches the convention used elsewhere for
+            // return-tainting sources, e.g. `getenv`).
+            call_id
+        };
+
+        let variadic_skip = (spec.dst.max(0) as usize).saturating_add(1);
+        for &src_idx in spec.src {
+            if src_idx == -1 {
+                for &a in args.iter().skip(variadic_skip) {
+                    edges.push((a, dst_node));
+                }
+            } else if let Some(&a) = args.get(src_idx as usize) {
+                edges.push((a, dst_node));
+            }
+        }
+    }
+    edges
 }

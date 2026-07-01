@@ -1,5 +1,7 @@
 // CWE-327: Weak Crypto — Java (JCA/JCE)
 
+// Same fix as the cipher rule below: check the actual algorithm string so
+// this doesn't also flag `MessageDigest.getInstance("SHA-256")`.
 rule "cwe-327-java-weak-hash-instance" {
     severity: high
     languages: [java]
@@ -7,9 +9,17 @@ rule "cwe-327-java-weak-hash-instance" {
     tags: ["weak-crypto", "cwe-327"]
     find n: Call where
         n.callee_name() in ["getInstance", "getMessageDigest"]
-        and (n.arg(0) matches Literal { lit_kind: "String" })
+        and let alg = n.arg(0) in
+        alg matches Literal { lit_kind: "String" }
+        and alg.string_value() in /(?i)^(MD2|MD4|MD5|SHA-?1)$/
 }
 
+// The old condition (`callee_name() == "getInstance" and arg(0) is a string
+// literal`) was structurally identical to the weak-hash rule above and fired
+// on *any* `getInstance("...")` call — including strong algorithms like
+// `Cipher.getInstance("AES/GCM/NoPadding")` — since the query language has no
+// way to inspect the literal's text directly in a `matches` pattern. Use
+// `string_value()` plus a regex check on the actual algorithm string instead.
 rule "cwe-327-java-weak-cipher-instance" {
     severity: critical
     languages: [java]
@@ -17,9 +27,14 @@ rule "cwe-327-java-weak-cipher-instance" {
     tags: ["weak-crypto", "cwe-327"]
     find n: Call where
         n.callee_name() == "getInstance"
-        and n.arg(0) matches Literal { lit_kind: "String" }
+        and let alg = n.arg(0) in
+        alg matches Literal { lit_kind: "String" }
+        and alg.string_value() in /(?i)^(DES|DESede|TripleDES|RC4|ARCFOUR|RC2|Blowfish)(\/|$)|\/ECB\//
 }
 
+// The old condition only checked that arg(0) was *some* integer literal,
+// flagging `initialize(4096)` just as readily as `initialize(512)`. Check the
+// actual value instead.
 rule "cwe-327-java-rsa-small-key" {
     severity: high
     languages: [java]
@@ -27,5 +42,8 @@ rule "cwe-327-java-rsa-small-key" {
     tags: ["weak-crypto", "cwe-327"]
     find n: Call where
         n.callee_name() in ["generateKeyPair", "initialize"]
-        and n.arg(0) matches Literal { lit_kind: "Integer" }
+        and let key_size = n.arg(0) in
+        key_size matches Literal { lit_kind: "Integer" }
+        and key_size.int_value() != null
+        and key_size.int_value() < 2048
 }

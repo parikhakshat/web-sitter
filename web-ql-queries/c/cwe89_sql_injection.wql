@@ -16,7 +16,7 @@ sanitizer c_sql_san = find n: Call where
 
 rule "cwe-89-c-sql-injection" {
     severity: critical
-    languages: [c]
+    languages: [c, cpp]
     message: "SQL injection: tainted input flows to SQL execution"
     tags: ["sql-injection", "injection", "cwe-89"]
     taint {
@@ -26,14 +26,18 @@ rule "cwe-89-c-sql-injection" {
     }
 }
 
-// Parameter-level check: function parameter used directly in sprintf-then-sql pattern.
-// (Full composite rule requires CFG ordering — see missing-features.md)
+// Parameter-level check: function parameter flows into sprintf for SQL construction.
+// The old condition (`exists(p: ParamDef | p.has_ancestor(n.function_id()))`) only
+// checked that the enclosing function had *some* parameter — true for nearly every
+// function — with no connection to whether that parameter actually reached the
+// sprintf call. Require an actual DFG flow from the parameter into the format call.
 rule "cwe-89-c-sprintf-param" {
     severity: high
-    languages: [c]
+    languages: [c, cpp]
     message: "SQL injection risk: function parameter passed to sprintf for SQL construction"
     tags: ["sql-injection", "cwe-89"]
-    find n: Call where
+    find n: Call, p: ParamDef where
         n.callee_name() in ["sprintf", "snprintf"]
-        and exists(p: ParamDef | p.has_ancestor(n.function_id()))
+        and p.has_ancestor(n.function_id())
+        and p.dfg_reaches(n)
 }

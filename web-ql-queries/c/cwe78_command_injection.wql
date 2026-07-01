@@ -1,14 +1,32 @@
-// CWE-78: OS Command Injection — C / POSIX
-// Tainted user input flows to a shell/exec function.
+// CWE-78: OS Command Injection — C / C++ / POSIX / Windows
+// Tainted user input flows to a shell/exec function. `cpp.exec_ops` adds
+// C++-only wrappers (boost::process, Qt QProcess, Poco::Process) on top of
+// the shared POSIX exec/system family — it's just more names on the same
+// Call-based check, not a different AST shape, so one multi-language rule
+// covers both instead of a separate C++ file.
 
 rule "cwe-78-c-command-injection" {
     severity: critical
-    languages: [c]
+    languages: [c, cpp]
     message: "OS command injection: tainted input reaches command execution"
     tags: ["command-injection", "injection", "cwe-78"]
     taint {
         sources: ["c.io_sources"]
-        sinks:   ["c.exec_ops"]
+        sinks:   ["c.exec_ops", "cpp.exec_ops"]
         sanitizers: ["c.command_sanitizers"]
     }
+}
+
+// Shell/process-spawn call whose command argument is not a literal (covers
+// Windows-only entry points not in exec_ops, plus non-taint-tracked cases).
+rule "cwe-78-c-nonliteral-shell-arg" {
+    severity: critical
+    languages: [c, cpp]
+    message: "OS command injection: shell/process command is not a string literal"
+    tags: ["command-injection", "injection", "cwe-78"]
+    find n: Call where
+        n.callee_name() in ["system", "popen", "ShellExecute", "ShellExecuteA",
+                            "ShellExecuteW", "ShellExecuteEx", "WinExec", "CreateProcess",
+                            "CreateProcessA", "CreateProcessW"]
+        and not n.arg(0) matches Literal { lit_kind: "String" }
 }

@@ -4,7 +4,7 @@
 
 rule "cwe-190-c-tainted-alloc-size" {
     severity: critical
-    languages: [c]
+    languages: [c, cpp]
     message: "Integer overflow: tainted value flows to allocation size"
     tags: ["integer-overflow", "cwe-190"]
     taint {
@@ -24,7 +24,7 @@ sanitizer c_overflow_checks = find n: Call where
 
 rule "cwe-190-c-tainted-copy-len" {
     severity: critical
-    languages: [c]
+    languages: [c, cpp]
     message: "Integer overflow: tainted length used in copy operation"
     tags: ["integer-overflow", "buffer-overflow", "cwe-190"]
     taint {
@@ -38,7 +38,7 @@ rule "cwe-190-c-tainted-copy-len" {
 
 rule "cwe-190-c-string-to-int-taint" {
     severity: high
-    languages: [c]
+    languages: [c, cpp]
     message: "Integer overflow risk: external string converted to integer without range check"
     tags: ["integer-overflow", "cwe-190"]
     taint {

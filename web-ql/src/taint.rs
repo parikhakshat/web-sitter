@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
+use web_profiler as prof;
 use web_sitter::{Cpg, FunctionSummary, IrNode, IrNodeKind, NodeId};
 use crate::dfg::{DfgIndex, TaintConfig};
 use crate::ir::{TaintEndpointRef, TaintSpec};
@@ -21,8 +22,11 @@ pub struct ResolvedEndpoint {
 pub struct EndpointRegistry {
     /// name → closure that extracts matching nodes from a CPG
     extractors: HashMap<String, Box<dyn Fn(&Cpg) -> Vec<NodeId> + Send + Sync>>,
-    /// name → closure that extracts (from, to) propagator edge pairs from a CPG
-    propagator_extractors: HashMap<String, Box<dyn Fn(&Cpg) -> Vec<(NodeId, NodeId)> + Send + Sync>>,
+    /// name → closure that extracts (from, to) propagator edge pairs from a CPG.
+    /// `Arc`, not `Box`: per-scan registries (see `QueryEngine::build_taint_registry`)
+    /// need to cheaply copy the base registry's propagator closures into a
+    /// fresh, per-rule registry without consuming the (borrowed) base registry.
+    propagator_extractors: HashMap<String, Arc<dyn Fn(&Cpg) -> Vec<(NodeId, NodeId)> + Send + Sync>>,
 }
 
 impl EndpointRegistry {
@@ -57,6 +61,18 @@ impl EndpointRegistry {
         }
     }
 
+    /// Copy every propagator closure from a borrowed `other` registry into
+    /// `self` (cheap `Arc` clones — doesn't consume `other`). Used when
+    /// building a fresh per-rule registry that must still inherit the base
+    /// registry's default STDLIB propagators.
+    pub fn merge_propagators_from(&mut self, other: &EndpointRegistry) {
+        for (name, f) in &other.propagator_extractors {
+            self.propagator_extractors
+                .entry(name.clone())
+                .or_insert_with(|| f.clone());
+        }
+    }
+
     /// Register a propagator: a function that returns (from_node, to_node) pairs
     /// representing extra taint-flow edges (e.g. memcpy arg0 → arg1).
     pub fn register_propagator(
@@ -64,7 +80,7 @@ impl EndpointRegistry {
         name: impl Into<String>,
         f: impl Fn(&Cpg) -> Vec<(NodeId, NodeId)> + Send + Sync + 'static,
     ) {
-        self.propagator_extractors.insert(name.into(), Box::new(f));
+        self.propagator_extractors.insert(name.into(), Arc::new(f));
     }
 
     pub fn resolve(&self, endpoint: &TaintEndpointRef, cpg: &Cpg) -> Vec<ResolvedEndpoint> {
@@ -163,9 +179,18 @@ impl<'a> TaintEngine<'a> {
             .map(|r| r.node)
             .collect();
 
-        // Extra propagator edges (node-level; from propagator defs)
-        let propagator_edges: Vec<(NodeId, NodeId)> = self
+        // Extra propagator edges (node-level; from propagator defs).
+        // Every rule automatically gets the STDLIB propagator table for the
+        // CPG's own language (e.g. "java.propagators" for a Java file) on
+        // top of whatever the rule explicitly listed — rule authors
+        // shouldn't have to opt in to standard-library dataflow semantics
+        // (StringBuilder.append, String.concat, sprintf, etc.) per rule.
+        let mut propagator_edges: Vec<(NodeId, NodeId)> = self
             .resolve_propagator_edges(&spec.propagators);
+        propagator_edges.extend(
+            self.registry
+                .resolve_propagator(&format!("{}.propagators", self.cpg.language), self.cpg),
+        );
 
         if sources.is_empty() || sinks.is_empty() {
             return vec![];
@@ -180,12 +205,22 @@ impl<'a> TaintEngine<'a> {
         let source_ids: Vec<NodeId> = sources.iter().map(|r| r.node).collect();
         let mut result = self.dfg.propagate_taint(&source_ids, &taint_cfg);
 
+        // Interprocedural/cross-file expansion marks a *call node* tainted based
+        // on one of its argument nodes being tainted (via a function summary or a
+        // callee-side return, respectively) — a relationship that exists nowhere
+        // in `self.dfg` or `propagator_edges` (there's no literal DFG edge from
+        // the argument to the call). Record these as extra edges so the final
+        // reachability check below (which must independently confirm *some*
+        // source reaches the sink) doesn't disagree with what was actually
+        // marked tainted here and silently drop the finding.
+        let mut interproc_edges: Vec<(NodeId, NodeId)> = Vec::new();
+
         // Interprocedural expansion: for each tainted Call node, check if any
         // argument is tainted. If a function summary says arg_i → return, mark
         // the call node itself as tainted (representing the return value) and
         // re-propagate. This handles library functions without DFG edges.
         if spec.require_interprocedural && !self.summaries.is_empty() {
-            self.expand_interprocedural(&mut result, &sanitizer_nodes, &taint_cfg);
+            self.expand_interprocedural(&mut result, &sanitizer_nodes, &taint_cfg, &mut interproc_edges);
         }
 
         // Cross-file interprocedural expansion: propagate taint into callee files
@@ -193,7 +228,7 @@ impl<'a> TaintEngine<'a> {
         if spec.require_interprocedural && self.cross_file.is_some() {
             let mut changed = true;
             while changed {
-                changed = self.expand_cross_file(&mut result, &taint_cfg);
+                changed = self.expand_cross_file(&mut result, &taint_cfg, &mut interproc_edges);
                 if changed {
                     // Re-propagate from any newly tainted nodes in the current file.
                     let new_tainted: Vec<NodeId> = result.tainted.iter().copied().collect();
@@ -211,7 +246,15 @@ impl<'a> TaintEngine<'a> {
             if result.tainted.contains(&sink.node) {
                 // Find which source leads to this sink
                 for src in &sources {
-                    if self.dfg.reaches(src.node, sink.node)
+                    // `self.dfg.reaches` only walks plain DFG edges — it has no
+                    // notion of propagator edges, so a source that only reaches
+                    // a sink *through* a propagator (e.g. `sb.append(tainted)`
+                    // then `sb` used at a sink) would be correctly marked
+                    // tainted above but never actually reported here. Use a
+                    // propagator-aware reachability check instead so the two
+                    // stay consistent. Also fold in `interproc_edges` so
+                    // interprocedural/cross-file-only paths agree the same way.
+                    if self.reaches_with_propagators(src.node, sink.node, &taint_cfg, &interproc_edges)
                     {
                         // Enforce same-function constraint when requested
                         if spec.require_same_function {
@@ -263,7 +306,10 @@ impl<'a> TaintEngine<'a> {
         result: &mut crate::dfg::TaintResult,
         sanitizer_nodes: &HashSet<NodeId>,
         taint_cfg: &TaintConfig<'_>,
+        extra_edges: &mut Vec<(NodeId, NodeId)>,
     ) {
+        let _span = prof::span("taint.expand_interprocedural");
+        let mut rounds: u64 = 0;
         let (call_args, arg_to_calls) = index_call_arguments(self.cpg);
 
         let mut frontier: HashSet<NodeId> = HashSet::new();
@@ -297,6 +343,14 @@ impl<'a> TaintEngine<'a> {
                 if let TaintExpansionResult::Known { return_tainted: true, .. } = expansion {
                     result.tainted.insert(call_id);
                     new_tainted.push(call_id);
+                    // Record the tainted-argument → call-node relationship that just
+                    // justified marking `call_id` tainted, since it exists nowhere in
+                    // the plain DFG (see `interproc_edges` comment in `run`).
+                    for &idx in &tainted_args {
+                        if let Some(&arg_id) = arg_ids.get(idx) {
+                            extra_edges.push((arg_id, call_id));
+                        }
+                    }
                     // The call node itself may be a literal argument to another call
                     // (e.g. `outer(inner(x))`) — re-check those callers directly,
                     // since they won't necessarily show up via DFG propagation below.
@@ -320,25 +374,37 @@ impl<'a> TaintEngine<'a> {
             }
 
             frontier = next_frontier;
+            rounds += 1;
         }
+        prof::count("taint.expand_interprocedural.worklist_rounds", rounds);
     }
 
-    /// Cross-file taint expansion: when a call node is tainted and the callee
-    /// lives in another file, propagate taint into the callee's DFG and check
-    /// if return nodes become tainted, marking the call node as the return value.
+    /// Cross-file taint expansion: for each call site with a resolved cross-file
+    /// callee, check if any of *its own arguments* are tainted; if so, propagate
+    /// taint into the callee's DFG and check if a Return node becomes tainted,
+    /// marking the call node as tainted (representing its return value).
     fn expand_cross_file(
         &self,
         result: &mut crate::dfg::TaintResult,
         taint_cfg: &TaintConfig<'_>,
+        extra_edges: &mut Vec<(NodeId, NodeId)>,
     ) -> bool {
         let Some(ctx) = self.cross_file else { return false };
+        let _span = prof::span("taint.expand_cross_file");
         let mut changed = false;
 
         // `call_to_callee_params` is already the sparse set of call sites with a
         // resolved cross-file callee (built once by `Workspace::build_cross_file_edges`)
         // — iterate it directly instead of rescanning every node in the AST.
         for (node_id, callee_list) in ctx.call_to_callee_params {
-            if !result.tainted.contains(node_id) {
+            // NOTE: do NOT gate on `result.tainted.contains(node_id)` here — the
+            // whole point of this pass is to *determine* whether the call node
+            // becomes tainted (via a tainted argument reaching a tainted return
+            // in the callee). Requiring it to already be tainted first would make
+            // `result.tainted.insert(*node_id)` below always a no-op (the id is
+            // already present), so `changed` could never become `true` and this
+            // expansion would be permanently inert.
+            if result.tainted.contains(node_id) {
                 continue;
             }
             let Some(node) = self.cpg.ast.get(node_id) else { continue };
@@ -348,17 +414,18 @@ impl<'a> TaintEngine<'a> {
 
                 // Find which argument nodes at this call site are tainted, and map
                 // them to the corresponding callee param nodes.
-                let tainted_param_nodes: Vec<NodeId> = node
+                let tainted_args: Vec<(NodeId, NodeId)> = node // (caller arg id, callee param id)
                     .children
                     .iter()
                     .enumerate()
                     .filter(|(_, arg_id)| result.tainted.contains(*arg_id))
-                    .filter_map(|(i, _)| callee_params.get(i).copied())
+                    .filter_map(|(i, &arg_id)| callee_params.get(i).map(|&p| (arg_id, p)))
                     .collect();
 
-                if tainted_param_nodes.is_empty() {
+                if tainted_args.is_empty() {
                     continue;
                 }
+                let tainted_param_nodes: Vec<NodeId> = tainted_args.iter().map(|&(_, p)| p).collect();
 
                 let sanitizers_empty = HashSet::new();
                 let props_empty = [];
@@ -376,11 +443,63 @@ impl<'a> TaintEngine<'a> {
 
                 if callee_return_tainted && result.tainted.insert(*node_id) {
                     changed = true;
+                    // Same rationale as `expand_interprocedural`: record the
+                    // tainted-argument → call-node relationship so the final
+                    // reachability check in `run` agrees with this expansion.
+                    for &(arg_id, _) in &tainted_args {
+                        extra_edges.push((arg_id, *node_id));
+                    }
                 }
             }
         }
 
+        prof::count("taint.expand_cross_file.call_sites_examined", ctx.call_to_callee_params.len() as u64);
         changed
+    }
+
+    /// Like `DfgIndex::reaches`, but also follows `cfg.propagator_edges` and
+    /// `extra_edges` (the interprocedural/cross-file argument → call-node
+    /// relationships recorded by `expand_interprocedural`/`expand_cross_file`)
+    /// — needed because `propagate_taint` plus those two expansions (used to
+    /// decide whether a sink is tainted at all) already follow all of these,
+    /// and this must agree with them or an interprocedural/cross-file-only path
+    /// taints the sink but never produces a finding.
+    fn reaches_with_propagators(
+        &self,
+        from: NodeId,
+        to: NodeId,
+        cfg: &TaintConfig<'_>,
+        extra_edges: &[(NodeId, NodeId)],
+    ) -> bool {
+        if from == to {
+            return true;
+        }
+        let _span = prof::span("taint.reaches_with_propagators_bfs");
+        let mut visited: HashSet<NodeId> = HashSet::new();
+        let mut queue = VecDeque::new();
+        queue.push_back(from);
+        visited.insert(from);
+        while let Some(node) = queue.pop_front() {
+            if node == to {
+                return true;
+            }
+            for &s in self.dfg.successors(node) {
+                if !cfg.sanitizer_nodes.contains(&s) && visited.insert(s) {
+                    queue.push_back(s);
+                }
+            }
+            for &(f, t) in cfg.propagator_edges {
+                if f == node && !cfg.sanitizer_nodes.contains(&t) && visited.insert(t) {
+                    queue.push_back(t);
+                }
+            }
+            for &(f, t) in extra_edges {
+                if f == node && !cfg.sanitizer_nodes.contains(&t) && visited.insert(t) {
+                    queue.push_back(t);
+                }
+            }
+        }
+        false
     }
 
     fn shortest_path(
@@ -389,6 +508,7 @@ impl<'a> TaintEngine<'a> {
         to: NodeId,
         cfg: &TaintConfig<'_>,
     ) -> Vec<NodeId> {
+        let _span = prof::span("taint.shortest_path_bfs");
         let mut visited: HashMap<NodeId, NodeId> = HashMap::new(); // node → parent
         let mut queue = VecDeque::new();
         queue.push_back(from);
@@ -655,7 +775,8 @@ mod tests {
             propagator_edges: &[],
             max_depth: 20,
         };
-        engine.expand_interprocedural(&mut result, &sanitizer_nodes, &taint_cfg);
+        let mut extra_edges = Vec::new();
+        engine.expand_interprocedural(&mut result, &sanitizer_nodes, &taint_cfg, &mut extra_edges);
 
         assert!(result.tainted.contains(&WRAP1), "first hop (wrap1) should become tainted");
         assert!(
@@ -693,7 +814,8 @@ mod tests {
             propagator_edges: &[],
             max_depth: 20,
         };
-        engine.expand_interprocedural(&mut result, &sanitizer_nodes, &taint_cfg);
+        let mut extra_edges = Vec::new();
+        engine.expand_interprocedural(&mut result, &sanitizer_nodes, &taint_cfg, &mut extra_edges);
 
         assert!(
             !result.tainted.contains(&WRAP1),
