@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use crate::{Cpg, FunctionKind, IrNodeKind, NodeId, PrimKind, RustType};
+use crate::{CallSite, Cpg, DataflowEdge, FunctionKind, IrNodeKind, NodeId, PrimKind, RustType};
 use crate::cpg_generator::SourceLanguage;
 use crate::type_inference::build_class_hierarchy_rust;
 
@@ -313,7 +313,7 @@ pub(crate) fn enrich_call_graph_cpp(cpg: &mut Cpg) {
     // - A bare `method()` (or `this->method()`) called from inside a class's
     //   own method body: the implicit receiver's static type is that
     //   enclosing class itself (`class_context`).
-    let mut virtual_dispatch_calls: Vec<NodeId> = Vec::new();
+    let mut virtual_dispatch_calls: Vec<(NodeId, NodeId, String, String)> = Vec::new();
     for (&call_id, call_node) in &cpg.ast {
         if !call_node.is_call() {
             continue;
@@ -354,13 +354,188 @@ pub(crate) fn enrich_call_graph_cpp(cpg: &mut Cpg) {
         let Some(receiver_type) = receiver_type else { continue };
         let mut visited = std::collections::HashSet::new();
         if class_hierarchy_declares_virtual(cpg, &receiver_type, &method_name, &mut visited) {
-            virtual_dispatch_calls.push(call_id);
+            virtual_dispatch_calls.push((call_id, fn_id, receiver_type, method_name));
         }
     }
 
-    for call_id in virtual_dispatch_calls {
+    for &(call_id, ..) in &virtual_dispatch_calls {
         cpg.cpp_meta_mut(call_id).is_virtual_dispatch = true;
     }
+
+    add_cha_call_edges(cpg, &virtual_dispatch_calls);
+    resolve_operator_overload_calls(cpg, &declared_types);
+}
+
+/// All (transitive) subclasses of `class_name`, per `cpg.workspace.class_hierarchy`
+/// (which maps child -> parents — this walks it in the opposite direction).
+fn subclasses_of(cpg: &Cpg, class_name: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut stack = vec![class_name.to_string()];
+    let mut seen: HashSet<String> = HashSet::from([class_name.to_string()]);
+    while let Some(cur) = stack.pop() {
+        for (child, parents) in &cpg.workspace.class_hierarchy {
+            if parents.iter().any(|p| p.trim() == cur) && seen.insert(child.clone()) {
+                result.push(child.clone());
+                stack.push(child.clone());
+            }
+        }
+    }
+    result
+}
+
+/// For every virtual-dispatch call site, add a call-graph edge to *every*
+/// override implementation reachable through the receiver's static type —
+/// i.e. real class-hierarchy analysis (CHA) — not just the single target the
+/// generic name-based call-graph resolution already picked (which, for a
+/// virtual call through a base-typed receiver, is really just "some class
+/// happens to declare a method with this name," not "every class that could
+/// actually run at this call site").
+fn add_cha_call_edges(cpg: &mut Cpg, virtual_dispatch_calls: &[(NodeId, NodeId, String, String)]) {
+    let mut new_call_sites: HashMap<NodeId, Vec<CallSite>> = HashMap::new();
+
+    for (call_id, fn_id, receiver_type, method_name) in virtual_dispatch_calls {
+        let already_resolved: HashSet<NodeId> = cpg
+            .call_graph
+            .get(fn_id)
+            .into_iter()
+            .flat_map(|e| e.calls.iter())
+            .filter(|c| c.call_site == Some(*call_id))
+            .filter_map(|c| c.callee_id)
+            .collect();
+
+        let candidate_classes: Vec<String> = std::iter::once(receiver_type.clone())
+            .chain(subclasses_of(cpg, receiver_type))
+            .collect();
+
+        for class_name in &candidate_classes {
+            let Some((&method_id, _)) = cpg.ast.iter().find(|(_, n)| {
+                n.kind == IrNodeKind::MethodDef
+                    && n.name.as_deref() == Some(method_name.as_str())
+                    && n.class_context.as_deref() == Some(class_name.as_str())
+            }) else {
+                continue;
+            };
+            if already_resolved.contains(&method_id) {
+                continue;
+            }
+            new_call_sites.entry(*fn_id).or_default().push(CallSite {
+                callee: method_name.clone(),
+                callee_id: Some(method_id),
+                call_site: Some(*call_id),
+                qualified_callee: Some(format!("{class_name}::{method_name}")),
+                callee_kind: FunctionKind::Internal,
+            });
+        }
+    }
+
+    for (fn_id, mut sites) in new_call_sites {
+        if let Some(entry) = cpg.call_graph.get_mut(&fn_id) {
+            entry.calls.append(&mut sites);
+        }
+    }
+}
+
+/// Resolve operator-overload invocations written with natural operator
+/// syntax (`a + b`) rather than explicit call syntax (`a.operator+(b)`).
+/// tree-sitter-cpp parses `a + b` as a plain `binary_expression` regardless
+/// of whether `operator+` is overloaded, so — unlike an explicit method
+/// call — it never becomes a `Call`/`is_call()` node and is otherwise
+/// completely invisible to the call graph and DFG.
+///
+/// Scope: resolves a binary op to a *member* `operatorOP` declared directly
+/// on the LHS operand's declared class type (the actual C++ overload-
+/// resolution rule for member operators — `a + b` with a member `operator+`
+/// desugars to `a.operator+(b)`). Free (non-member) `operator+` functions and
+/// full overload-resolution-with-implicit-conversions are out of scope.
+fn resolve_operator_overload_calls(cpg: &mut Cpg, declared_types: &HashMap<(NodeId, String), String>) {
+    let mut new_call_sites: HashMap<NodeId, Vec<CallSite>> = HashMap::new();
+    let mut new_edges: Vec<DataflowEdge> = Vec::new();
+
+    for (&node_id, node) in &cpg.ast {
+        if node.kind != IrNodeKind::BinaryOp {
+            continue;
+        }
+        let Some(op) = &node.operator else { continue };
+        let Some(fn_id) = node.function_id else { continue };
+        if node.children.len() < 2 {
+            continue;
+        }
+        let lhs_id = node.children[0];
+        let rhs_id = node.children[1];
+        let Some(lhs_node) = cpg.ast.get(&lhs_id) else { continue };
+        if lhs_node.kind != IrNodeKind::Identifier {
+            continue;
+        }
+        let Some(lhs_name) = &lhs_node.text else { continue };
+        let Some(lhs_type) = declared_types.get(&(fn_id, lhs_name.clone())) else { continue };
+
+        let operator_name = format!("operator{op}");
+        let Some((&method_id, _)) = cpg.ast.iter().find(|(_, n)| {
+            n.kind == IrNodeKind::MethodDef
+                && n.name.as_deref() == Some(operator_name.as_str())
+                && n.class_context.as_deref() == Some(lhs_type.as_str())
+        }) else {
+            continue;
+        };
+
+        new_call_sites.entry(fn_id).or_default().push(CallSite {
+            callee: operator_name.clone(),
+            callee_id: Some(method_id),
+            call_site: Some(node_id),
+            qualified_callee: Some(format!("{lhs_type}::{operator_name}")),
+            callee_kind: FunctionKind::Internal,
+        });
+
+        // Bind the RHS operand to the operator method's own (sole) parameter,
+        // the same way a normal call's argument flows to its callee's param —
+        // this is what lets `dfg_reaches`/taint propagation cross the operator
+        // call the way it already does for explicit method calls.
+        if let Some(rhs_node) = cpg.ast.get(&rhs_id) {
+            if rhs_node.kind == IrNodeKind::Identifier {
+                if let Some(param_id) = first_param_identifier(&cpg.ast, method_id) {
+                    new_edges.push(DataflowEdge {
+                        source: rhs_id,
+                        destination: param_id,
+                        variable: rhs_node.text.clone().unwrap_or_default(),
+                        edge_type: "INTERPROCEDURAL_FLOW".to_string(),
+                        field_path: Vec::new(),
+                    });
+                }
+            }
+        }
+    }
+
+    for (fn_id, mut sites) in new_call_sites {
+        if let Some(entry) = cpg.call_graph.get_mut(&fn_id) {
+            entry.calls.append(&mut sites);
+        }
+    }
+    cpg.dataflow.edges.extend(new_edges);
+}
+
+/// The identifier leaf of a `MethodDef`'s first parameter (descends through
+/// `function_declarator` -> `parameter_list` -> first `parameter_declaration`
+/// -> nested `identifier`), or `None` if the method takes no parameters.
+fn first_param_identifier(ast: &BTreeMap<NodeId, crate::AstNode>, method_id: NodeId) -> Option<NodeId> {
+    let method = ast.get(&method_id)?;
+    let declarator = method.children.iter().find_map(|&cid| {
+        let c = ast.get(&cid)?;
+        (c.node_type == "function_declarator").then_some(c)
+    })?;
+    let params = declarator.children.iter().find_map(|&cid| {
+        let c = ast.get(&cid)?;
+        (c.node_type == "parameter_list").then_some(c)
+    })?;
+    let first_param_id = *params.children.first()?;
+
+    fn find_identifier(ast: &BTreeMap<NodeId, crate::AstNode>, root: NodeId) -> Option<NodeId> {
+        let node = ast.get(&root)?;
+        if node.node_type == "identifier" {
+            return Some(root);
+        }
+        node.children.iter().find_map(|&cid| find_identifier(ast, cid))
+    }
+    find_identifier(ast, first_param_id)
 }
 
 // ── DFG language-specific passes ──────────────────────────────────────────────

@@ -3,9 +3,7 @@
 //! pointers, and polymorphism.
 //!
 //! Written with real assertions; failures point at engine/CPG-generator gaps
-//! (e.g. the call graph doesn't yet build CHA edges to every override for a
-//! virtually-dispatched call — see `cpp_grammar_coverage.rs::virtual_dispatch_call_edges`,
-//! already marked "Phase 2 target" in this codebase) rather than test bugs.
+//! rather than test bugs.
 
 use std::collections::HashMap;
 

@@ -5,12 +5,10 @@
 //!   2. CFG structural validity (no dangling successor references)
 //!   3. DFG structural validity (no dangling node IDs)
 //!   4. A semantic property specific to that node type
-//!
-//! Tests marked "Phase 2" will fail until the corresponding CPG fixes land.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use web_sitter::{Cpg, IrNodeKind, NodeId};
+use web_sitter::{Cpg, FunctionKind, IrNodeKind, NodeId};
 use web_sitter::{
     CpgGenerator, GraphBuildOptions, IncrementalCpgGenerator, SourceLanguage, compute_edit,
 };
@@ -341,7 +339,6 @@ fn operator_overload_parsed_as_function() {
 
 #[test]
 fn operator_overload_in_callgraph() {
-    // Phase 2 target: operator overloads should appear in the call graph with their name
     let src = r#"
         struct MyStr {
             const char* buf;
@@ -353,15 +350,64 @@ fn operator_overload_in_callgraph() {
     let cpg = cpp_cpg_full_text(src);
     assert_cfg_valid(&cpg);
     assert_dfg_valid(&cpg);
-    // The call graph should have entries for functions in the source
     assert!(!cpg.call_graph.is_empty(), "call graph should be non-empty");
-    // operator+ should appear as a defined function in the call graph
     let cg_names: Vec<_> = cpg.call_graph.values().map(|e| e.name.as_str()).collect();
     assert!(
         cg_names
             .iter()
             .any(|n| n.contains("operator+") || n.contains("concat")),
         "operator+ or concat should appear in call graph, got: {cg_names:?}"
+    );
+
+    // `a + b` in `concat` must be resolved as an actual invocation of
+    // `MyStr::operator+`, not left as an opaque binary_expression the call
+    // graph never sees — tree-sitter-cpp parses `a + b` as a plain
+    // binary_expression regardless of overloading, so this has to be inferred
+    // from `a`'s declared type, not read off the parse tree directly.
+    let operator_plus_id = cpg
+        .ast
+        .iter()
+        .find(|(_, n)| n.kind == IrNodeKind::MethodDef && n.name.as_deref() == Some("operator+"))
+        .map(|(&id, _)| id)
+        .expect("operator+ MethodDef should exist");
+    let concat_entry = cpg.call_graph.values().find(|e| e.name == "concat").expect("concat call-graph entry");
+    let op_calls: Vec<_> = concat_entry.calls.iter().filter(|c| c.callee == "operator+").collect();
+    assert_eq!(op_calls.len(), 1, "concat's `a + b` should appear as exactly one operator+ call, got {op_calls:?}");
+    assert_eq!(op_calls[0].callee_id, Some(operator_plus_id), "a + b should resolve callee_id to MyStr::operator+");
+    assert_eq!(op_calls[0].callee_kind, FunctionKind::Internal);
+
+    // The RHS operand `b` should dataflow into operator+'s own parameter
+    // (`other`), the same way a normal call's argument flows to its param.
+    let b_id = cpg
+        .ast
+        .iter()
+        .find(|(_, n)| n.node_type == "identifier" && n.text.as_deref() == Some("b") && n.parent_id
+            .and_then(|pid| cpg.ast.get(&pid))
+            .map(|p| p.node_type == "binary_expression")
+            .unwrap_or(false))
+        .map(|(&id, _)| id)
+        .expect("`b` operand identifier in `a + b`");
+    let other_param_id = cpg
+        .ast
+        .iter()
+        .find(|(_, n)| n.kind == IrNodeKind::ParamDef && n.name.as_deref() == Some("other") && n.function_id == Some(operator_plus_id))
+        .map(|(&id, _)| id)
+        .expect("operator+'s `other` ParamDef");
+    let other_identifier = cpg.ast[&other_param_id]
+        .children
+        .iter()
+        .find_map(|&cid| {
+            let c = cpg.ast.get(&cid)?;
+            (c.node_type == "reference_declarator" || c.node_type == "identifier").then(|| {
+                if c.node_type == "identifier" { cid } else {
+                    *c.children.iter().find(|&&gcid| cpg.ast.get(&gcid).map(|g| g.node_type == "identifier").unwrap_or(false)).unwrap()
+                }
+            })
+        })
+        .expect("other's identifier leaf");
+    assert!(
+        cpg.dataflow.edges.iter().any(|e| e.source == b_id && e.destination == other_identifier),
+        "`b` should have a DFG edge into operator+'s `other` parameter"
     );
 }
 
@@ -633,7 +679,6 @@ fn template_method_in_namespace_qualified_name() {
 
 #[test]
 fn qualified_identifier_call_resolves() {
-    // Phase 2 target: std::string::append call should resolve to qualified name
     let src = r#"
         namespace std {
             struct string {
@@ -654,12 +699,42 @@ fn qualified_identifier_call_resolves() {
     let cpg = cpp_cpg_full_text(src);
     assert_cfg_valid(&cpg);
     assert_dfg_valid(&cpg);
-    // call_expression nodes for append should be present
+
     let calls: Vec<_> = nodes_of_type(&cpg, "call_expression");
     assert!(
         !calls.is_empty(),
         "call_expression nodes should be present for qualified calls"
     );
+
+    // `cmd.append(...)` should resolve past the call-graph name match all the
+    // way to `append`'s own MethodDef inside `std::string`, not just be
+    // recorded as an unresolved/external call by name.
+    let append_id = cpg
+        .ast
+        .iter()
+        .find(|(_, n)| n.node_type == "function_definition" && n.name.as_deref() == Some("append"))
+        .map(|(&id, _)| id)
+        .expect("append MethodDef should exist");
+    let caller = cpg
+        .call_graph
+        .values()
+        .find(|e| e.name == "test_qualified_call")
+        .expect("test_qualified_call call-graph entry");
+    let append_calls: Vec<_> = caller.calls.iter().filter(|c| c.callee == "append").collect();
+    assert_eq!(append_calls.len(), 2, "both cmd.append(...) call sites should be recorded, got {append_calls:?}");
+    for c in &append_calls {
+        assert_eq!(
+            c.callee_id,
+            Some(append_id),
+            "cmd.append(...) should resolve callee_id to append's own MethodDef, not stay unresolved"
+        );
+        assert_eq!(c.callee_kind, FunctionKind::Internal, "resolved call should be classified Internal, got {:?}", c.callee_kind);
+    }
+
+    // `dangerous_sink` has no local definition, so it must stay unresolved —
+    // confirms resolution isn't just blindly marking everything Internal.
+    let sink_call = caller.calls.iter().find(|c| c.callee == "dangerous_sink").expect("dangerous_sink call site");
+    assert_eq!(sink_call.callee_id, None, "dangerous_sink has no definition and must stay unresolved");
 }
 
 #[test]
@@ -940,7 +1015,6 @@ fn virtual_method_flagged_in_base_and_override() {
 
 #[test]
 fn virtual_dispatch_call_edges() {
-    // Phase 2 target: call graph should include CHA edges to override implementations
     let src = r#"
         class Shape {
         public:
@@ -959,19 +1033,52 @@ fn virtual_dispatch_call_edges() {
             Rect(float w, float h) : w(w), h(h) {}
             float area() override { return w * h; }
         };
+        class Square : public Rect {
+        public:
+            Square(float s) : Rect(s, s) {}
+        };
         float compute(Shape* s) {
-            return s->area();  // virtual dispatch — should see Circle::area + Rect::area in CG
+            return s->area();  // virtual dispatch — should see Shape/Circle/Rect::area (+ Square via inherited Rect::area) in CG
         }
     "#;
     let cpg = cpp_cpg(src);
     assert_cfg_valid(&cpg);
     assert_dfg_valid(&cpg);
-    // All override implementations should be in the call graph
     let cg_names: Vec<_> = cpg.call_graph.values().map(|e| e.name.as_str()).collect();
     assert!(
         cg_names.iter().any(|n| n.contains("area")),
         "area implementations should appear in call graph, got: {cg_names:?}"
     );
+
+    // Real class-hierarchy analysis (CHA): `s->area()` through a `Shape*`
+    // must resolve to EVERY override reachable via the hierarchy — Shape's
+    // own definition, Circle::area, and Rect::area — not just whichever one
+    // the generic by-name call-graph resolution happened to pick first.
+    let area_ids_by_class: HashMap<&str, NodeId> = ["Shape", "Circle", "Rect"]
+        .iter()
+        .map(|&class_name| {
+            let id = cpg
+                .ast
+                .iter()
+                .find(|(_, n)| n.kind == IrNodeKind::MethodDef && n.name.as_deref() == Some("area") && n.class_context.as_deref() == Some(class_name))
+                .map(|(&id, _)| id)
+                .unwrap_or_else(|| panic!("{class_name}::area MethodDef not found"));
+            (class_name, id)
+        })
+        .collect();
+
+    let compute_entry = cpg.call_graph.values().find(|e| e.name == "compute").expect("compute call-graph entry");
+    let area_call_targets: HashSet<NodeId> = compute_entry.calls.iter().filter(|c| c.callee == "area").filter_map(|c| c.callee_id).collect();
+
+    for (class_name, method_id) in &area_ids_by_class {
+        assert!(
+            area_call_targets.contains(method_id),
+            "s->area() should include {class_name}::area ({method_id}) as a CHA target; got targets {area_call_targets:?}"
+        );
+    }
+    // Square doesn't override area() itself (inherits Rect::area), so it must
+    // not introduce a spurious 4th target beyond the 3 real definitions.
+    assert_eq!(area_call_targets.len(), 3, "expected exactly 3 CHA targets (Shape/Circle/Rect), got {area_call_targets:?}");
 }
 
 // ── lambda incremental update ─────────────────────────────────────────────────
@@ -999,16 +1106,36 @@ fn lambda_in_incremental_initial_parse() {
     );
 }
 
+/// `(node_type, text)` snapshot of `root` and every descendant, sorted for
+/// order-independent comparison — used to prove a subtree was reused as-is
+/// (untouched by an edit elsewhere), not rebuilt with fresh content.
+fn subtree_snapshot(cpg: &Cpg, root: NodeId) -> Vec<(String, Option<String>)> {
+    let mut out = Vec::new();
+    let mut stack = vec![root];
+    while let Some(id) = stack.pop() {
+        if let Some(n) = cpg.ast.get(&id) {
+            out.push((n.node_type.clone(), n.text.clone()));
+            stack.extend(n.children.iter().copied());
+        }
+    }
+    out.sort();
+    out
+}
+
 #[test]
 fn lambda_in_incremental_update() {
-    // Phase 2 target: editing a lambda body should trigger incremental rebuild of that lambda
+    // A sibling function untouched by the edit, so we can verify the update
+    // is actually scoped rather than a full-file rebuild that happens to
+    // produce equivalent-looking output.
     let src1 = r#"
+        int helper(int a) { return a + 1; }
         int compute() {
             auto fn = [](int x) { return x * 2; };
             return fn(5);
         }
     "#;
     let src2 = r#"
+        int helper(int a) { return a + 1; }
         int compute() {
             auto fn = [](int x) { return x * 3; };
             return fn(5);
@@ -1019,25 +1146,61 @@ fn lambda_in_incremental_update() {
         GraphBuildOptions::default(),
     )
     .expect("IncrementalCpgGenerator init");
-    inc.parse_initial(src1.as_bytes()).expect("initial parse");
+    let initial = inc.parse_initial(src1.as_bytes()).expect("initial parse");
+    let helper_id_before = initial
+        .ast
+        .iter()
+        .find(|(_, n)| n.node_type == "function_definition" && n.name.as_deref() == Some("helper"))
+        .map(|(&id, _)| id)
+        .expect("helper MethodDef before edit");
+    let helper_snapshot_before = subtree_snapshot(initial, helper_id_before);
+
     let edit = compute_edit(src1.as_bytes(), src2.as_bytes()).expect("compute_edit");
     let updated = inc.apply_edit(&edit, src2.as_bytes()).expect("apply_edit");
-    // After update, the AST should still be valid
-    assert!(
-        !updated.ast.is_empty(),
-        "AST must not be empty after lambda edit"
-    );
+
+    assert!(!updated.ast.is_empty(), "AST must not be empty after lambda edit");
     let ast_ids: HashSet<NodeId> = updated.ast.keys().copied().collect();
     for edge in &updated.dataflow.edges {
-        assert!(
-            ast_ids.contains(&edge.source),
-            "DFG edge source dangling after lambda edit"
-        );
-        assert!(
-            ast_ids.contains(&edge.destination),
-            "DFG edge dest dangling after lambda edit"
-        );
+        assert!(ast_ids.contains(&edge.source), "DFG edge source dangling after lambda edit");
+        assert!(ast_ids.contains(&edge.destination), "DFG edge dest dangling after lambda edit");
     }
+
+    // The edit must actually be reflected: the lambda body should now
+    // multiply by 3, not 2.
+    let lambda_body_text = updated
+        .ast
+        .values()
+        .find(|n| n.node_type == "lambda_expression")
+        .and_then(|n| n.text.clone())
+        .unwrap_or_default();
+    let full_fresh = cpp_cpg(src2);
+    let fresh_lambda_text = full_fresh
+        .ast
+        .values()
+        .find(|n| n.node_type == "lambda_expression")
+        .and_then(|n| n.text.clone())
+        .unwrap_or_default();
+    assert_eq!(
+        lambda_body_text, fresh_lambda_text,
+        "incrementally-updated lambda body should match a fresh parse of src2"
+    );
+
+    // The edit must be *scoped*: `helper`, entirely untouched by the diff,
+    // should keep the exact same NodeId with an identical subtree — proof
+    // that editing the lambda didn't trigger a whole-file rebuild that
+    // happens to reassign fresh ids to unrelated, unchanged code.
+    let helper_id_after = updated
+        .ast
+        .iter()
+        .find(|(_, n)| n.node_type == "function_definition" && n.name.as_deref() == Some("helper"))
+        .map(|(&id, _)| id)
+        .expect("helper MethodDef after edit");
+    assert_eq!(helper_id_after, helper_id_before, "helper's NodeId should be stable across an edit that doesn't touch it");
+    let helper_snapshot_after = subtree_snapshot(updated, helper_id_after);
+    assert_eq!(
+        helper_snapshot_before, helper_snapshot_after,
+        "helper's subtree should be byte-for-byte reused, not rebuilt, by an edit scoped to compute()'s lambda"
+    );
 }
 
 // ── structured_binding_declarator (complex) ───────────────────────────────────
