@@ -1,6 +1,24 @@
 // CWE-121: Stack Buffer Overflow / CWE-787: OOB Write — C
 // Unsafe string/memory functions that write without bounds checks.
 
+// ── Predicate: a CFG-dominating guard mentions the destination or source ──────
+// Coarse (same spirit as `null_checked` in cwe476_null_deref.wql): doesn't
+// verify the guard's comparison actually proves enough room, just that some
+// conditional reachable from the destination/source dominates the call and
+// precedes it — enough to distinguish "guard checks the relevant buffer" from
+// "guard checks an unrelated variable" (see guard_validation_test.c).
+// `.refers_to()` is resolved inside the `exists` rather than hoisted via an
+// outer `let` — a `let` binding that fails to produce a node makes the whole
+// surrounding expression false, which would otherwise suppress the finding
+// entirely (the opposite of what we want) instead of just this guard check.
+pred call_size_guarded(dst: Node, src: Node, call: Node) =
+    exists(nc: Conditional |
+        let dst_decl = dst.refers_to() in
+        let src_decl = src.refers_to() in
+        (dst_decl.dfg_reaches(nc) or src_decl.dfg_reaches(nc))
+        and nc.dominates(call)
+        and nc.line() <= call.line())
+
 // ── Direct use of unbounded string functions ──────────────────────────────────
 
 rule "cwe-121-c-unbounded-string-copy" {
@@ -8,9 +26,29 @@ rule "cwe-121-c-unbounded-string-copy" {
     languages: [c, cpp]
     message: "Buffer overflow: unbounded string copy into fixed-size destination"
     tags: ["buffer-overflow", "stack-overflow", "cwe-121", "cwe-787"]
+    // `gets`/`sprintf`/`vsprintf` have no destination-size argument to compare
+    // against — always flag.
     find n: Call where
-        n.callee_name() in ["gets", "strcpy", "strcat", "sprintf", "vsprintf",
-                            "wcscpy", "wcscat"]
+        n.callee_name() in ["gets", "sprintf", "vsprintf"]
+    // `strcpy`/`strcat`/`wcscpy`/`wcscat` DO carry a destination we can size —
+    // when both the destination's declared size and the literal source's
+    // length are statically known and the literal provably fits, this is not
+    // a true positive (e.g. `char buf[100]; strcpy(buf, "short");`). Also not
+    // a true positive when a size guard on the destination/source dominates
+    // the call (e.g. `if (strlen(input) < sizeof(buf)) strcpy(buf, input);`).
+    find n: Call where
+        n.callee_name() in ["strcpy", "strcat", "wcscpy", "wcscat"]
+        and not (
+            let dst = n.arg(0) in
+            let decl = dst.refers_to() in
+            let src = n.arg(1) in
+            decl.has_known_size()
+            and src.has_known_size()
+            and src.alloc_size() <= decl.alloc_size()
+        )
+        and let dst2 = n.arg(0) in
+        let src2 = n.arg(1) in
+        not call_size_guarded(dst2, src2, n)
 }
 
 // ── Copy length provably exceeds the destination's statically known size ──────

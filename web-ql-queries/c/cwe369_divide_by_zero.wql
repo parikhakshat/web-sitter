@@ -1,13 +1,13 @@
 // CWE-369: Divide by Zero — C
 // Tainted value flows to divisor position, or the divisor is provably zero.
 
-// `child(1)` is the right-hand operand of a binary expression. The operator
-// itself (`/`, `%`, `==`, `<<`, …) isn't exposed as a queryable field, so we
-// scope to a `/` or `%` character in the source text to exclude unrelated
-// binary ops (comparisons, shifts, bitwise) whose RHS also happens to be 0.
+// `child(1)` is the right-hand operand of a binary expression. Match on the
+// actual operator token rather than scanning the node's full source text for
+// a `/`/`%` character — the latter also matches unrelated substrings, e.g. a
+// `/` inside a string-literal operand (`strstr(s, "../") != NULL`).
 sink c_divisor = find n: BinaryOp where
     n.raw_kind() == "binary_expression"
-    and n.text() in /[\/%]/
+    and (n.operator() == "/" or n.operator() == "%")
 
 rule "cwe-369-c-tainted-divisor" {
     severity: medium
@@ -32,8 +32,50 @@ rule "cwe-369-c-const-zero-divisor" {
     tags: ["divide-by-zero", "cwe-369"]
     find n: BinaryOp where
         n.raw_kind() == "binary_expression"
-        and n.text() in /[\/%]/
+        and (n.operator() == "/" or n.operator() == "%")
         and let rhs = n.child(1) in
         rhs.is_const_expr()
         and rhs.eval_int() == 0
+}
+
+// ── Divisor is a plain function parameter with no reachable zero-check ────────
+// Not taint (the divisor need not come from external input) — a parameter
+// that a function divides by is a latent division-by-zero for any caller
+// that passes 0, unless the function itself guards against it.
+
+// `assert(b != 0)` guards the same way an `if`/abort does, but `assert` is a
+// plain Call (a macro expansion in practice), not a Conditional.
+//
+// The source for `dfg_reaches` must be the *declaration* (like `alloc` in
+// `null_checked` above), not the divisor's own occurrence at the division —
+// that occurrence is chronologically the last use of the variable, so it can
+// never "reach forward" into a conditional that appears earlier in the
+// source (reaching-def flow only goes forward from a definition).
+// `dominates()` is block-granular, so a guard sharing a straight-line block
+// with the division "dominates" it regardless of order — require the guard
+// to textually precede the division too (see cwe476_null_deref.wql).
+pred div_guarded(decl: Node, div_node: Node) =
+    exists(nc: Conditional |
+        decl.dfg_reaches(nc)
+        and nc.dominates(div_node)
+        and nc.line() <= div_node.line())
+    or exists(ac: Call |
+        ac.callee_name() == "assert"
+        and decl.dfg_reaches(ac)
+        and ac.dominates(div_node)
+        and ac.line() <= div_node.line())
+
+rule "cwe-369-c-param-divisor-unguarded" {
+    severity: low
+    languages: [c, cpp]
+    message: "Divide by zero: parameter used as divisor without a zero-check guard"
+    tags: ["divide-by-zero", "cwe-369"]
+    find n: BinaryOp where
+        n.raw_kind() == "binary_expression"
+        and (n.operator() == "/" or n.operator() == "%")
+        and let rhs = n.child(1) in
+        rhs.kind() == "Identifier"
+        and let decl = rhs.refers_to() in
+        decl.kind() == "ParamDef"
+        and not div_guarded(decl, n)
 }

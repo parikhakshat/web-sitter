@@ -4,10 +4,25 @@
 // True when there is no Conditional that (a) sees the alloc value via DFG and
 // (b) dominates the dereference — i.e., the deref is reachable without a null check.
 
+// `assert(p != NULL)` guards the same way an `if`/abort does, but `assert`
+// is a plain Call (a macro expansion in practice), not a Conditional, so it
+// needs its own alternative rather than falling out of the Conditional check.
+//
+// `dominates()` is block-granular: a guard and the dereference sharing a
+// single straight-line block (no branch between them) "dominate" each other
+// regardless of which comes first, so a check placed AFTER the dereference
+// (`*p = 'A'; if (!p) return;`) would otherwise be wrongly accepted as a
+// guard. Require the guard to textually precede the deref as well.
 pred null_checked(alloc: Call, deref: Node) =
     exists(nc: Conditional |
         alloc.dfg_reaches(nc)
-        and nc.dominates(deref))
+        and nc.dominates(deref)
+        and nc.line() <= deref.line())
+    or exists(ac: Call |
+        ac.callee_name() == "assert"
+        and alloc.dfg_reaches(ac)
+        and ac.dominates(deref)
+        and ac.line() <= deref.line())
 
 // ── Allocation result dereferenced without null check on all paths ────────────
 
@@ -25,6 +40,25 @@ rule "cwe-476-c-alloc-unchecked-deref" {
         // call and an unrelated `->`/`.` access was flagged.
         and let recv = deref.receiver() in
         alloc.dfg_reaches(recv)
+        and not null_checked(alloc, deref)
+}
+
+// ── Allocation result dereferenced via `*p` without null check on all paths ───
+// Mirrors `cwe-476-c-alloc-unchecked-deref` (which only covers `p->field`);
+// `*p` lifts to a `pointer_expression` UnaryOp, a different node shape.
+
+rule "cwe-476-c-alloc-unchecked-ptr-deref" {
+    severity: high
+    languages: [c, cpp]
+    message: "NULL dereference: allocation result dereferenced without null check on all paths"
+    tags: ["null-dereference", "cwe-476"]
+    find alloc: Call, deref: Expr where
+        alloc.callee_name() in ["malloc", "calloc", "realloc", "strdup", "strndup"]
+        and deref.raw_kind() == "pointer_expression"
+        and deref.text() in /^\*/
+        and alloc.cfg_reaches(deref)
+        and let ptr = deref.child(0) in
+        alloc.dfg_reaches(ptr)
         and not null_checked(alloc, deref)
 }
 

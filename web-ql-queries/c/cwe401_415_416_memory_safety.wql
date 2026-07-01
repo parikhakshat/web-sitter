@@ -12,9 +12,16 @@ rule "cwe-415-c-double-free" {
         and f2.callee_name() in ["free", "cfree", "kfree", "g_free"]
         and f1.id() != f2.id()
         and f1.cfg_reaches(f2)
+        and f1.line() <= f2.line()
+        // `a1` (the argument identifier at the first free() call site) has no
+        // outgoing DFG edges of its own to later uses of the same variable —
+        // only the original declaration does (reaching-def edges fan out
+        // from a definition to its uses, not use-to-use). Resolve to the
+        // declaration first so `dfg_reaches` actually has somewhere to walk.
         and let a1 = f1.arg(0) in
+            let decl = a1.refers_to() in
             let a2 = f2.arg(0) in
-            a1.dfg_reaches(a2)
+            decl.dfg_reaches(a2)
 }
 
 // ── CWE-416: Use after free — CFG-ordered AND correlated by pointer identity ──
@@ -33,16 +40,77 @@ rule "cwe-416-c-use-after-free" {
         free_call.callee_name() in ["free", "cfree", "kfree", "zfree", "g_free",
                                     "av_free", "av_freep", "OPENSSL_free"]
         and free_call.cfg_reaches(use_node)
+        and free_call.line() <= use_node.line()
+        // See the comment on `cwe-415-c-double-free`: resolve to the
+        // declaration so `dfg_reaches` has a real fan-out source.
         and let freed = free_call.arg(0) in
+        let decl = freed.refers_to() in
         let ptr = use_node.receiver() in
-        freed.dfg_reaches(ptr)
+        decl.dfg_reaches(ptr)
     find free_call: Call, use_node: Subscript where
         free_call.callee_name() in ["free", "cfree", "kfree", "zfree", "g_free",
                                     "av_free", "av_freep", "OPENSSL_free"]
         and free_call.cfg_reaches(use_node)
+        and free_call.line() <= use_node.line()
         and let freed = free_call.arg(0) in
+        let decl = freed.refers_to() in
         let ptr = use_node.child(0) in
-        freed.dfg_reaches(ptr)
+        decl.dfg_reaches(ptr)
+}
+
+// ── CWE-416: Use after free — freed pointer passed as a plain call argument ────
+// Covers the extremely common `free(ptr); ...; some_call(ptr)` shape (e.g.
+// `printf("%s", ptr)`, `strcpy(ptr, ...)`), which the MemberAccess/Subscript
+// rule above doesn't: a bare identifier argument is neither.
+
+// Three separate `find` blocks (one per argument position) rather than three
+// `let`-bound candidates checked with `or`: `let x = call.arg(n) in ...` is
+// only satisfiable when `arg(n)` actually resolves to a node, so chaining
+// `let u0 = arg(0) in let u1 = arg(1) in let u2 = arg(2) in (...)` for a call
+// with fewer than 3 arguments (e.g. `printf("%s", ptr)`, a 2-arg call) makes
+// the *whole* conjunction unsatisfiable — the `arg(2)` binding failing
+// silently kills the `arg(0)`/`arg(1)` alternatives too, not just its own.
+rule "cwe-416-c-use-after-free-call-arg" {
+    severity: critical
+    languages: [c, cpp]
+    message: "Use after free: freed pointer passed as a call argument on a reachable path"
+    tags: ["use-after-free", "memory-safety", "cwe-416"]
+    find free_call: Call, use_call: Call where
+        free_call.callee_name() in ["free", "cfree", "kfree", "zfree", "g_free",
+                                    "av_free", "av_freep", "OPENSSL_free"]
+        and free_call.id() != use_call.id()
+        and not (use_call.callee_name() in ["free", "cfree", "kfree", "zfree", "g_free",
+                                            "av_free", "av_freep", "OPENSSL_free"])
+        and free_call.cfg_reaches(use_call)
+        and free_call.line() <= use_call.line()
+        and let freed = free_call.arg(0) in
+        let decl = freed.refers_to() in
+        let u0 = use_call.arg(0) in
+        decl.dfg_reaches(u0)
+    find free_call: Call, use_call: Call where
+        free_call.callee_name() in ["free", "cfree", "kfree", "zfree", "g_free",
+                                    "av_free", "av_freep", "OPENSSL_free"]
+        and free_call.id() != use_call.id()
+        and not (use_call.callee_name() in ["free", "cfree", "kfree", "zfree", "g_free",
+                                            "av_free", "av_freep", "OPENSSL_free"])
+        and free_call.cfg_reaches(use_call)
+        and free_call.line() <= use_call.line()
+        and let freed = free_call.arg(0) in
+        let decl = freed.refers_to() in
+        let u1 = use_call.arg(1) in
+        decl.dfg_reaches(u1)
+    find free_call: Call, use_call: Call where
+        free_call.callee_name() in ["free", "cfree", "kfree", "zfree", "g_free",
+                                    "av_free", "av_freep", "OPENSSL_free"]
+        and free_call.id() != use_call.id()
+        and not (use_call.callee_name() in ["free", "cfree", "kfree", "zfree", "g_free",
+                                            "av_free", "av_freep", "OPENSSL_free"])
+        and free_call.cfg_reaches(use_call)
+        and free_call.line() <= use_call.line()
+        and let freed = free_call.arg(0) in
+        let decl = freed.refers_to() in
+        let u2 = use_call.arg(2) in
+        decl.dfg_reaches(u2)
 }
 
 // ── CWE-401: Allocation not assigned — memory discarded ──────────────────────
@@ -54,7 +122,14 @@ rule "cwe-401-c-alloc-discarded" {
     tags: ["memory-leak", "cwe-401"]
     find n: Call where
         n.callee_name() in ["malloc", "calloc", "strdup", "strndup", "realloc"]
+        // A cast (e.g. `(char *)malloc(n)`) sits between the call and its
+        // real destination, so also look one level past it.
         and not (n.parent() matches Assign { }
                  or n.parent() matches LocalDef { }
-                 or n.parent() matches Return { })
+                 or n.parent() matches Return { }
+                 or n.parent() matches FieldDef { }
+                 or n.parent().parent() matches Assign { }
+                 or n.parent().parent() matches LocalDef { }
+                 or n.parent().parent() matches Return { }
+                 or n.parent().parent() matches FieldDef { })
 }

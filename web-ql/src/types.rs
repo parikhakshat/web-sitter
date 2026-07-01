@@ -157,7 +157,7 @@ pub fn method_group(method: &str) -> Option<MethodGroup> {
         "parent" | "ancestor" | "has_ancestor" | "children" | "child"
         | "descendant" | "has_descendant" | "id" | "function_id" | "class_context"
         | "namespace" | "basic_block" | "line" | "end_line" | "file" | "name" | "text"
-        | "raw_kind" | "kind" | "cpp_meta" | "go_meta" | "python_meta" | "java_meta"
+        | "raw_kind" | "kind" | "operator" | "cpp_meta" | "go_meta" | "python_meta" | "java_meta"
         | "js_meta" | "ts_meta" | "rust_meta" | "is_some" | "is_none"
         // CFG predicates (all universal — CFG is computed per function, not per type)
         | "cfg_reaches" | "cfg_reaches_feasible" | "cfg_reaches_without"
