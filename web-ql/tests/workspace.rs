@@ -7,6 +7,7 @@ use web_ql::{
     ir::{CompiledClause, CompiledRule, QueryPlan, RootBinding, RuleSet, SearchPlan},
     ast::{Severity, TypeExpr},
     loader::compile_rules,
+    node_ref::NodeRef,
     taint::EndpointRegistry,
     workspace::Workspace,
 };
@@ -385,7 +386,7 @@ fn build_cross_file_edges_shares_callee_cpg_via_arc_not_clone() {
     ws.build_cross_file_edges();
 
     assert_eq!(
-        ws.cross_file_callee_params.get(&11).map(|v| v.len()),
+        ws.cross_file_callee_params.get(&NodeRef::new(path("caller.py"), 11)).map(|v| v.len()),
         Some(1),
         "the cross-file call should resolve to exactly one callee"
     );
@@ -431,7 +432,9 @@ fn build_cross_file_edges_resolves_unqualified_callee_name() {
 
     ws.build_cross_file_edges();
 
-    let resolved = ws.cross_file_callee_params.get(&11).expect("call should resolve");
+    let resolved = ws.cross_file_callee_params
+        .get(&NodeRef::new(path("caller.py"), 11))
+        .expect("call should resolve");
     assert_eq!(resolved.len(), 1);
     assert_eq!(resolved[0].0, path("callee.py"));
 }

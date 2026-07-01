@@ -425,6 +425,38 @@ impl RuleSet {
         self
     }
 
+    /// Merge multiple independently-compiled `RuleSet`s (e.g. one per `.wql` file
+    /// in a directory) into a single set, concatenating rules and unioning the
+    /// named predicate/source/sink/sanitizer plan tables. Without this, loading
+    /// more than one rule file and combining only `.rules` (as `RuleSet::new`
+    /// alone would require) silently drops every named `pred`/`source`/`sink`/
+    /// `sanitizer` definition, so `not some_pred(...)` calls always miss their
+    /// plan and evaluate to `false`.
+    pub fn merge(rule_sets: Vec<RuleSet>) -> Self {
+        let mut rules = Vec::new();
+        let mut predicate_plans = HashMap::new();
+        let mut predicate_params = HashMap::new();
+        let mut source_plans = HashMap::new();
+        let mut sink_plans = HashMap::new();
+        let mut sanitizer_plans = HashMap::new();
+
+        for rs in rule_sets {
+            rules.extend(rs.rules);
+            predicate_plans.extend(rs.predicate_plans);
+            predicate_params.extend(rs.predicate_params);
+            source_plans.extend(rs.source_plans);
+            sink_plans.extend(rs.sink_plans);
+            sanitizer_plans.extend(rs.sanitizer_plans);
+        }
+
+        Self::new(rules)
+            .with_predicate_plans(predicate_plans)
+            .with_predicate_params(predicate_params)
+            .with_source_plans(source_plans)
+            .with_sink_plans(sink_plans)
+            .with_sanitizer_plans(sanitizer_plans)
+    }
+
     pub fn rules_for_language(&self, lang: Language) -> impl Iterator<Item = &CompiledRule> {
         self.rules.iter().filter(move |r| {
             r.languages.as_ref().map_or(true, |langs| langs.contains(&lang))

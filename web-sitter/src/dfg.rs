@@ -2209,6 +2209,7 @@ fn build_dataflow_impl(
         &function_map,
         affected_function_ids,
         include_globals,
+        macro_aliases,
     );
     if include_interprocedural {
         add_interprocedural_edges(
@@ -3813,6 +3814,7 @@ fn add_taint_propagator_edges(
     function_map: &BTreeMap<NodeId, NodeId>,
     affected_function_ids: Option<&BTreeSet<NodeId>>,
     include_globals: bool,
+    macro_aliases: Option<&BTreeMap<String, String>>,
 ) {
     // (function_name, dst_arg_index, src_arg_indices)
     // -1 means "all remaining args after dst_arg_index"
@@ -3835,7 +3837,10 @@ fn add_taint_propagator_edges(
         let Some(call_node) = graph.get(&call_id) else {
             continue;
         };
-        let Some(func_name) = extract_called_function_name(graph, call_id, None) else {
+        // Resolve through macro aliases (e.g. nginx's `ngx_memcpy` → `memcpy`) —
+        // otherwise a project's own wrapper macros around stdlib propagator
+        // functions would never match `TAINT_PROPAGATORS`' stdlib names.
+        let Some(func_name) = extract_called_function_name(graph, call_id, macro_aliases) else {
             continue;
         };
         let Some((_, prop)) = propagators.iter().find(|(n, _)| *n == func_name.as_str()) else {

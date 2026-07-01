@@ -22,6 +22,9 @@ use crate::taint::{CrossFileTaintCtx, EndpointRegistry, TaintEngine};
 
 pub struct EvalContext<'a> {
     pub cpg: &'a Cpg,
+    /// The file `cpg`/`dfg` were parsed from. Needed to address entries in
+    /// `cross_file`'s workspace-wide, `NodeRef`-keyed map correctly.
+    pub current_file: &'a std::path::Path,
     pub dfg: &'a DfgIndex,
     pub cfg_cache: &'a HashMap<NodeId, FunctionCfg>,
     /// Node-kind / raw-node-type / call-site index, built once per file.
@@ -90,6 +93,7 @@ impl<'a> RuleRunner<'a> {
                                 &merged,
                                 self.ctx.dfg,
                                 self.ctx.cpg,
+                                self.ctx.current_file,
                                 self.ctx.summaries,
                             );
                             if let Some(cf) = self.ctx.cross_file {
@@ -307,6 +311,7 @@ impl<'a> RuleRunner<'a> {
                     self.ctx.registry,
                     self.ctx.dfg,
                     self.ctx.cpg,
+                    self.ctx.current_file,
                     self.ctx.summaries,
                 );
                 if let Some(cf) = self.ctx.cross_file {
@@ -335,7 +340,7 @@ impl<'a> RuleRunner<'a> {
                             EvalValue::Str(s) => BindingValue::Str(s),
                             EvalValue::Int(n) => BindingValue::Int(n),
                             EvalValue::Bool(b) => BindingValue::Bool(b),
-                            EvalValue::Null | EvalValue::MetaNode(..) => BindingValue::Null,
+                            EvalValue::Null | EvalValue::MetaNode(..) | EvalValue::List(..) => BindingValue::Null,
                         };
                         child.insert(param_name.to_owned(), binding);
                     }
@@ -1351,6 +1356,7 @@ pub enum EvalValue {
     Int(i64),
     Bool(bool),
     Null,
+    List(Vec<EvalValue>),
 }
 
 /// Return the set of all node IDs in the AST subtree rooted at `root` (inclusive).
@@ -1381,6 +1387,7 @@ fn eval_value_of_literal(lit: &Literal) -> EvalValue {
         Literal::Bool(b) => EvalValue::Bool(*b),
         Literal::Str(s) => EvalValue::Str(s.clone()),
         Literal::Null => EvalValue::Null,
+        Literal::List(items) => EvalValue::List(items.iter().map(eval_value_of_literal).collect()),
         _ => EvalValue::Null,
     }
 }
@@ -1393,8 +1400,12 @@ fn compare_values(lhs: &EvalValue, op: CmpOp, rhs: &EvalValue) -> bool {
         CmpOp::Gt => numeric_cmp(lhs, rhs).map_or(false, |o| o > 0),
         CmpOp::Le => numeric_cmp(lhs, rhs).map_or(false, |o| o <= 0),
         CmpOp::Ge => numeric_cmp(lhs, rhs).map_or(false, |o| o >= 0),
-        CmpOp::In => match (lhs, rhs) {
-            (EvalValue::Str(s), EvalValue::Str(list)) => list.contains(s.as_str()),
+        CmpOp::In => match rhs {
+            EvalValue::List(items) => items.iter().any(|item| values_equal(lhs, item)),
+            // Fall back to substring containment when the RHS is a plain string
+            // (e.g. `text() in /pattern/`-style checks against a scalar), so
+            // `in` still behaves sensibly outside of list-literal membership.
+            EvalValue::Str(s) => matches!(lhs, EvalValue::Str(needle) if s.contains(needle.as_str())),
             _ => false,
         },
     }

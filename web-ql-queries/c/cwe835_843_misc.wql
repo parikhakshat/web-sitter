@@ -14,6 +14,11 @@ rule "cwe-835-c-cfg-no-exit-loop" {
 }
 
 // AST fallback: literal-true loop with no break/return/exit call descendant.
+// `guard_evals_true()` confirms the loop's own condition is a compile-time
+// constant truth (`while (1)`, `do { } while (1)`) — without it, any loop
+// that simply lacks a break/return/exit (e.g. a normal bounded `for` loop)
+// was flagged as "infinite", which is not what "literal true" in the message
+// claims to check.
 rule "cwe-835-c-unconditional-loop" {
     severity: medium
     languages: [c, cpp]
@@ -21,6 +26,7 @@ rule "cwe-835-c-unconditional-loop" {
     tags: ["infinite-loop", "dos", "cwe-835"]
     find n: Loop where
         n.raw_kind() in ["while_statement", "for_statement", "do_statement"]
+        and n.guard_evals_true()
         and not exists(brk: Stmt | brk.raw_kind() == "break_statement" and brk.has_ancestor(n.id()))
         and not exists(ret: Return | ret.has_ancestor(n.id()))
         and not exists(call: Call |
