@@ -12,6 +12,7 @@ use rmcp::ServerHandler;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
 use rmcp::tool_handler;
+use web_ql::RuleSet;
 use web_ql::Workspace;
 use web_ql::symbol_index::ReverseSymbolIndex;
 
@@ -28,6 +29,10 @@ pub struct WebMcpServer {
     pub(crate) workspace: Arc<Workspace>,
     pub(crate) reverse_index: Arc<ReverseSymbolIndex>,
     pub(crate) call_graph: Arc<SymbolCallGraph>,
+    /// The built-in CWE rule corpus (`web-ql-queries/`), loaded once at startup —
+    /// `run_security_scan` clones out of this `Arc` when no custom `rule_source` is
+    /// given, instead of recompiling 52 `.wql` files on every call.
+    pub(crate) security_rules: Arc<RuleSet>,
     pub(crate) tool_router: ToolRouter<Self>,
 }
 
@@ -51,6 +56,7 @@ impl WebMcpServer {
         workspace_root: PathBuf,
         workspace: Workspace,
         reverse_index: ReverseSymbolIndex,
+        security_rules: RuleSet,
     ) -> Self {
         let call_graph = SymbolCallGraph::build(&workspace, &reverse_index);
         Self {
@@ -58,11 +64,13 @@ impl WebMcpServer {
             workspace: Arc::new(workspace),
             reverse_index: Arc::new(reverse_index),
             call_graph: Arc::new(call_graph),
+            security_rules: Arc::new(security_rules),
             tool_router: Self::lookup_tool_router()
                 + Self::callgraph_tool_router()
                 + Self::dataflow_tool_router()
                 + Self::impact_tool_router()
-                + Self::verify_tool_router(),
+                + Self::verify_tool_router()
+                + Self::security_tool_router(),
         }
     }
 }

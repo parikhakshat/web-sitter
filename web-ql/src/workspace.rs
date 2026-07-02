@@ -1,21 +1,21 @@
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use rayon::prelude::*;
-use web_sitter::{Cpg, CpgEdgeData, CpgNodeData, CpgSubgraph, FunctionSummary, IrNodeKind, NodeId};
 use web_profiler as prof;
+use web_sitter::{Cpg, CpgEdgeData, CpgNodeData, CpgSubgraph, FunctionSummary, IrNodeKind, NodeId};
 
 use crate::alias::AliasIndex;
 use crate::cfg::FunctionCfg;
 use crate::dfg::DfgIndex;
+use crate::engine::{EvalContext, RuleRunner};
 use crate::finding::Finding;
 use crate::ir::RuleSet;
 use crate::kind_index::KindIndex;
-use crate::nullability::NullabilityIndex;
 use crate::node_ref::NodeRef;
+use crate::nullability::NullabilityIndex;
 use crate::size_tracking::AllocSizeIndex;
 use crate::taint::{CrossFileTaintCtx, EndpointRegistry};
-use crate::engine::{EvalContext, RuleRunner};
 
 // ── File index ────────────────────────────────────────────────────────────────
 
@@ -99,9 +99,7 @@ fn build_cfg_cache(cpg: &Cpg) -> HashMap<NodeId, FunctionCfg> {
     let fn_ids: Vec<NodeId> = cpg
         .ast
         .iter()
-        .filter(|(_, n)| {
-            matches!(n.kind, IrNodeKind::MethodDef | IrNodeKind::LambdaDef)
-        })
+        .filter(|(_, n)| matches!(n.kind, IrNodeKind::MethodDef | IrNodeKind::LambdaDef))
         .map(|(id, _)| *id)
         .collect();
 
@@ -214,7 +212,8 @@ impl Workspace {
 
         // Merge function summaries from this CPG.
         for (_node_id, summary) in &cpg.workspace.function_summaries {
-            self.summary_source.insert(summary.name.clone(), path.clone());
+            self.summary_source
+                .insert(summary.name.clone(), path.clone());
             self.summaries.insert(summary.name.clone(), summary.clone());
         }
 
@@ -418,10 +417,29 @@ impl Workspace {
         self.scan_with_progress(rule_set, || {})
     }
 
+    /// Like [`scan`] but only evaluates files whose path is in `scope` — the scoped
+    /// alternative to a full `scan()`, for a security-scan tool that shouldn't have to
+    /// touch every file in a 100k+ file monorepo to check a single directory or PR diff.
+    /// Cross-file taint context is still built from the *whole* workspace (an in-scope
+    /// file's taint can legitimately flow through an out-of-scope file), so a scoped scan
+    /// still catches interprocedural findings — only which files get their own `Finding`s
+    /// reported is restricted, not what cross-file context feeds into evaluating them.
+    pub fn scan_scoped(&self, rule_set: &RuleSet, scope: &HashSet<PathBuf>) -> Vec<Finding> {
+        self.scan_filtered(rule_set, |path| scope.contains(path), || {})
+    }
+
     /// Like [`scan`] but calls `on_file()` after each file is processed, allowing
     /// the caller to drive a progress bar.
     pub fn scan_with_progress<F>(&self, rule_set: &RuleSet, on_file: F) -> Vec<Finding>
     where
+        F: Fn() + Sync,
+    {
+        self.scan_filtered(rule_set, |_| true, on_file)
+    }
+
+    fn scan_filtered<P, F>(&self, rule_set: &RuleSet, predicate: P, on_file: F) -> Vec<Finding>
+    where
+        P: Fn(&Path) -> bool + Sync,
         F: Fn() + Sync,
     {
         let _span = prof::span("query.scan_total");
@@ -435,6 +453,7 @@ impl Workspace {
 
         self.files
             .par_iter()
+            .filter(|(path, _)| predicate(path))
             .flat_map(|(path, file_idx)| {
                 let _task = prof::task();
                 let _span = prof::span("query.scan_file");
@@ -586,9 +605,10 @@ impl Workspace {
         if finding.matched_nodes.is_empty() {
             return None;
         }
-        let file_idx = self.files.values().find(|fi| {
-            fi.cpg.source_file.as_deref() == Some(finding.location.file.as_str())
-        })?;
+        let file_idx = self
+            .files
+            .values()
+            .find(|fi| fi.cpg.source_file.as_deref() == Some(finding.location.file.as_str()))?;
         Some(build_cpg_subgraph(&file_idx.cpg, &finding.matched_nodes))
     }
 }
@@ -650,7 +670,10 @@ fn build_cpg_subgraph(cpg: &Cpg, matched_nodes: &[NodeId]) -> CpgSubgraph {
             for _ in 0..24 {
                 if let Some(node) = cpg.ast.get(&cur) {
                     match node.parent_id {
-                        Some(p) => { included.insert(p); cur = p; }
+                        Some(p) => {
+                            included.insert(p);
+                            cur = p;
+                        }
                         None => break,
                     }
                 } else {
@@ -666,21 +689,26 @@ fn build_cpg_subgraph(cpg: &Cpg, matched_nodes: &[NodeId]) -> CpgSubgraph {
     }
 
     // Build node list
-    let nodes: Vec<CpgNodeData> = included.iter().filter_map(|&id| {
-        let n = cpg.ast.get(&id)?;
-        let text = n.text.as_ref()
-            .map(|t| t.chars().take(60).collect::<String>())
-            .or_else(|| n.name.clone());
-        Some(CpgNodeData {
-            id,
-            node_type: n.node_type.clone(),
-            text,
-            line: n.line,
-            col: n.column,
-            end_line: n.end_line,
-            parent_id: n.parent_id.filter(|p| included.contains(p)),
+    let nodes: Vec<CpgNodeData> = included
+        .iter()
+        .filter_map(|&id| {
+            let n = cpg.ast.get(&id)?;
+            let text = n
+                .text
+                .as_ref()
+                .map(|t| t.chars().take(60).collect::<String>())
+                .or_else(|| n.name.clone());
+            Some(CpgNodeData {
+                id,
+                node_type: n.node_type.clone(),
+                text,
+                line: n.line,
+                col: n.column,
+                end_line: n.end_line,
+                parent_id: n.parent_id.filter(|p| included.contains(p)),
+            })
         })
-    }).collect();
+        .collect();
 
     // AST edges (parent → child)
     let mut edges: Vec<CpgEdgeData> = Vec::new();
@@ -688,7 +716,12 @@ fn build_cpg_subgraph(cpg: &Cpg, matched_nodes: &[NodeId]) -> CpgSubgraph {
         if let Some(n) = cpg.ast.get(&id) {
             if let Some(parent) = n.parent_id {
                 if included.contains(&parent) {
-                    edges.push(CpgEdgeData { s: parent, d: id, k: "A".to_string(), v: None });
+                    edges.push(CpgEdgeData {
+                        s: parent,
+                        d: id,
+                        k: "A".to_string(),
+                        v: None,
+                    });
                 }
             }
         }
@@ -701,10 +734,18 @@ fn build_cpg_subgraph(cpg: &Cpg, matched_nodes: &[NodeId]) -> CpgSubgraph {
                 s: edge.source,
                 d: edge.destination,
                 k: "D".to_string(),
-                v: if edge.variable.is_empty() { None } else { Some(edge.variable.clone()) },
+                v: if edge.variable.is_empty() {
+                    None
+                } else {
+                    Some(edge.variable.clone())
+                },
             });
         }
     }
 
-    CpgSubgraph { nodes, edges, pruned }
+    CpgSubgraph {
+        nodes,
+        edges,
+        pruned,
+    }
 }

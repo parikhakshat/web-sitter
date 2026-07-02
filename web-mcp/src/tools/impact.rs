@@ -18,13 +18,62 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{tool, tool_router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use web_sitter::symbol_id::build_symbol_table;
-use web_sitter::{CpgGenerator, GraphBuildOptions};
+use web_sitter::symbol_id::{SymbolId, build_symbol_table};
+use web_sitter::{Cpg, CpgGenerator, GraphBuildOptions};
 
 use crate::server::WebMcpServer;
 
 fn default_max_depth() -> u32 {
     5
+}
+
+/// Diff two versions of one file's symbol table by byte-range text comparison, returning
+/// every symbol whose presence or text changed, tagged `"added"`/`"removed"`/`"modified"`.
+/// Shared between `impact_of_change` and `run_security_scan`'s `diff` scope (both need
+/// "what changed" as the seed for a blast-radius/scoped-scan computation).
+pub(crate) fn diff_changed_symbols(
+    old_cpg: &Cpg,
+    old_source: &[u8],
+    new_cpg: &Cpg,
+    new_source: &[u8],
+) -> Vec<(SymbolId, &'static str)> {
+    let old_symbols = build_symbol_table(old_cpg);
+    let new_symbols = build_symbol_table(new_cpg);
+
+    let mut old_by_id = std::collections::HashMap::new();
+    for (&node_id, symbol_id) in &old_symbols {
+        if let Some(node) = old_cpg.ast.get(&node_id)
+            && let (Some(s), Some(e)) = (node.start_byte, node.end_byte)
+        {
+            old_by_id.insert(symbol_id.clone(), (s as usize, e as usize));
+        }
+    }
+    let mut new_by_id = std::collections::HashMap::new();
+    for (&node_id, symbol_id) in &new_symbols {
+        if let Some(node) = new_cpg.ast.get(&node_id)
+            && let (Some(s), Some(e)) = (node.start_byte, node.end_byte)
+        {
+            new_by_id.insert(symbol_id.clone(), (s as usize, e as usize));
+        }
+    }
+
+    let mut changed = Vec::new();
+    let all_ids: BTreeSet<_> = old_by_id.keys().chain(new_by_id.keys()).cloned().collect();
+    for symbol_id in all_ids {
+        match (old_by_id.get(&symbol_id), new_by_id.get(&symbol_id)) {
+            (Some(_), None) => changed.push((symbol_id, "removed")),
+            (None, Some(_)) => changed.push((symbol_id, "added")),
+            (Some(&(os, oe)), Some(&(ns, ne))) => {
+                let old_text = old_source.get(os..oe);
+                let new_text = new_source.get(ns..ne);
+                if old_text != new_text {
+                    changed.push((symbol_id, "modified"));
+                }
+            }
+            (None, None) => unreachable!("symbol_id came from one of the two maps"),
+        }
+    }
+    changed
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -85,42 +134,7 @@ impl WebMcpServer {
             .generate_from_source_with_options(new_source, GraphBuildOptions::default())
             .map_err(|e| format!("parsing new_source: {e}"))?;
 
-        let old_symbols = build_symbol_table(&idx.cpg);
-        let new_symbols = build_symbol_table(&new_cpg);
-
-        let mut old_by_id = std::collections::HashMap::new();
-        for (&node_id, symbol_id) in &old_symbols {
-            if let Some(node) = idx.cpg.ast.get(&node_id)
-                && let (Some(s), Some(e)) = (node.start_byte, node.end_byte)
-            {
-                old_by_id.insert(symbol_id.clone(), (s as usize, e as usize));
-            }
-        }
-        let mut new_by_id = std::collections::HashMap::new();
-        for (&node_id, symbol_id) in &new_symbols {
-            if let Some(node) = new_cpg.ast.get(&node_id)
-                && let (Some(s), Some(e)) = (node.start_byte, node.end_byte)
-            {
-                new_by_id.insert(symbol_id.clone(), (s as usize, e as usize));
-            }
-        }
-
-        let mut changed = Vec::new();
-        let all_ids: BTreeSet<_> = old_by_id.keys().chain(new_by_id.keys()).cloned().collect();
-        for symbol_id in all_ids {
-            match (old_by_id.get(&symbol_id), new_by_id.get(&symbol_id)) {
-                (Some(_), None) => changed.push((symbol_id, "removed")),
-                (None, Some(_)) => changed.push((symbol_id, "added")),
-                (Some(&(os, oe)), Some(&(ns, ne))) => {
-                    let old_text = old_source.get(os..oe);
-                    let new_text = new_source.get(ns..ne);
-                    if old_text != new_text {
-                        changed.push((symbol_id, "modified"));
-                    }
-                }
-                (None, None) => unreachable!("symbol_id came from one of the two maps"),
-            }
-        }
+        let changed = diff_changed_symbols(&idx.cpg, &old_source, &new_cpg, new_source);
 
         let mut blast_radius: BTreeSet<String> = BTreeSet::new();
         for (symbol_id, kind) in &changed {

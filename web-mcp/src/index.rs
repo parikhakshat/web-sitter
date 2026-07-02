@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use rayon::prelude::*;
+use web_ql::RuleSet;
+use web_ql::loader::load_rules_dir;
 use web_ql::symbol_index::ReverseSymbolIndex;
 use web_ql::workspace::Workspace;
 use web_sitter::{CpgGenerator, GraphBuildOptions, language_from_path};
@@ -52,6 +54,30 @@ pub fn build_workspace(root: &Path) -> Result<(Workspace, ReverseSymbolIndex)> {
     );
 
     Ok((workspace, reverse_index))
+}
+
+/// Load and merge every `.wql` rule file under `rules_dir` into one `RuleSet` — the
+/// built-in CWE corpus `run_security_scan` runs by default. `web-ql-queries/` is laid
+/// out one subdirectory per language (`c/`, `cpp/`, `go/`, ...); `load_rules_dir` itself
+/// is non-recursive, so this walks `rules_dir`'s immediate children as well as any
+/// `.wql` files directly inside it, rather than requiring a specific layout.
+pub fn load_builtin_rules(rules_dir: &Path) -> Result<RuleSet> {
+    let mut rule_sets = load_rules_dir(rules_dir)
+        .with_context(|| format!("loading rules directly under {}", rules_dir.display()))?;
+
+    for entry in std::fs::read_dir(rules_dir)
+        .with_context(|| format!("reading rules directory {}", rules_dir.display()))?
+    {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            rule_sets.extend(
+                load_rules_dir(&entry.path())
+                    .with_context(|| format!("loading rules from {}", entry.path().display()))?,
+            );
+        }
+    }
+
+    Ok(RuleSet::merge(rule_sets))
 }
 
 fn build_cpg(path: &Path) -> Result<web_sitter::Cpg> {
@@ -135,6 +161,42 @@ mod tests {
         assert!(
             reverse_index.symbol_count() >= 2,
             "helper and caller must both be defined symbols"
+        );
+    }
+
+    #[test]
+    fn load_builtin_rules_merges_top_level_and_subdirectory_wql_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("top_level.wql"),
+            r#"rule "top-level-rule" {
+                severity: high
+                languages: [c]
+                message: "top level"
+                find n: Call where n.callee_name() in ["system"]
+            }"#,
+        )
+        .unwrap();
+        std::fs::create_dir(dir.path().join("c")).unwrap();
+        std::fs::write(
+            dir.path().join("c/nested.wql"),
+            r#"rule "nested-rule" {
+                severity: critical
+                languages: [c]
+                message: "nested"
+                find n: Call where n.callee_name() in ["exec"]
+            }"#,
+        )
+        .unwrap();
+        // Non-.wql files must be ignored, not error the walk.
+        std::fs::write(dir.path().join("README.md"), "not a rule file").unwrap();
+
+        let rule_set = load_builtin_rules(dir.path()).expect("load_builtin_rules");
+        let rule_ids: HashSet<&str> = rule_set.rules.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(
+            rule_ids,
+            HashSet::from(["top-level-rule", "nested-rule"]),
+            "must merge both the top-level .wql file and the one in the c/ subdirectory"
         );
     }
 
