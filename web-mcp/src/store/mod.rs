@@ -12,6 +12,7 @@
 //! server-shaped costume.
 
 pub mod incremental_file;
+pub mod live_workspace;
 pub mod persistence;
 pub mod revision;
 pub mod shard;

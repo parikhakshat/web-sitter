@@ -8,7 +8,7 @@ license = "MIT"
 web-sitter = { path = "../web-sitter" }
 web-ql = { path = "../web-ql" }
 rmcp = { version = "2.1", features = ["server", "macros", "transport-io", "schemars"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "signal", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "signal", "sync", "fs"] }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = "1.0"
@@ -22,6 +22,7 @@ bincode = { workspace = true }
 lz4_flex = { version = "0.11", default-features = false, features = ["frame"] }
 lru = "0.12"
 dashmap = "6"
+notify-debouncer-mini = "0.7"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["process", "io-util", "time"] }

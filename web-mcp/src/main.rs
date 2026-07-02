@@ -1,14 +1,16 @@
 mod callgraph;
 mod index;
 mod server;
-// Not wired into WebMcpServer yet — sharded locking (#12), the incremental-system
-// unification (#13), and the file watcher (#14) all need to land first before the live
-// server can use this instead of crate::index's all-in-memory batch Workspace. Exercised
-// by its own unit tests in the meantime.
+// Not wired into WebMcpServer yet: every tool handler still reads from crate::index's
+// batch-built, all-in-memory Workspace. Swapping tools over to LiveWorkspace (so they see
+// live edits) is follow-up integration work beyond this phase's per-piece tasks — store
+// and watcher are exercised by their own unit/integration tests in the meantime.
 #[allow(dead_code)]
 mod store;
 mod symbol_query;
 mod tools;
+#[allow(dead_code)]
+mod watcher;
 
 use std::path::PathBuf;
 
