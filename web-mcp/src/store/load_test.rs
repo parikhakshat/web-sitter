@@ -198,20 +198,29 @@ async fn concurrent_edits_to_distinct_shards_scale_with_parallelism_not_serializ
     // revealed that's wrong — `WorkspaceStore::put` calls `PersistentStore::put`, which
     // opens and commits its own `redb` write transaction per call, and `redb::Database`
     // only permits *one* write transaction at a time process-wide, independent of which
-    // shard it's for. So the incremental-reparse/diff work (the part `ShardedLocks`
-    // actually parallelizes) overlaps across shards, but every edit's final persist step
-    // still serializes behind redb's single-writer model. Tuning conclusion: per-shard
-    // locking is doing its job for the CPU-bound work; the remaining bottleneck is
-    // `WorkspaceStore`'s one-write-transaction-per-file persistence, not lock granularity
-    // — batching multiple files' writes into fewer redb transactions (a real follow-up,
-    // not implemented here) is the lever that would actually move this number, not
-    // finer-grained locking.
+    // shard it's for and independent of durability level (see `persistence.rs`'s module
+    // docs, updated after measuring this — dropping to `Durability::Eventual` removed
+    // real per-commit fsync-barrier overhead, but the single-write-transaction-slot
+    // serialization itself is structural to redb, not a durability setting). So the
+    // incremental-reparse/diff work (the part `ShardedLocks` actually parallelizes)
+    // overlaps across shards, but every edit's final persist step still queues behind
+    // the others for that one slot. Tuning conclusion: per-shard locking is doing its job
+    // for the CPU-bound work; the remaining bottleneck is `WorkspaceStore`'s
+    // one-write-transaction-per-file persistence, not lock granularity — batching
+    // multiple files' writes into fewer redb transactions (a real architectural
+    // follow-up, not implemented here) is the lever that would actually move this
+    // number, not finer-grained locking or further durability tuning.
     //
     // So this assertion checks what's actually true given that architecture: total time
     // for DIRECTORY_COUNT concurrent edits must stay well under full serialization
     // (DIRECTORY_COUNT × baseline) — ruling out an *accidental* additional bottleneck
     // (e.g. a stray global mutex around the whole apply, not just the redb write) beyond
-    // the known, already-understood one.
+    // the known, already-understood one. Deliberately not tightened further: the
+    // Eventual-durability change measurably speeds up a single put() in isolation but
+    // barely moves this specific total (still dominated by the same structural
+    // single-writer queueing, just with a cheaper commit at the front of each wait) —
+    // asserting a tighter ceiling here would be describing a fix this change doesn't
+    // actually deliver.
     let full_serialization_ceiling = baseline_latency * (DIRECTORY_COUNT as u32);
     assert!(
         total_wall_time < full_serialization_ceiling,

@@ -4,11 +4,39 @@
 //! `store/mod.rs`) caches hot shards over — plain `redb`, not a container of every file's
 //! `Cpg` in memory, is what makes a 100k+ file monorepo's cold-start and steady-state
 //! memory footprint tractable.
+//!
+//! Write durability: `put`/`remove` use `Durability::Eventual` rather than redb's default
+//! `Durability::Immediate`, which skips the fsync-equivalent barrier `Immediate` waits on
+//! before a commit returns. `Eventual` still commits atomically and is immediately visible
+//! to any reader in this process (crash-safety is what it trades away, not read-after-write
+//! consistency) — an acceptable trade for a store that's a *rebuildable derived cache* of
+//! already-persisted source files, not source-of-truth data: losing the last few
+//! not-yet-flushed writes to an actual crash just means those files are treated as a cache
+//! miss and re-derived on next warm-restart (see `store::live_workspace`'s
+//! content-hash-equivalent validity check), not data loss.
+//!
+//! What this fix does and doesn't address — measured with `store::load_test`'s concurrency
+//! benchmark, not assumed: `redb::Database` permits only one write transaction active at a
+//! time process-wide, *independent of durability level* — that serialization is inherent
+//! to redb's copy-on-write B-tree design (similar to LMDB/SQLite's single-writer model),
+//! not something a durability setting changes. Dropping `Immediate`'s fsync barrier removes
+//! real per-commit overhead (measurably faster single-`put` latency), but concurrent
+//! cross-shard `put`s still queue behind each other waiting for the one write-transaction
+//! slot — `ShardedLocks` parallelizes the CPU-bound reparse/diff work fine, but every edit's
+//! persist step still funnels through that single slot. Actually removing *that*
+//! bottleneck needs batching multiple files' writes into fewer transactions (coalescing
+//! writes queued within a short window into one commit, the same shape as the file
+//! watcher's own debounce) — a real architectural change, not a one-line fix, and left as
+//! documented follow-up rather than attempted under this task's scope. `Durability::None`
+//! (skips even more bookkeeping) was measured too and gave a further small improvement, but
+//! was rejected: redb's own docs warn it accumulates freed-but-unreclaimed pages ("rapid
+//! growth of the database file") when used exclusively, a bad trade for a long-running
+//! server with no batching in place yet to make that growth worth it.
 
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use redb::{Database, ReadableTableMetadata, TableDefinition};
+use redb::{Database, Durability, ReadableTableMetadata, TableDefinition};
 use web_sitter::Cpg;
 
 /// Bumped whenever the on-disk encoding of a stored `Cpg` changes incompatibly, mirroring
@@ -65,7 +93,8 @@ impl PersistentStore {
             .context("encoding Cpg for on-disk storage")?;
         let payload = lz4_flex::compress_prepend_size(&encoded);
 
-        let write_txn = self.db.begin_write().context("opening write transaction")?;
+        let mut write_txn = self.db.begin_write().context("opening write transaction")?;
+        write_txn.set_durability(Durability::Eventual);
         {
             let mut table = write_txn
                 .open_table(CPG_TABLE)
@@ -104,7 +133,8 @@ impl PersistentStore {
 
     /// Remove any entry stored under `file_path`. Safe to call when absent (no-op).
     pub fn remove(&self, file_path: &str) -> Result<()> {
-        let write_txn = self.db.begin_write().context("opening write transaction")?;
+        let mut write_txn = self.db.begin_write().context("opening write transaction")?;
+        write_txn.set_durability(Durability::Eventual);
         {
             let mut table = write_txn
                 .open_table(CPG_TABLE)
