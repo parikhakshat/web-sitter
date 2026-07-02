@@ -1,23 +1,27 @@
 // CWE-121: Stack Buffer Overflow / CWE-787: OOB Write — C
 // Unsafe string/memory functions that write without bounds checks.
 
-// ── Predicate: a CFG-dominating guard mentions the destination or source ──────
-// Coarse (same spirit as `null_checked` in cwe476_null_deref.wql): doesn't
-// verify the guard's comparison actually proves enough room, just that some
-// conditional reachable from the destination/source dominates the call and
-// precedes it — enough to distinguish "guard checks the relevant buffer" from
-// "guard checks an unrelated variable" (see guard_validation_test.c).
+// ── Predicate: a CFG-dominating guard proves the source fits the destination ──
 // `.refers_to()` is resolved inside the `exists` rather than hoisted via an
 // outer `let` — a `let` binding that fails to produce a node makes the whole
 // surrounding expression false, which would otherwise suppress the finding
 // entirely (the opposite of what we want) instead of just this guard check.
+//
+// `bounds_value()` (web-ql/src/guard.rs) verifies the actual comparison: it
+// finds the enclosing comparison for `src`/`dst` (optionally wrapped in a
+// `strlen`-family call, the common `if (strlen(input) < sizeof(buf))`
+// shape), works out the direction and polarity on the branch reaching
+// `call`, and checks the resolved bound against `dst`'s statically known
+// capacity — not just that some dominating conditional happens to mention
+// the destination or source at all (see guard_validation_test.c).
 pred call_size_guarded(dst: Node, src: Node, call: Node) =
     exists(nc: Conditional |
         let dst_decl = dst.refers_to() in
         let src_decl = src.refers_to() in
         (dst_decl.dfg_reaches(nc) or src_decl.dfg_reaches(nc))
         and nc.dominates(call)
-        and nc.line() <= call.line())
+        and nc.line() <= call.line()
+        and nc.bounds_value(src_decl, call, dst_decl))
 
 // ── Direct use of unbounded string functions ──────────────────────────────────
 

@@ -176,6 +176,8 @@ pub fn method_group(method: &str) -> Option<MethodGroup> {
         | "may_be_null" | "null_source"
         // Size tracking
         | "alloc_size" | "has_known_size"
+        // Symbolic guard verification
+        | "excludes_zero" | "bounds_value"
         => Some(MethodGroup::Universal),
 
         // Call-only

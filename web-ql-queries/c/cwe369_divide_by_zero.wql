@@ -54,11 +54,17 @@ rule "cwe-369-c-const-zero-divisor" {
 // `dominates()` is block-granular, so a guard sharing a straight-line block
 // with the division "dominates" it regardless of order — require the guard
 // to textually precede the division too (see cwe476_null_deref.wql).
+//
+// `excludes_zero()` (web-ql/src/guard.rs) verifies the conditional's
+// comparison actually establishes `decl != 0` on the branch reaching
+// `div_node` — the same "value excludes zero" fact a null check proves,
+// just applied to a divisor instead of a pointer.
 pred div_guarded(decl: Node, div_node: Node) =
     exists(nc: Conditional |
         decl.dfg_reaches(nc)
         and nc.dominates(div_node)
-        and nc.line() <= div_node.line())
+        and nc.line() <= div_node.line()
+        and nc.excludes_zero(decl, div_node))
     or exists(ac: Call |
         ac.callee_name() == "assert"
         and decl.dfg_reaches(ac)

@@ -6,10 +6,10 @@ use web_profiler as prof;
 use web_sitter::{Cpg, FunctionSummary, IrNode, IrNodeKind, NodeId};
 use crate::dfg::{DfgIndex, TaintConfig};
 use crate::engine::resolve_var_declaration;
+use crate::guard;
 use crate::ir::{TaintEndpointRef, TaintSpec};
 use crate::node_ref::NodeRef;
 use crate::size_tracking::AllocSizeIndex;
-use crate::symbolic::SymbolicEval;
 
 // ── Taint endpoint resolution ─────────────────────────────────────────────────
 
@@ -390,8 +390,8 @@ impl<'a> TaintEngine<'a> {
                             .iter()
                             .any(|&a| self.dfg.reaches(finding.source_node, a) || finding.source_node == a);
                         if reaches {
-                            if KNOWN_LENGTH_FUNCTIONS.contains(&name) {
-                                if self.verify_length_guard(id, cond_node, finding) {
+                            if guard::KNOWN_LENGTH_FUNCTIONS.contains(&name) {
+                                if self.verify_length_guard(cond_node, finding) {
                                     return true;
                                 }
                                 // Wrong direction/magnitude, or no enclosing
@@ -412,59 +412,18 @@ impl<'a> TaintEngine<'a> {
         false
     }
 
-    /// Verify that `len_call` (a call to a known length function, e.g.
-    /// `strlen(x)`) sits inside a comparison that actually bounds it against
-    /// the sink's destination capacity, accounting for:
-    /// - which side of the comparison the length call is on,
-    /// - which branch of `cond_node` reaches the sink (so `if (cond) return;`
-    ///   is understood as "reaching the sink requires `cond` to be false"),
-    /// - a constant offset on the length side (`strlen(x) + 1`), and
-    /// - the actual known size of the sink's destination buffer, when
-    ///   statically resolvable.
-    ///
-    /// When the destination size *isn't* statically resolvable (e.g. it's a
-    /// `size_t` parameter, not a fixed array), falls back to verifying only
-    /// that the comparison's direction is a valid upper-bound shape — still
-    /// real symbolic verification (rejects `if (strlen(x) > n)`-style
-    /// non-bounds as a guard), just without the numeric cross-check.
-    fn verify_length_guard(&self, len_call: NodeId, cond_node: NodeId, finding: &TaintFinding) -> bool {
-        let Some((_binop, value_side, bound_side, op, flipped)) =
-            find_enclosing_comparison(self.cpg, len_call, cond_node)
-        else {
-            return false;
-        };
-
-        let mut op = op.as_str();
-        if flipped {
-            op = flip_operator(op);
-        }
-        match branch_polarity(self.cpg, cond_node, finding.sink_node) {
-            Some(true) => {}
-            Some(false) => op = negate_operator(op),
-            None => return false,
-        }
-        // After polarity adjustment, the comparison must read as
-        // `value <op> bound` with `op` an upper-bound shape — anything else
-        // (`>`, `>=`, `==`, `!=`) doesn't establish that the value is small
-        // enough, regardless of which function produced it.
-        if op != "<" && op != "<=" {
-            return false;
-        }
-
-        let offset = extract_length_offset(self.cpg, value_side, len_call).unwrap_or(0);
-
-        let Some(sizes) = self.sizes else { return true };
-        let mut se = SymbolicEval::new(self.cpg);
-        let Some(bound_val) = se.eval_int(bound_side) else { return true };
-        let Some(dest_capacity) = sink_destination_capacity(self.cpg, sizes, finding.sink_node) else {
-            return true;
-        };
-        let threshold = dest_capacity.saturating_add(offset);
-        if op == "<" {
-            bound_val <= threshold
-        } else {
-            bound_val < threshold
-        }
+    /// Verify that the condition actually bounds `finding.source_node`
+    /// (directly, or wrapped in a `strlen`-family call) against the sink's
+    /// destination capacity. Delegates the comparison-direction/polarity/
+    /// magnitude verification to `guard::upper_bounds` — the same primitive
+    /// the WQL-level `bounds_value()` predicate uses — and only resolves the
+    /// taint-guard-specific piece: the sink call's destination-argument
+    /// capacity convention.
+    fn verify_length_guard(&self, cond_node: NodeId, finding: &TaintFinding) -> bool {
+        let capacity = self
+            .sizes
+            .and_then(|sizes| sink_destination_capacity(self.cpg, sizes, finding.sink_node));
+        guard::upper_bounds(self.cpg, self.dfg, finding.source_node, cond_node, finding.sink_node, capacity)
     }
 
     fn resolve_propagator_edges(&self, propagators: &[TaintEndpointRef]) -> Vec<(NodeId, NodeId)> {
@@ -782,161 +741,10 @@ fn call_argument_nodes(cpg: &Cpg, call_id: NodeId) -> Vec<NodeId> {
 }
 
 // ── Length-guard symbolic verification helpers ─────────────────────────────────
-
-/// Length functions whose comparison against a bound this engine can
-/// actually verify symbolically (direction + magnitude), as opposed to
-/// opaque user-defined validators (`validate`, `is_valid`, ...) which can
-/// only be recognized by name — there's no way to know what an arbitrary
-/// function's return value means, so those are accepted on presence alone.
-/// `strlen`-family functions have known, fixed semantics: the engine can
-/// find the comparison they sit in, work out which direction and magnitude
-/// it establishes, and check that against the sink's actual destination
-/// capacity.
-const KNOWN_LENGTH_FUNCTIONS: &[&str] = &["strlen", "strnlen", "wcslen"];
-
-/// True if `ancestor` is `node` itself or one of its AST ancestors.
-fn is_ancestor(cpg: &Cpg, ancestor: NodeId, node: NodeId) -> bool {
-    let mut cur = node;
-    for _ in 0..500 {
-        if cur == ancestor {
-            return true;
-        }
-        match cpg.ast.get(&cur).and_then(|n| n.parent_id) {
-            Some(p) if p != cur => cur = p,
-            _ => return false,
-        }
-    }
-    false
-}
-
-/// Walk up from `from` (a length-function call) looking for the nearest
-/// enclosing comparison `BinaryOp`, stopping at `stop_at` (the Conditional's
-/// condition root — don't walk past it into unrelated code). Returns
-/// `(binop, value_side, bound_side, operator, flipped)` where `value_side`
-/// is whichever operand contains `from`, `bound_side` is the other operand,
-/// and `flipped` is true when `from` was on the right (so the caller must
-/// mirror the operator to read the comparison as `value <op> bound`).
-fn find_enclosing_comparison(
-    cpg: &Cpg,
-    from: NodeId,
-    stop_at: NodeId,
-) -> Option<(NodeId, NodeId, NodeId, String, bool)> {
-    let mut cur = from;
-    for _ in 0..200 {
-        if cur == stop_at {
-            return None;
-        }
-        let node = cpg.ast.get(&cur)?;
-        if node.kind == IrNodeKind::BinaryOp && node.children.len() >= 2 {
-            if let Some(op) = node.operator.as_deref() {
-                if matches!(op, "<" | "<=" | ">" | ">=" | "==" | "!=") {
-                    let lhs = node.children[0];
-                    let rhs = *node.children.last().unwrap();
-                    if is_ancestor(cpg, lhs, from) {
-                        return Some((cur, lhs, rhs, op.to_owned(), false));
-                    }
-                    if is_ancestor(cpg, rhs, from) {
-                        return Some((cur, rhs, lhs, op.to_owned(), true));
-                    }
-                }
-            }
-        }
-        match node.parent_id {
-            Some(p) if p != cur => cur = p,
-            _ => return None,
-        }
-    }
-    None
-}
-
-fn flip_operator(op: &str) -> &'static str {
-    match op {
-        "<" => ">",
-        "<=" => ">=",
-        ">" => "<",
-        ">=" => "<=",
-        "==" => "==",
-        _ => "!=",
-    }
-}
-
-fn negate_operator(op: &str) -> &'static str {
-    match op {
-        "<" => ">=",
-        "<=" => ">",
-        ">" => "<=",
-        ">=" => "<",
-        "==" => "!=",
-        _ => "==",
-    }
-}
-
-/// Which branch of `cond_node` (a Conditional) reaches `target`: `Some(true)`
-/// if `target` is inside the "consequence" (then) subtree, `Some(false)` if
-/// inside "alternative" (else) — or, when `target` is outside both (the
-/// common `if (cond) return;` early-exit idiom, where the sink sits after
-/// the whole if-statement), `Some(false)` on the assumption that the
-/// consequence branch terminates (return/break/continue/goto) rather than
-/// falling through itself. Doesn't verify that assumption structurally; a
-/// non-terminating consequence with no `alternative` is rare enough in
-/// practice that getting it wrong here just means an occasional guard isn't
-/// recognized (a missed suppression, not a wrong one).
-fn branch_polarity(cpg: &Cpg, cond_node: NodeId, target: NodeId) -> Option<bool> {
-    let node = cpg.ast.get(&cond_node)?;
-    let mut consequence = None;
-    let mut alternative = None;
-    for (i, &child) in node.children.iter().enumerate() {
-        match node.field_names.get(i).and_then(|f| f.as_deref()) {
-            Some("consequence") => consequence = Some(child),
-            Some("alternative") => alternative = Some(child),
-            _ => {}
-        }
-    }
-    if let Some(c) = consequence {
-        if is_ancestor(cpg, c, target) {
-            return Some(true);
-        }
-    }
-    if let Some(a) = alternative {
-        if is_ancestor(cpg, a, target) {
-            return Some(false);
-        }
-    }
-    Some(false)
-}
-
-/// If `value_expr` is exactly `len_call` (offset 0) or `len_call + CONST` /
-/// `CONST + len_call` (offset `CONST`), return the offset — handles the
-/// common null-terminator idiom (`strlen(x) + 1`). Any other shape (a
-/// non-constant second operand, subtraction, multiplication, ...) returns
-/// `None` rather than guess; the caller treats that as offset 0, which is
-/// conservative for `<`/`<=` bounds (a wrongly-assumed offset of 0 instead
-/// of a positive one under-credits the guard, never over-credits it).
-fn extract_length_offset(cpg: &Cpg, value_expr: NodeId, len_call: NodeId) -> Option<i64> {
-    if value_expr == len_call {
-        return Some(0);
-    }
-    let node = cpg.ast.get(&value_expr)?;
-    if node.is_parenthesized() {
-        return extract_length_offset(cpg, *node.children.first()?, len_call);
-    }
-    if node.kind == IrNodeKind::BinaryOp && node.children.len() >= 2 {
-        let op = node.operator.as_deref()?;
-        let lhs = node.children[0];
-        let rhs = *node.children.last().unwrap();
-        let mut se = SymbolicEval::new(cpg);
-        if lhs == len_call && op == "+" {
-            return se.eval_int(rhs);
-        }
-        if lhs == len_call && op == "-" {
-            return se.eval_int(rhs).map(|c| -c);
-        }
-        if rhs == len_call && op == "+" {
-            return se.eval_int(lhs);
-        }
-    }
-    None
-}
+// The actual comparison-direction/polarity/magnitude verification now lives
+// in `guard.rs`, shared with the WQL-exposed `bounds_value()`/`excludes_zero()`
+// predicates — this module only resolves the taint-guard-specific piece: the
+// sink call's destination-argument capacity convention.
 
 /// The statically-known capacity of the sink's actual destination buffer:
 /// walk up from `sink_node` to its enclosing `Call` (the copy/read

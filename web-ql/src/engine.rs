@@ -1030,6 +1030,70 @@ impl<'a> RuleRunner<'a> {
                 EvalValue::Bool(se.is_const(node_id))
             }
 
+            // ── Symbolic guard verification ───────────────────────────────────
+            // Shared primitives (see guard.rs) behind the coarse WQL-level
+            // "some dominating conditional mentions the value" predicates:
+            // `null_checked`, `div_guarded`, `index_guarded`, and
+            // `call_size_guarded` all reduce to one of these two calls,
+            // receiver-bound to the candidate `Conditional`/`Call` guard node.
+            //
+            // `nc.excludes_zero(value, target)` — true when `nc`'s condition
+            // establishes, on the branch reaching `target`, that `value` is
+            // nonzero (covers null-pointer checks and zero-divisor checks —
+            // the same underlying fact).
+            "excludes_zero" => {
+                let value = step.args.first().map(|a| self.eval_plan_expr(a, env));
+                let target = step.args.get(1).map(|a| self.eval_plan_expr(a, env));
+                match (value, target) {
+                    (Some(EvalValue::Node(v)), Some(EvalValue::Node(t))) => EvalValue::Bool(
+                        crate::guard::excludes_zero(self.ctx.cpg, self.ctx.dfg, v, node_id, t),
+                    ),
+                    _ => EvalValue::Bool(false),
+                }
+            }
+
+            // `nc.bounds_value(value, target, capacity)` — true when `nc`'s
+            // condition establishes, on the branch reaching `target`, that
+            // `value` (optionally wrapped in a `strlen`-family call) is
+            // bounded above by `capacity`. `capacity` may be an already-
+            // resolved integer (`decl.alloc_size()`) or a raw node whose
+            // concrete size is looked up directly.
+            "bounds_value" => {
+                let value = step.args.first().map(|a| self.eval_plan_expr(a, env));
+                let target = step.args.get(1).map(|a| self.eval_plan_expr(a, env));
+                let capacity = step.args.get(2).map(|a| self.eval_plan_expr(a, env));
+                let capacity_int = match capacity {
+                    Some(EvalValue::Int(n)) => Some(n),
+                    // Accept either an already-resolved declaration (as other
+                    // rules pass via `.refers_to()`) or a raw expression node
+                    // — resolve to its declaration here so callers don't need
+                    // a `let` (whose failure would short-circuit the whole
+                    // surrounding predicate rather than just falling back to
+                    // the direction-only capacity=None verification).
+                    Some(EvalValue::Node(cap_id)) => {
+                        self.ctx.sizes.concrete_size(cap_id).or_else(|| {
+                            let cap_node = self.ctx.cpg.ast.get(&cap_id)?;
+                            let decl = resolve_var_declaration(self.ctx.cpg, cap_id, cap_node)?;
+                            self.ctx.sizes.concrete_size(decl)
+                        })
+                    }
+                    _ => None,
+                };
+                match (value, target) {
+                    (Some(EvalValue::Node(v)), Some(EvalValue::Node(t))) => {
+                        EvalValue::Bool(crate::guard::upper_bounds(
+                            self.ctx.cpg,
+                            self.ctx.dfg,
+                            v,
+                            node_id,
+                            t,
+                            capacity_int,
+                        ))
+                    }
+                    _ => EvalValue::Bool(false),
+                }
+            }
+
             // ── Language metadata side-table accessors ────────────────────────
             // Return a MetaNode sentinel; the next chained step resolves the field.
             "cpp_meta"    => EvalValue::MetaNode(node_id, "cpp".to_owned()),
@@ -1394,7 +1458,14 @@ fn compile_wql_regex(raw: &str) -> Option<regex::Regex> {
 /// Used by DFG predicate subtree extensions so that `LocalDef.dfg_reaches(Call)`
 /// checks flow between descendant identifier/expression nodes, not just the
 /// structural container nodes (which have no DFG edges themselves).
-fn ast_subtree(cpg: &Cpg, root: NodeId) -> HashSet<NodeId> {
+/// All descendant node ids of `root`, including `root` itself. `pub(crate)`
+/// so `guard.rs` can mirror the same "subtree extension" semantics that
+/// `DfgPredicate::ReachesFlow` uses below: a DFG edge for a compound
+/// expression's *value* (e.g. a `Call`) often originates on one of its
+/// descendant identifier/argument nodes rather than the compound node's own
+/// id, so reachability checks need to consider the whole subtree, not just
+/// the literal node.
+pub(crate) fn ast_subtree(cpg: &Cpg, root: NodeId) -> HashSet<NodeId> {
     use std::collections::VecDeque;
     let mut visited: HashSet<NodeId> = HashSet::new();
     let mut queue: VecDeque<NodeId> = VecDeque::new();

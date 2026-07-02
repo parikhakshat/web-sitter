@@ -13,11 +13,18 @@
 // regardless of which comes first, so a check placed AFTER the dereference
 // (`*p = 'A'; if (!p) return;`) would otherwise be wrongly accepted as a
 // guard. Require the guard to textually precede the deref as well.
+//
+// `excludes_zero()` (see web-ql/src/guard.rs) does the actual symbolic work:
+// it verifies the conditional's comparison direction/polarity actually
+// establishes `alloc != 0` on the branch reaching `deref` (`p == NULL`,
+// `p != NULL`, bare `if (p)`/`if (!p)`), rather than just noting that some
+// dominating conditional happens to mention the value at all.
 pred null_checked(alloc: Call, deref: Node) =
     exists(nc: Conditional |
         alloc.dfg_reaches(nc)
         and nc.dominates(deref)
-        and nc.line() <= deref.line())
+        and nc.line() <= deref.line()
+        and nc.excludes_zero(alloc, deref))
     or exists(ac: Call |
         ac.callee_name() == "assert"
         and alloc.dfg_reaches(ac)
