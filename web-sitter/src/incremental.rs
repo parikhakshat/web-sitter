@@ -343,6 +343,7 @@ impl IncrementalCpgGenerator {
         let tree_ref = self.tree.as_ref().expect("just stored above");
         let artifacts = get_node_graph_artifacts(tree_ref.root_node(), source, &lightweight_opts, self.source_language)?;
         let mut cpg = artifacts.cpg;
+        cpg.language = self.source_language.as_str().to_string();
         cpg.source_file = self.state.source_file.clone();
 
         // Build call graph from the AST (cheap — no CFG/DFG needed).
@@ -689,6 +690,7 @@ impl IncrementalCpgGenerator {
         let artifacts =
             get_node_graph_artifacts(tree.root_node(), &self.state.source_code, &self.options, self.source_language)?;
         let mut cpg = artifacts.cpg;
+        cpg.language = self.source_language.as_str().to_string();
         if let Some(old_cpg) = &self.state.cpg {
             let reuse =
                 stabilize_cpg_ids(old_cpg, &cpg, self.state.next_id, &self.state.deleted_ids);

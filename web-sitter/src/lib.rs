@@ -1404,6 +1404,7 @@ pub mod dfg;
 pub mod incremental;
 pub mod lifter;
 pub mod symbol_anonymizer;
+pub mod symbol_id;
 pub mod type_inference;
 pub mod call_analysis;
 
