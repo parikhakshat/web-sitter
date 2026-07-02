@@ -1,35 +1,75 @@
+use crate::kind_index::KindIndex;
 use std::collections::{HashMap, HashSet, VecDeque};
 use web_sitter::{Cpg, IrNodeKind, LiteralKind, NodeId};
-use crate::kind_index::KindIndex;
 
 /// Functions whose return value may be null (NULL / nullptr / None / nil).
 ///
 /// Extend this list to cover platform-specific or project-specific APIs.
 const NULLABLE_FUNCTIONS: &[&str] = &[
     // ── Standard C heap ──────────────────────────────────────────────────────
-    "malloc", "calloc", "realloc", "reallocarray", "aligned_alloc",
-    "valloc", "memalign", "posix_memalign",
+    "malloc",
+    "calloc",
+    "realloc",
+    "reallocarray",
+    "aligned_alloc",
+    "valloc",
+    "memalign",
+    "posix_memalign",
     // ── String helpers ───────────────────────────────────────────────────────
-    "strdup", "strndup", "wcsdup",
+    "strdup",
+    "strndup",
+    "wcsdup",
     // ── String search (returns NULL on no-match) ─────────────────────────────
-    "strstr", "strchr", "strrchr", "memchr", "memmem",
+    "strstr",
+    "strchr",
+    "strrchr",
+    "memchr",
+    "memmem",
     // ── File / IO ────────────────────────────────────────────────────────────
-    "fopen", "fdopen", "freopen", "popen", "tmpfile",
+    "fopen",
+    "fdopen",
+    "freopen",
+    "popen",
+    "tmpfile",
     // ── POSIX / system ───────────────────────────────────────────────────────
-    "opendir", "getenv", "getenv_s", "getcwd", "realpath", "inet_ntoa",
-    "dlopen", "dlsym", "mmap", "shmat",
+    "opendir",
+    "getenv",
+    "getenv_s",
+    "getcwd",
+    "realpath",
+    "inet_ntoa",
+    "dlopen",
+    "dlsym",
+    "mmap",
+    "shmat",
     // ── Search / scan ────────────────────────────────────────────────────────
-    "bsearch", "lfind", "lsearch",
+    "bsearch",
+    "lfind",
+    "lsearch",
     // ── GLib ─────────────────────────────────────────────────────────────────
-    "g_malloc", "g_try_malloc", "g_try_malloc0", "g_realloc",
-    "g_strdup", "g_strndup",
+    "g_malloc",
+    "g_try_malloc",
+    "g_try_malloc0",
+    "g_realloc",
+    "g_strdup",
+    "g_strndup",
     // ── Linux kernel ─────────────────────────────────────────────────────────
-    "kmalloc", "kzalloc", "vmalloc", "kvmalloc",
+    "kmalloc",
+    "kzalloc",
+    "vmalloc",
+    "kvmalloc",
     // ── Windows ──────────────────────────────────────────────────────────────
-    "HeapAlloc", "GlobalAlloc", "LocalAlloc", "VirtualAlloc", "VirtualAllocEx",
-    "CreateFile", "CreateFileA", "CreateFileW",
+    "HeapAlloc",
+    "GlobalAlloc",
+    "LocalAlloc",
+    "VirtualAlloc",
+    "VirtualAllocEx",
+    "CreateFile",
+    "CreateFileA",
+    "CreateFileW",
     // ── C++ ──────────────────────────────────────────────────────────────────
-    "std::make_unique", "std::make_shared",
+    "std::make_unique",
+    "std::make_shared",
 ];
 
 /// Nullability index: tracks which CPG nodes may carry a null/None/nil value,
@@ -58,7 +98,10 @@ impl NullabilityIndex {
             if node.kind == IrNodeKind::Literal {
                 let is_null = matches!(node.lit_kind, Some(LiteralKind::Null))
                     || node.text.as_deref().map_or(false, |t| {
-                        matches!(t, "NULL" | "nullptr" | "null" | "nil" | "None" | "undefined")
+                        matches!(
+                            t,
+                            "NULL" | "nullptr" | "null" | "nil" | "None" | "undefined"
+                        )
                     });
                 if is_null {
                     seeds.push(*node_id);
@@ -100,7 +143,10 @@ impl NullabilityIndex {
             }
         }
 
-        Self { may_be_null, null_origin }
+        Self {
+            may_be_null,
+            null_origin,
+        }
     }
 
     /// True if `node_id` may carry a null value.

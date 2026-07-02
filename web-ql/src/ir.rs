@@ -1,7 +1,7 @@
-use std::collections::HashMap;
-use regex::Regex;
-use web_sitter::IrNodeKind;
 use crate::ast::{CmpOp, Language, Literal, Severity, TypeExpr};
+use regex::Regex;
+use std::collections::HashMap;
+use web_sitter::IrNodeKind;
 
 // ── String matcher ────────────────────────────────────────────────────────────
 
@@ -118,10 +118,7 @@ pub enum QueryPlan {
     },
 
     /// User-defined predicate call: name(resolved args)
-    PredicateCall {
-        name: String,
-        args: Vec<PlanExpr>,
-    },
+    PredicateCall { name: String, args: Vec<PlanExpr> },
 
     /// Bind a derived node to `var`, then evaluate `body` with it in scope.
     /// `expr` must evaluate to a `Node`; if it evaluates to anything else the
@@ -196,7 +193,11 @@ pub enum CfgPredicate {
     /// `node` is on an exception-handling path
     InExceptionPath { node: String },
     /// There exists a CFG path from `from` to `to` that avoids `barrier`
-    CfgReachableWithout { from: String, to: String, barrier: String },
+    CfgReachableWithout {
+        from: String,
+        to: String,
+        barrier: String,
+    },
     /// `a` and `b` are in the same function (share the same function_id)
     SameFunction { a: String, b: String },
     /// `node` is inside a loop whose SCC has no exit edge to outside the loop
@@ -298,7 +299,9 @@ pub enum BindingValue {
 
 impl BindingEnv {
     pub fn new() -> Self {
-        Self { bindings: HashMap::new() }
+        Self {
+            bindings: HashMap::new(),
+        }
     }
 
     pub fn insert(&mut self, name: impl Into<String>, val: BindingValue) {
@@ -466,7 +469,9 @@ impl RuleSet {
 
     pub fn rules_for_language(&self, lang: Language) -> impl Iterator<Item = &CompiledRule> {
         self.rules.iter().filter(move |r| {
-            r.languages.as_ref().map_or(true, |langs| langs.contains(&lang))
+            r.languages
+                .as_ref()
+                .map_or(true, |langs| langs.contains(&lang))
         })
     }
 }

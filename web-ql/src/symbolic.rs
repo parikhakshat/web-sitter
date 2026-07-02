@@ -28,7 +28,10 @@ pub struct SymbolicEval<'a> {
 
 impl<'a> SymbolicEval<'a> {
     pub fn new(cpg: &'a Cpg) -> Self {
-        Self { cpg, cache: HashMap::new() }
+        Self {
+            cpg,
+            cache: HashMap::new(),
+        }
     }
 
     /// Evaluate `node_id` to a `SymbolicValue`, with memoisation.
@@ -119,22 +122,22 @@ impl<'a> SymbolicEval<'a> {
             if let (SymbolicValue::Int(l), SymbolicValue::Int(r)) = (&lv, &rv) {
                 let (l, r) = (*l, *r);
                 return match op {
-                    "+"  => SymbolicValue::Int(l.wrapping_add(r)),
-                    "-"  => SymbolicValue::Int(l.wrapping_sub(r)),
-                    "*"  => SymbolicValue::Int(l.wrapping_mul(r)),
-                    "/"  if r != 0 => SymbolicValue::Int(l / r),
-                    "%"  if r != 0 => SymbolicValue::Int(l % r),
+                    "+" => SymbolicValue::Int(l.wrapping_add(r)),
+                    "-" => SymbolicValue::Int(l.wrapping_sub(r)),
+                    "*" => SymbolicValue::Int(l.wrapping_mul(r)),
+                    "/" if r != 0 => SymbolicValue::Int(l / r),
+                    "%" if r != 0 => SymbolicValue::Int(l % r),
                     "**" => SymbolicValue::Int(l.wrapping_pow(r.max(0) as u32)),
                     "<<" if r >= 0 && r < 64 => SymbolicValue::Int(l.wrapping_shl(r as u32)),
                     ">>" if r >= 0 && r < 64 => SymbolicValue::Int(l.wrapping_shr(r as u32)),
-                    "&"  => SymbolicValue::Int(l & r),
-                    "|"  => SymbolicValue::Int(l | r),
-                    "^"  => SymbolicValue::Int(l ^ r),
+                    "&" => SymbolicValue::Int(l & r),
+                    "|" => SymbolicValue::Int(l | r),
+                    "^" => SymbolicValue::Int(l ^ r),
                     "==" => SymbolicValue::Bool(l == r),
                     "!=" | "<>" => SymbolicValue::Bool(l != r),
-                    "<"  => SymbolicValue::Bool(l < r),
+                    "<" => SymbolicValue::Bool(l < r),
                     "<=" => SymbolicValue::Bool(l <= r),
-                    ">"  => SymbolicValue::Bool(l > r),
+                    ">" => SymbolicValue::Bool(l > r),
                     ">=" => SymbolicValue::Bool(l >= r),
                     _ => SymbolicValue::Unknown,
                 };
@@ -144,7 +147,7 @@ impl<'a> SymbolicEval<'a> {
                 let (l, r) = (*l, *r);
                 if let Some(v) = match op {
                     "&&" | "and" => Some(SymbolicValue::Bool(l && r)),
-                    "||" | "or"  => Some(SymbolicValue::Bool(l || r)),
+                    "||" | "or" => Some(SymbolicValue::Bool(l || r)),
                     "==" => Some(SymbolicValue::Bool(l == r)),
                     "!=" => Some(SymbolicValue::Bool(l != r)),
                     _ => None,
@@ -166,12 +169,12 @@ impl<'a> SymbolicEval<'a> {
             if let Some(&cid) = node.children.first() {
                 let cv = self.eval(cid);
                 return match (op, cv) {
-                    ("-",  SymbolicValue::Int(n))  => SymbolicValue::Int(-n),
-                    ("~",  SymbolicValue::Int(n))  => SymbolicValue::Int(!n),
-                    ("!",  SymbolicValue::Bool(b)) => SymbolicValue::Bool(!b),
+                    ("-", SymbolicValue::Int(n)) => SymbolicValue::Int(-n),
+                    ("~", SymbolicValue::Int(n)) => SymbolicValue::Int(!n),
+                    ("!", SymbolicValue::Bool(b)) => SymbolicValue::Bool(!b),
                     ("not", SymbolicValue::Bool(b)) => SymbolicValue::Bool(!b),
-                    ("!",  SymbolicValue::Int(n))  => SymbolicValue::Bool(n == 0),
-                    ("+",  v @ SymbolicValue::Int(_)) => v,
+                    ("!", SymbolicValue::Int(n)) => SymbolicValue::Bool(n == 0),
+                    ("+", v @ SymbolicValue::Int(_)) => v,
                     _ => SymbolicValue::Unknown,
                 };
             }
@@ -203,7 +206,9 @@ impl<'a> SymbolicEval<'a> {
             if decl_name != Some(name) {
                 continue;
             }
-            let Some(sz) = array_size_in_subtree(self.cpg, id) else { continue };
+            let Some(sz) = array_size_in_subtree(self.cpg, id) else {
+                continue;
+            };
             if fid.is_some() && n.function_id == fid {
                 return Some(sz);
             }
@@ -242,7 +247,9 @@ impl<'a> SymbolicEval<'a> {
 fn find_first_identifier(cpg: &Cpg, root: NodeId) -> Option<&web_sitter::IrNode> {
     let mut stack = vec![root];
     while let Some(id) = stack.pop() {
-        let Some(node) = cpg.ast.get(&id) else { continue };
+        let Some(node) = cpg.ast.get(&id) else {
+            continue;
+        };
         if node.kind == IrNodeKind::Identifier {
             return Some(node);
         }
@@ -257,7 +264,9 @@ fn find_first_identifier(cpg: &Cpg, root: NodeId) -> Option<&web_sitter::IrNode>
 fn array_size_in_subtree(cpg: &Cpg, root: NodeId) -> Option<i64> {
     let mut stack = vec![root];
     while let Some(id) = stack.pop() {
-        let Some(node) = cpg.ast.get(&id) else { continue };
+        let Some(node) = cpg.ast.get(&id) else {
+            continue;
+        };
         if let Some(sz) = node.array_size {
             return Some(sz);
         }
@@ -282,7 +291,11 @@ pub(crate) fn parse_int(raw: &str) -> Option<i64> {
     if s.is_empty() {
         return None;
     }
-    let (neg, s) = if let Some(rest) = s.strip_prefix('-') { (true, rest) } else { (false, s) };
+    let (neg, s) = if let Some(rest) = s.strip_prefix('-') {
+        (true, rest)
+    } else {
+        (false, s)
+    };
     let val: i64 = if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
         i64::from_str_radix(hex, 16).ok()?
     } else if let Some(bin) = s.strip_prefix("0b").or_else(|| s.strip_prefix("0B")) {

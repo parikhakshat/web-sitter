@@ -23,7 +23,10 @@ impl KindIndex {
         let mut by_node_type: HashMap<String, Vec<NodeId>> = HashMap::new();
         for (&id, node) in &cpg.ast {
             by_kind.entry(node.kind).or_default().push(id);
-            by_node_type.entry(node.node_type.clone()).or_default().push(id);
+            by_node_type
+                .entry(node.node_type.clone())
+                .or_default()
+                .push(id);
         }
 
         let mut call_site_by_node: HashMap<NodeId, CallSite> = HashMap::new();
@@ -35,7 +38,11 @@ impl KindIndex {
             }
         }
 
-        Self { by_kind, by_node_type, call_site_by_node }
+        Self {
+            by_kind,
+            by_node_type,
+            call_site_by_node,
+        }
     }
 
     /// All node ids matching any of `kinds`. Empty `kinds` returns every node, matching
@@ -60,7 +67,11 @@ impl KindIndex {
         if raw_lc == raw {
             return self.by_node_type.get(raw).cloned().unwrap_or_default();
         }
-        let mut out = self.by_node_type.get(raw_lc.as_str()).cloned().unwrap_or_default();
+        let mut out = self
+            .by_node_type
+            .get(raw_lc.as_str())
+            .cloned()
+            .unwrap_or_default();
         if let Some(extra) = self.by_node_type.get(raw) {
             for id in extra {
                 if !out.contains(id) {

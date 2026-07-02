@@ -1,10 +1,10 @@
-use std::path::{Path, PathBuf};
-use anyhow::{Context, Result};
-use web_sitter::Cpg;
 use crate::ast::RuleFile;
 use crate::ir::RuleSet;
 use crate::parser::parse_rule_file;
 use crate::planner::Planner;
+use anyhow::{Context, Result};
+use std::path::{Path, PathBuf};
+use web_sitter::Cpg;
 
 // ── CPG loader ────────────────────────────────────────────────────────────────
 
@@ -20,8 +20,7 @@ pub fn load_cpg(path: &Path) -> Result<Cpg> {
 
 /// Parse and compile a ScuzzQL rule file from source text.
 pub fn compile_rules(source: &str) -> Result<RuleSet> {
-    let ast: RuleFile = parse_rule_file(source)
-        .map_err(|e| anyhow::anyhow!("parse error: {e}"))?;
+    let ast: RuleFile = parse_rule_file(source).map_err(|e| anyhow::anyhow!("parse error: {e}"))?;
 
     let mut planner = Planner::new();
     let rule_set = planner
@@ -35,8 +34,7 @@ pub fn compile_rules(source: &str) -> Result<RuleSet> {
 pub fn load_rules(path: &Path) -> Result<RuleSet> {
     let source = std::fs::read_to_string(path)
         .with_context(|| format!("reading rule file {}", path.display()))?;
-    compile_rules(&source)
-        .with_context(|| format!("compiling rules from {}", path.display()))
+    compile_rules(&source).with_context(|| format!("compiling rules from {}", path.display()))
 }
 
 /// Load all `.wql` rule files from a directory (non-recursive).
@@ -59,11 +57,10 @@ pub fn load_rules_dir(dir: &Path) -> Result<Vec<RuleSet>> {
 
 /// Compute a fast content hash for a file to detect changes during incremental scans.
 pub fn file_hash(path: &Path) -> Result<u64> {
-    use std::hash::{Hash, Hasher};
     use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
 
-    let meta = std::fs::metadata(path)
-        .with_context(|| format!("stat {}", path.display()))?;
+    let meta = std::fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
 
     let mut hasher = DefaultHasher::new();
     // Hash mtime + file size for a cheap "has this changed" check

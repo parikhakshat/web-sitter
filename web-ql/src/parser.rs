@@ -255,7 +255,8 @@ impl Parser {
                     let st = self.peek().unwrap();
                     return Err(ParseError::UnexpectedToken {
                         found: format!("{:?}", st.token),
-                        expected: "severity | languages | tags | message | find | taint | `}`".to_owned(),
+                        expected: "severity | languages | tags | message | find | taint | `}`"
+                            .to_owned(),
                         span: st.span,
                     });
                 }
@@ -267,7 +268,11 @@ impl Parser {
             }
         }
 
-        let end = self.tokens.get(self.pos.saturating_sub(1)).map(|t| t.span).unwrap_or(start);
+        let end = self
+            .tokens
+            .get(self.pos.saturating_sub(1))
+            .map(|t| t.span)
+            .unwrap_or(start);
         Ok(Rule {
             span: start.merge(end),
             id,
@@ -372,7 +377,13 @@ impl Parser {
             (cond, e)
         } else {
             let sp = self.current_span();
-            (Expr { span: sp, kind: ExprKind::Literal(Literal::Bool(true)) }, sp)
+            (
+                Expr {
+                    span: sp,
+                    kind: ExprKind::Literal(Literal::Bool(true)),
+                },
+                sp,
+            )
         };
         Ok(SearchClause {
             span: start.merge(end),
@@ -395,7 +406,12 @@ impl Parser {
         self.expect(&Token::Colon, "`:`")?;
         let ty = self.parse_type_expr()?;
         Ok(Binding {
-            span: span.merge(self.tokens.get(self.pos.saturating_sub(1)).map(|t| t.span).unwrap_or(span)),
+            span: span.merge(
+                self.tokens
+                    .get(self.pos.saturating_sub(1))
+                    .map(|t| t.span)
+                    .unwrap_or(span),
+            ),
             name,
             ty,
         })
@@ -441,7 +457,11 @@ impl Parser {
                 Some(Token::Guards) => {
                     self.advance();
                     self.expect(&Token::Colon, "`:`")?;
-                    guards = self.parse_named_ref_list()?.into_iter().map(|r| r.name).collect();
+                    guards = self
+                        .parse_named_ref_list()?
+                        .into_iter()
+                        .map(|r| r.name)
+                        .collect();
                 }
                 Some(Token::Propagators) => {
                     self.advance();
@@ -479,7 +499,11 @@ impl Parser {
             }
         }
 
-        let end = self.tokens.get(self.pos.saturating_sub(1)).map(|t| t.span).unwrap_or(start);
+        let end = self
+            .tokens
+            .get(self.pos.saturating_sub(1))
+            .map(|t| t.span)
+            .unwrap_or(start);
         Ok(TaintClause {
             span: start.merge(end),
             sources,
@@ -526,8 +550,16 @@ impl Parser {
         } else {
             Vec::new()
         };
-        let end = self.tokens.get(self.pos.saturating_sub(1)).map(|t| t.span).unwrap_or(span);
-        Ok(NamedRef { span: span.merge(end), name, args })
+        let end = self
+            .tokens
+            .get(self.pos.saturating_sub(1))
+            .map(|t| t.span)
+            .unwrap_or(span);
+        Ok(NamedRef {
+            span: span.merge(end),
+            name,
+            args,
+        })
     }
 
     // ── Type expressions ──────────────────────────────────────────────────────
@@ -537,37 +569,130 @@ impl Parser {
             expected: "type expression".to_owned(),
         })?;
         let ty = match &st.token {
-            Token::TyNode => { self.pos += 1; TypeExpr::Node }
-            Token::TyExpr => { self.pos += 1; TypeExpr::Expr }
-            Token::TyStmt => { self.pos += 1; TypeExpr::Stmt }
-            Token::TyDecl => { self.pos += 1; TypeExpr::Decl }
-            Token::TyCall => { self.pos += 1; TypeExpr::Call }
-            Token::TyMethodDef => { self.pos += 1; TypeExpr::MethodDef }
-            Token::TyClassDef => { self.pos += 1; TypeExpr::ClassDef }
-            Token::TyIdentifier => { self.pos += 1; TypeExpr::Identifier }
-            Token::TyLiteral => { self.pos += 1; TypeExpr::Literal }
-            Token::TyAssign => { self.pos += 1; TypeExpr::Assign }
-            Token::TyBinaryOp => { self.pos += 1; TypeExpr::BinaryOp }
-            Token::TyReturn => { self.pos += 1; TypeExpr::Return }
-            Token::TyLoop => { self.pos += 1; TypeExpr::Loop }
-            Token::TyConditional => { self.pos += 1; TypeExpr::Conditional }
-            Token::TyBlock => { self.pos += 1; TypeExpr::Block }
-            Token::TyTry => { self.pos += 1; TypeExpr::Try }
-            Token::TyCatch => { self.pos += 1; TypeExpr::Catch }
-            Token::TyParamDef => { self.pos += 1; TypeExpr::ParamDef }
-            Token::TyLocalDef => { self.pos += 1; TypeExpr::LocalDef }
-            Token::TyFieldDef => { self.pos += 1; TypeExpr::FieldDef }
-            Token::TyMemberAccess => { self.pos += 1; TypeExpr::MemberAccess }
-            Token::TySubscript => { self.pos += 1; TypeExpr::Subscript }
-            Token::TyCast => { self.pos += 1; TypeExpr::Cast }
-            Token::TyGoStmt => { self.pos += 1; TypeExpr::GoStmt }
-            Token::TyDeferStmt => { self.pos += 1; TypeExpr::DeferStmt }
-            Token::TyMatchExpr => { self.pos += 1; TypeExpr::MatchExpr }
-            Token::TyComprehension => { self.pos += 1; TypeExpr::Comprehension }
-            Token::TyAwait => { self.pos += 1; TypeExpr::Await }
-            Token::TyYield => { self.pos += 1; TypeExpr::Yield }
-            Token::TyUnsafeBlock => { self.pos += 1; TypeExpr::UnsafeBlock }
-            Token::TyImplBlock => { self.pos += 1; TypeExpr::ImplBlock }
+            Token::TyNode => {
+                self.pos += 1;
+                TypeExpr::Node
+            }
+            Token::TyExpr => {
+                self.pos += 1;
+                TypeExpr::Expr
+            }
+            Token::TyStmt => {
+                self.pos += 1;
+                TypeExpr::Stmt
+            }
+            Token::TyDecl => {
+                self.pos += 1;
+                TypeExpr::Decl
+            }
+            Token::TyCall => {
+                self.pos += 1;
+                TypeExpr::Call
+            }
+            Token::TyMethodDef => {
+                self.pos += 1;
+                TypeExpr::MethodDef
+            }
+            Token::TyClassDef => {
+                self.pos += 1;
+                TypeExpr::ClassDef
+            }
+            Token::TyIdentifier => {
+                self.pos += 1;
+                TypeExpr::Identifier
+            }
+            Token::TyLiteral => {
+                self.pos += 1;
+                TypeExpr::Literal
+            }
+            Token::TyAssign => {
+                self.pos += 1;
+                TypeExpr::Assign
+            }
+            Token::TyBinaryOp => {
+                self.pos += 1;
+                TypeExpr::BinaryOp
+            }
+            Token::TyReturn => {
+                self.pos += 1;
+                TypeExpr::Return
+            }
+            Token::TyLoop => {
+                self.pos += 1;
+                TypeExpr::Loop
+            }
+            Token::TyConditional => {
+                self.pos += 1;
+                TypeExpr::Conditional
+            }
+            Token::TyBlock => {
+                self.pos += 1;
+                TypeExpr::Block
+            }
+            Token::TyTry => {
+                self.pos += 1;
+                TypeExpr::Try
+            }
+            Token::TyCatch => {
+                self.pos += 1;
+                TypeExpr::Catch
+            }
+            Token::TyParamDef => {
+                self.pos += 1;
+                TypeExpr::ParamDef
+            }
+            Token::TyLocalDef => {
+                self.pos += 1;
+                TypeExpr::LocalDef
+            }
+            Token::TyFieldDef => {
+                self.pos += 1;
+                TypeExpr::FieldDef
+            }
+            Token::TyMemberAccess => {
+                self.pos += 1;
+                TypeExpr::MemberAccess
+            }
+            Token::TySubscript => {
+                self.pos += 1;
+                TypeExpr::Subscript
+            }
+            Token::TyCast => {
+                self.pos += 1;
+                TypeExpr::Cast
+            }
+            Token::TyGoStmt => {
+                self.pos += 1;
+                TypeExpr::GoStmt
+            }
+            Token::TyDeferStmt => {
+                self.pos += 1;
+                TypeExpr::DeferStmt
+            }
+            Token::TyMatchExpr => {
+                self.pos += 1;
+                TypeExpr::MatchExpr
+            }
+            Token::TyComprehension => {
+                self.pos += 1;
+                TypeExpr::Comprehension
+            }
+            Token::TyAwait => {
+                self.pos += 1;
+                TypeExpr::Await
+            }
+            Token::TyYield => {
+                self.pos += 1;
+                TypeExpr::Yield
+            }
+            Token::TyUnsafeBlock => {
+                self.pos += 1;
+                TypeExpr::UnsafeBlock
+            }
+            Token::TyImplBlock => {
+                self.pos += 1;
+                TypeExpr::ImplBlock
+            }
             Token::TyNodeType => {
                 self.pos += 1;
                 self.expect(&Token::LParen, "`(`")?;
@@ -680,7 +805,11 @@ impl Parser {
             Some(Token::Matches) => {
                 self.pos += 1;
                 let pattern = self.parse_node_pattern()?;
-                let end = self.tokens.get(self.pos.saturating_sub(1)).map(|t| t.span).unwrap_or(lhs.span);
+                let end = self
+                    .tokens
+                    .get(self.pos.saturating_sub(1))
+                    .map(|t| t.span)
+                    .unwrap_or(lhs.span);
                 return Ok(Expr {
                     span: lhs.span.merge(end),
                     kind: ExprKind::MatchesPattern {
@@ -724,7 +853,9 @@ impl Parser {
             } else {
                 Vec::new()
             };
-            let end = self.tokens.get(self.pos.saturating_sub(1))
+            let end = self
+                .tokens
+                .get(self.pos.saturating_sub(1))
                 .map(|t| t.span)
                 .unwrap_or(method_span);
             let span = expr.span.merge(end);
@@ -854,17 +985,26 @@ impl Parser {
             Token::True => {
                 let span = st.span;
                 self.pos += 1;
-                Ok(Expr { span, kind: ExprKind::Literal(Literal::Bool(true)) })
+                Ok(Expr {
+                    span,
+                    kind: ExprKind::Literal(Literal::Bool(true)),
+                })
             }
             Token::False => {
                 let span = st.span;
                 self.pos += 1;
-                Ok(Expr { span, kind: ExprKind::Literal(Literal::Bool(false)) })
+                Ok(Expr {
+                    span,
+                    kind: ExprKind::Literal(Literal::Bool(false)),
+                })
             }
             Token::Null => {
                 let span = st.span;
                 self.pos += 1;
-                Ok(Expr { span, kind: ExprKind::Literal(Literal::Null) })
+                Ok(Expr {
+                    span,
+                    kind: ExprKind::Literal(Literal::Null),
+                })
             }
             Token::RegexLit => {
                 let raw = st.text.clone();
@@ -919,9 +1059,18 @@ impl Parser {
                 self.pos += 1;
                 Ok(Literal::Float(text.parse().unwrap_or(0.0)))
             }
-            Token::True => { self.pos += 1; Ok(Literal::Bool(true)) }
-            Token::False => { self.pos += 1; Ok(Literal::Bool(false)) }
-            Token::Null => { self.pos += 1; Ok(Literal::Null) }
+            Token::True => {
+                self.pos += 1;
+                Ok(Literal::Bool(true))
+            }
+            Token::False => {
+                self.pos += 1;
+                Ok(Literal::Bool(false))
+            }
+            Token::Null => {
+                self.pos += 1;
+                Ok(Literal::Null)
+            }
             Token::RegexLit => {
                 let raw = st.text.clone();
                 self.pos += 1;
@@ -937,8 +1086,14 @@ impl Parser {
 
     fn parse_bool_lit(&mut self) -> ParseResult<bool> {
         match self.peek_tok() {
-            Some(Token::True) => { self.pos += 1; Ok(true) }
-            Some(Token::False) => { self.pos += 1; Ok(false) }
+            Some(Token::True) => {
+                self.pos += 1;
+                Ok(true)
+            }
+            Some(Token::False) => {
+                self.pos += 1;
+                Ok(false)
+            }
             Some(_) => {
                 let st = self.peek().unwrap();
                 Err(ParseError::UnexpectedToken {
@@ -947,7 +1102,9 @@ impl Parser {
                     span: st.span,
                 })
             }
-            None => Err(ParseError::UnexpectedEof { expected: "bool literal".to_owned() }),
+            None => Err(ParseError::UnexpectedEof {
+                expected: "bool literal".to_owned(),
+            }),
         }
     }
 
@@ -962,7 +1119,9 @@ impl Parser {
                 expected: "integer literal".to_owned(),
                 span: st.span,
             }),
-            None => Err(ParseError::UnexpectedEof { expected: "integer literal".to_owned() }),
+            None => Err(ParseError::UnexpectedEof {
+                expected: "integer literal".to_owned(),
+            }),
         }
     }
 
@@ -997,8 +1156,16 @@ impl Parser {
             let (name, span) = self.expect_ident()?;
             self.expect(&Token::Colon, "`:`")?;
             let ty = self.parse_type_expr()?;
-            let end = self.tokens.get(self.pos.saturating_sub(1)).map(|t| t.span).unwrap_or(span);
-            params.push(Param { span: span.merge(end), name, ty });
+            let end = self
+                .tokens
+                .get(self.pos.saturating_sub(1))
+                .map(|t| t.span)
+                .unwrap_or(span);
+            params.push(Param {
+                span: span.merge(end),
+                name,
+                ty,
+            });
             if !self.eat(&Token::Comma) {
                 break;
             }
@@ -1022,7 +1189,12 @@ impl Parser {
             self.parse_expr()?
         };
         let end = body.span;
-        Ok(PredicateDef { span: start.merge(end), name, params, body })
+        Ok(PredicateDef {
+            span: start.merge(end),
+            name,
+            params,
+            body,
+        })
     }
 
     fn parse_find_expr(&mut self) -> ParseResult<FindExpr> {
@@ -1037,10 +1209,17 @@ impl Parser {
             (cond, e)
         } else {
             let sp = self.current_span();
-            let cond = Expr { span: sp, kind: ExprKind::Literal(Literal::Bool(true)) };
+            let cond = Expr {
+                span: sp,
+                kind: ExprKind::Literal(Literal::Bool(true)),
+            };
             (cond, sp)
         };
-        Ok(FindExpr { span: start.merge(end), bindings, condition })
+        Ok(FindExpr {
+            span: start.merge(end),
+            bindings,
+            condition,
+        })
     }
 
     fn parse_find_expr_alternatives(&mut self) -> ParseResult<Vec<FindExpr>> {
@@ -1074,8 +1253,17 @@ impl Parser {
             self.expect(&Token::Assign, "`=`")?;
             self.parse_find_expr_alternatives()?
         };
-        let end = self.tokens.get(self.pos.saturating_sub(1)).map(|t| t.span).unwrap_or(start);
-        Ok(SourceDef { span: start.merge(end), name, params: vec![], body })
+        let end = self
+            .tokens
+            .get(self.pos.saturating_sub(1))
+            .map(|t| t.span)
+            .unwrap_or(start);
+        Ok(SourceDef {
+            span: start.merge(end),
+            name,
+            params: vec![],
+            body,
+        })
     }
 
     fn parse_sink_def(&mut self) -> ParseResult<SinkDef> {
@@ -1092,8 +1280,17 @@ impl Parser {
             self.expect(&Token::Assign, "`=`")?;
             self.parse_find_expr_alternatives()?
         };
-        let end = self.tokens.get(self.pos.saturating_sub(1)).map(|t| t.span).unwrap_or(start);
-        Ok(SinkDef { span: start.merge(end), name, params: vec![], body })
+        let end = self
+            .tokens
+            .get(self.pos.saturating_sub(1))
+            .map(|t| t.span)
+            .unwrap_or(start);
+        Ok(SinkDef {
+            span: start.merge(end),
+            name,
+            params: vec![],
+            body,
+        })
     }
 
     /// Parse `{ kind: Type, name: "str", ... }` and synthesize a `FindExpr`.
@@ -1108,9 +1305,15 @@ impl Parser {
             let (key, _) = self.expect_ident()?;
             self.expect(&Token::Colon, "`:`")?;
             match key.as_str() {
-                "kind" => { kind_ty = self.parse_type_expr()?; }
-                "name" => { name_constraint = Some(self.expect_string_lit()?.0); }
-                _ => { let _ = self.parse_expr()?; } // skip unknown attrs
+                "kind" => {
+                    kind_ty = self.parse_type_expr()?;
+                }
+                "name" => {
+                    name_constraint = Some(self.expect_string_lit()?.0);
+                }
+                _ => {
+                    let _ = self.parse_expr()?;
+                } // skip unknown attrs
             }
             self.eat(&Token::Comma);
         }
@@ -1131,7 +1334,10 @@ impl Parser {
                     lhs: Box::new(Expr {
                         span,
                         kind: ExprKind::MethodCall {
-                            receiver: Box::new(Expr { span, kind: ExprKind::Ident(var) }),
+                            receiver: Box::new(Expr {
+                                span,
+                                kind: ExprKind::Ident(var),
+                            }),
                             method: "name".to_owned(),
                             args: vec![],
                         },
@@ -1144,9 +1350,16 @@ impl Parser {
                 },
             }
         } else {
-            Expr { span, kind: ExprKind::Literal(Literal::Bool(true)) }
+            Expr {
+                span,
+                kind: ExprKind::Literal(Literal::Bool(true)),
+            }
         };
-        Ok(FindExpr { span, bindings: vec![binding], condition })
+        Ok(FindExpr {
+            span,
+            bindings: vec![binding],
+            condition,
+        })
     }
 
     fn parse_sanitizer_def(&mut self) -> ParseResult<SanitizerDef> {
@@ -1160,8 +1373,17 @@ impl Parser {
         };
         self.expect(&Token::Assign, "`=`")?;
         let body = self.parse_find_expr_alternatives()?;
-        let end = self.tokens.get(self.pos.saturating_sub(1)).map(|t| t.span).unwrap_or(start);
-        Ok(SanitizerDef { span: start.merge(end), name, params, body })
+        let end = self
+            .tokens
+            .get(self.pos.saturating_sub(1))
+            .map(|t| t.span)
+            .unwrap_or(start);
+        Ok(SanitizerDef {
+            span: start.merge(end),
+            name,
+            params,
+            body,
+        })
     }
 
     fn parse_propagator_def(&mut self) -> ParseResult<PropagatorDef> {
@@ -1171,8 +1393,17 @@ impl Parser {
         let params = self.parse_param_list()?;
         self.expect(&Token::Assign, "`=`")?;
         let body = self.parse_prop_body()?;
-        let end = self.tokens.get(self.pos.saturating_sub(1)).map(|t| t.span).unwrap_or(start);
-        Ok(PropagatorDef { span: start.merge(end), name, params, body })
+        let end = self
+            .tokens
+            .get(self.pos.saturating_sub(1))
+            .map(|t| t.span)
+            .unwrap_or(start);
+        Ok(PropagatorDef {
+            span: start.merge(end),
+            name,
+            params,
+            body,
+        })
     }
 
     fn parse_prop_body(&mut self) -> ParseResult<PropBody> {
@@ -1185,7 +1416,11 @@ impl Parser {
         self.expect(&Token::To, "`to`")?;
         self.expect(&Token::Colon, "`:`")?;
         let (to_binding, _) = self.expect_ident()?;
-        Ok(PropBody { pattern, from_binding, to_binding })
+        Ok(PropBody {
+            pattern,
+            from_binding,
+            to_binding,
+        })
     }
 }
 
@@ -1204,7 +1439,10 @@ fn unescape_string(raw: &str) -> String {
                 Some('\\') => out.push('\\'),
                 Some('"') => out.push('"'),
                 Some('\'') => out.push('\''),
-                Some(other) => { out.push('\\'); out.push(other); }
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
                 None => out.push('\\'),
             }
         } else {

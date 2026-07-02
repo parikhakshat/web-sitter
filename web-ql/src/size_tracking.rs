@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use web_sitter::{Cpg, IrNodeKind, LiteralKind, NodeId};
 use web_sitter::security_patterns::HEAP_ALLOCATORS;
+use web_sitter::{Cpg, IrNodeKind, LiteralKind, NodeId};
 
 /// The known or inferred allocation size of a node.
 #[derive(Clone, Debug, PartialEq)]
@@ -73,7 +73,10 @@ impl AllocSizeIndex {
             // strings have no such runtime terminator, so their reported size
             // is the plain content length.
             if node.kind == IrNodeKind::Literal
-                && matches!(node.lit_kind, Some(LiteralKind::String) | Some(LiteralKind::Bytes))
+                && matches!(
+                    node.lit_kind,
+                    Some(LiteralKind::String) | Some(LiteralKind::Bytes)
+                )
             {
                 let len = node
                     .string_length
@@ -81,7 +84,10 @@ impl AllocSizeIndex {
                     .or_else(|| node.text.as_deref().map(literal_content_length));
                 if let Some(len) = len {
                     let nul_terminated = matches!(cpg.language.as_str(), "c" | "cpp");
-                    sizes.insert(*node_id, SizeValue::Concrete(if nul_terminated { len + 1 } else { len }));
+                    sizes.insert(
+                        *node_id,
+                        SizeValue::Concrete(if nul_terminated { len + 1 } else { len }),
+                    );
                 }
                 continue;
             }
@@ -100,7 +106,10 @@ impl AllocSizeIndex {
             }
         }
 
-        Self { sizes, size_sources }
+        Self {
+            sizes,
+            size_sources,
+        }
     }
 
     /// Size value for `node_id`.  Falls back to checking SIZE_FLOW backward sources.
@@ -149,14 +158,23 @@ fn propagate_size_to_declaration(
 ) {
     let mut cur = declarator_id;
     for _ in 0..4 {
-        let Some(node) = cpg.ast.get(&cur) else { return };
-        let Some(parent_id) = node.parent_id else { return };
+        let Some(node) = cpg.ast.get(&cur) else {
+            return;
+        };
+        let Some(parent_id) = node.parent_id else {
+            return;
+        };
         if parent_id == cur {
             return;
         }
         cur = parent_id;
-        let Some(parent) = cpg.ast.get(&cur) else { return };
-        if matches!(parent.kind, IrNodeKind::LocalDef | IrNodeKind::ParamDef | IrNodeKind::FieldDef) {
+        let Some(parent) = cpg.ast.get(&cur) else {
+            return;
+        };
+        if matches!(
+            parent.kind,
+            IrNodeKind::LocalDef | IrNodeKind::ParamDef | IrNodeKind::FieldDef
+        ) {
             sizes.entry(cur).or_insert(size);
             return;
         }
@@ -184,7 +202,9 @@ fn literal_content_length(text: &str) -> i64 {
     }
     let mut chars = rest.chars();
     match (chars.next(), chars.next_back()) {
-        (Some(a), Some(b)) if a == b && matches!(a, '"' | '\'' | '`') && rest.chars().count() >= 2 => {
+        (Some(a), Some(b))
+            if a == b && matches!(a, '"' | '\'' | '`') && rest.chars().count() >= 2 =>
+        {
             rest.chars().count() as i64 - 2
         }
         _ => rest.chars().count() as i64,
@@ -234,18 +254,14 @@ fn callee_name_for_call(cpg: &Cpg, call_id: NodeId) -> Option<String> {
         }
     }
     // Fallback: first identifier child text
-    cpg.ast
-        .get(&call_id)?
-        .children
-        .iter()
-        .find_map(|&cid| {
-            let c = cpg.ast.get(&cid)?;
-            if c.kind == web_sitter::IrNodeKind::Identifier {
-                c.text.clone()
-            } else {
-                None
-            }
-        })
+    cpg.ast.get(&call_id)?.children.iter().find_map(|&cid| {
+        let c = cpg.ast.get(&cid)?;
+        if c.kind == web_sitter::IrNodeKind::Identifier {
+            c.text.clone()
+        } else {
+            None
+        }
+    })
 }
 
 fn arg_text(cpg: &Cpg, call_node: &web_sitter::AstNode, idx: usize) -> Option<String> {
@@ -282,17 +298,23 @@ fn infer_heap_alloc_size(
         if name == "calloc" || name == "xcalloc" || name == "g_new" || name == "g_new0" {
             let count_text = arg_text(cpg, node, 0);
             let elem_text = arg_text(cpg, node, 1);
-            return Some(match (
-                count_text.as_deref().and_then(|s| s.trim().parse::<i64>().ok()),
-                elem_text.as_deref().and_then(|s| s.trim().parse::<i64>().ok()),
-            ) {
-                (Some(c), Some(e)) => SizeValue::Concrete(c.saturating_mul(e)),
-                _ => SizeValue::Symbolic(format!(
-                    "{}*{}",
-                    count_text.unwrap_or_default(),
-                    elem_text.unwrap_or_default()
-                )),
-            });
+            return Some(
+                match (
+                    count_text
+                        .as_deref()
+                        .and_then(|s| s.trim().parse::<i64>().ok()),
+                    elem_text
+                        .as_deref()
+                        .and_then(|s| s.trim().parse::<i64>().ok()),
+                ) {
+                    (Some(c), Some(e)) => SizeValue::Concrete(c.saturating_mul(e)),
+                    _ => SizeValue::Symbolic(format!(
+                        "{}*{}",
+                        count_text.unwrap_or_default(),
+                        elem_text.unwrap_or_default()
+                    )),
+                },
+            );
         }
 
         let size_text = arg_text(cpg, node, size_idx)?;

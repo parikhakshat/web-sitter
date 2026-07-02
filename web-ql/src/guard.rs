@@ -192,11 +192,13 @@ fn occurs_as(cpg: &Cpg, dfg: &DfgIndex, expr: NodeId, value_source: NodeId) -> b
         return true;
     }
     let expr_sub = crate::engine::ast_subtree(cpg, expr);
-    crate::engine::ast_subtree(cpg, value_source).iter().any(|&f| {
-        dfg.reachable_from(f)
-            .iter()
-            .any(|r| expr_sub.contains(r) && *r != value_source)
-    })
+    crate::engine::ast_subtree(cpg, value_source)
+        .iter()
+        .any(|&f| {
+            dfg.reachable_from(f)
+                .iter()
+                .any(|r| expr_sub.contains(r) && *r != value_source)
+        })
 }
 
 /// Resolve a `Call` node's callee name via the call graph (falling back to
@@ -214,7 +216,9 @@ fn callee_name_of(cpg: &Cpg, call_id: NodeId) -> Option<String> {
 /// Argument nodes of a single `Call`, descending into the `argument_list`/
 /// `arguments` container child most languages wrap arguments in.
 fn call_argument_nodes(cpg: &Cpg, call_id: NodeId) -> Vec<NodeId> {
-    let Some(node) = cpg.ast.get(&call_id) else { return Vec::new() };
+    let Some(node) = cpg.ast.get(&call_id) else {
+        return Vec::new();
+    };
     node.children
         .iter()
         .find_map(|&cid| {
@@ -260,7 +264,9 @@ fn find_value_occurrence(
         if !seen.insert(id) {
             continue;
         }
-        let Some(node) = cpg.ast.get(&id) else { continue };
+        let Some(node) = cpg.ast.get(&id) else {
+            continue;
+        };
         if node.kind == IrNodeKind::Call {
             if let Some(name) = callee_name_of(cpg, id) {
                 if KNOWN_LENGTH_FUNCTIONS.contains(&name.as_str()) {
@@ -364,7 +370,9 @@ pub fn excludes_zero(
 /// restriction for why the unrestricted subtree-extended check would
 /// otherwise match on coarse ancestor/compound nodes.
 fn is_identifier_occurrence(cpg: &Cpg, dfg: &DfgIndex, expr: NodeId, value_source: NodeId) -> bool {
-    cpg.ast.get(&expr).is_some_and(|n| n.kind == IrNodeKind::Identifier)
+    cpg.ast
+        .get(&expr)
+        .is_some_and(|n| n.kind == IrNodeKind::Identifier)
         && occurs_as(cpg, dfg, expr, value_source)
 }
 
@@ -410,9 +418,13 @@ pub fn upper_bounds(
 
     let offset = extract_offset(cpg, value_side, occurrence).unwrap_or(0);
 
-    let Some(capacity) = capacity else { return true };
+    let Some(capacity) = capacity else {
+        return true;
+    };
     let mut se = SymbolicEval::new(cpg);
-    let Some(bound_val) = se.eval_int(bound_side) else { return true };
+    let Some(bound_val) = se.eval_int(bound_side) else {
+        return true;
+    };
     let threshold = capacity.saturating_add(offset);
     if op == "<" {
         bound_val <= threshold

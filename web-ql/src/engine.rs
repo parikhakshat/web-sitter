@@ -1,22 +1,22 @@
-use std::collections::{HashMap, HashSet};
-use rayon::prelude::*;
-use web_sitter::{Cpg, IrNode, IrNodeKind, LiteralKind, NodeId};
-use web_profiler as prof;
 use crate::alias::AliasIndex;
 use crate::ast::{CmpOp, Literal, TypeExpr};
 use crate::cfg::FunctionCfg;
 use crate::dfg::DfgIndex;
-use crate::kind_index::KindIndex;
+use crate::finding::{Finding, FindingLocation};
 use crate::ir::{
     AstConstraint, BindingEnv, BindingValue, CfgPredicate, CompiledClause, CompiledRule,
     DfgPredicate, FieldConstraint, MethodStep, PlanExpr, QueryPlan, RootBinding, RuleSet,
     SearchPlan,
 };
-use crate::finding::{Finding, FindingLocation};
+use crate::kind_index::KindIndex;
 use crate::nullability::NullabilityIndex;
 use crate::size_tracking::{AllocSizeIndex, SizeValue};
 use crate::symbolic::SymbolicEval;
 use crate::taint::{CrossFileTaintCtx, EndpointRegistry, TaintEngine};
+use rayon::prelude::*;
+use std::collections::{HashMap, HashSet};
+use web_profiler as prof;
+use web_sitter::{Cpg, IrNode, IrNodeKind, LiteralKind, NodeId};
 
 // ── Eval context ──────────────────────────────────────────────────────────────
 
@@ -80,7 +80,12 @@ impl<'a> RuleRunner<'a> {
                             let matches = self.eval_search(plan);
                             prof::count("nodes_evaluated", matches.len() as u64);
                             for env in matches {
-                                rule_findings.push(finding_from_env(rule, &env, self.ctx.cpg, &plan.report_vars));
+                                rule_findings.push(finding_from_env(
+                                    rule,
+                                    &env,
+                                    self.ctx.cpg,
+                                    &plan.report_vars,
+                                ));
                             }
                         }
                         CompiledClause::Taint(spec) => {
@@ -140,7 +145,7 @@ impl<'a> RuleRunner<'a> {
         // Resolve one endpoint ref: prefer a named plan (evaluated against the current
         // CPG) over forwarding pre-resolved base-registry entries.
         let resolve_one = |endpoint_ref: &crate::ir::TaintEndpointRef,
-                            named_plans: &HashMap<String, SearchPlan>|
+                           named_plans: &HashMap<String, SearchPlan>|
          -> (String, Vec<NodeId>) {
             let nodes = if let Some(plan) = named_plans.get(&endpoint_ref.name) {
                 let envs = self.eval_search(plan);
@@ -156,7 +161,8 @@ impl<'a> RuleRunner<'a> {
                 ids.dedup();
                 ids
             } else {
-                self.ctx.registry
+                self.ctx
+                    .registry
                     .resolve(endpoint_ref, self.ctx.cpg)
                     .into_iter()
                     .map(|r| r.node)
@@ -344,7 +350,10 @@ impl<'a> RuleRunner<'a> {
                             EvalValue::Str(s) => BindingValue::Str(s),
                             EvalValue::Int(n) => BindingValue::Int(n),
                             EvalValue::Bool(b) => BindingValue::Bool(b),
-                            EvalValue::Null | EvalValue::MetaNode(..) | EvalValue::List(..) | EvalValue::Regex(..) => BindingValue::Null,
+                            EvalValue::Null
+                            | EvalValue::MetaNode(..)
+                            | EvalValue::List(..)
+                            | EvalValue::Regex(..) => BindingValue::Null,
                         };
                         child.insert(param_name.to_owned(), binding);
                     }
@@ -415,11 +424,15 @@ impl<'a> RuleRunner<'a> {
                 self.with_cfg_for_node(na, |cfg| cfg.node_reaches(na, nb))
             }
             CfgPredicate::InLoop { node } => {
-                let Some(n) = env.get_node(node) else { return false };
+                let Some(n) = env.get_node(node) else {
+                    return false;
+                };
                 self.with_cfg_for_node(n, |cfg| cfg.node_in_loop(n))
             }
             CfgPredicate::InExceptionPath { node } => {
-                let Some(n) = env.get_node(node) else { return false };
+                let Some(n) = env.get_node(node) else {
+                    return false;
+                };
                 self.with_cfg_for_node(n, |cfg| cfg.node_in_exception_path(n))
             }
             CfgPredicate::CfgReachableWithout { from, to, barrier } => {
@@ -439,7 +452,9 @@ impl<'a> RuleRunner<'a> {
                 fn_a.is_some() && fn_a == fn_b
             }
             CfgPredicate::LoopHasNoExit { node } => {
-                let Some(n) = env.get_node(node) else { return false };
+                let Some(n) = env.get_node(node) else {
+                    return false;
+                };
                 let cpg = self.ctx.cpg;
                 self.with_cfg_for_node(n, |cfg| cfg.node_loop_has_no_exit(n, cpg))
             }
@@ -449,24 +464,36 @@ impl<'a> RuleRunner<'a> {
                 let (Some(na), Some(nb)) = (env.get_node(a), env.get_node(b)) else {
                     return false;
                 };
-                let Some(ir) = self.ctx.cpg.ast.get(&na) else { return false };
-                let Some(fn_id) = ir.function_id else { return false };
-                let Some(cfg) = self.ctx.cfg_cache.get(&fn_id) else { return false };
+                let Some(ir) = self.ctx.cpg.ast.get(&na) else {
+                    return false;
+                };
+                let Some(fn_id) = ir.function_id else {
+                    return false;
+                };
+                let Some(cfg) = self.ctx.cfg_cache.get(&fn_id) else {
+                    return false;
+                };
                 cfg.feasible_reaches(na, nb, self.ctx.cpg)
             }
 
             CfgPredicate::GuardEvalTrue { node } => {
-                let Some(n) = env.get_node(node) else { return false };
+                let Some(n) = env.get_node(node) else {
+                    return false;
+                };
                 guard_const_eval(self.ctx.cpg, n) == Some(true)
             }
 
             CfgPredicate::GuardEvalFalse { node } => {
-                let Some(n) = env.get_node(node) else { return false };
+                let Some(n) = env.get_node(node) else {
+                    return false;
+                };
                 guard_const_eval(self.ctx.cpg, n) == Some(false)
             }
 
             CfgPredicate::InDeadBranch { node } => {
-                let Some(n) = env.get_node(node) else { return false };
+                let Some(n) = env.get_node(node) else {
+                    return false;
+                };
                 self.with_cfg_for_node(n, |cfg| cfg.node_in_dead_branch(n, self.ctx.cpg))
             }
         }
@@ -474,9 +501,15 @@ impl<'a> RuleRunner<'a> {
 
     /// Run `f` with the `FunctionCfg` of the function that owns `node`.
     fn with_cfg_for_node<F: FnOnce(&FunctionCfg) -> bool>(&self, node: NodeId, f: F) -> bool {
-        let Some(ir_node) = self.ctx.cpg.ast.get(&node) else { return false };
-        let Some(fn_id) = ir_node.function_id else { return false };
-        let Some(cfg) = self.ctx.cfg_cache.get(&fn_id) else { return false };
+        let Some(ir_node) = self.ctx.cpg.ast.get(&node) else {
+            return false;
+        };
+        let Some(fn_id) = ir_node.function_id else {
+            return false;
+        };
+        let Some(cfg) = self.ctx.cfg_cache.get(&fn_id) else {
+            return false;
+        };
         f(cfg)
     }
 
@@ -526,31 +559,41 @@ impl<'a> RuleRunner<'a> {
                 }
                 false
             }
-            DfgPredicate::ReachesWithBarrier { from, to, barrier_kinds } => {
+            DfgPredicate::ReachesWithBarrier {
+                from,
+                to,
+                barrier_kinds,
+            } => {
                 let (Some(nf), Some(nt)) = (env.get_node(from), env.get_node(to)) else {
                     return false;
                 };
-                self.ctx.dfg.reaches_with_barrier(nf, nt, barrier_kinds, self.ctx.cpg)
+                self.ctx
+                    .dfg
+                    .reaches_with_barrier(nf, nt, barrier_kinds, self.ctx.cpg)
             }
             DfgPredicate::DfgDef { var_name, node } => {
-                let Some(n) = env.get_node(node) else { return false };
+                let Some(n) = env.get_node(node) else {
+                    return false;
+                };
                 if self.ctx.dfg.defines_var(n, var_name) {
                     return true;
                 }
                 // Subtree extension: any descendant of `node` defines `var_name`
-                ast_subtree(self.ctx.cpg, n).iter().any(|&d| {
-                    d != n && self.ctx.dfg.defines_var(d, var_name)
-                })
+                ast_subtree(self.ctx.cpg, n)
+                    .iter()
+                    .any(|&d| d != n && self.ctx.dfg.defines_var(d, var_name))
             }
             DfgPredicate::DfgUse { var_name, node } => {
-                let Some(n) = env.get_node(node) else { return false };
+                let Some(n) = env.get_node(node) else {
+                    return false;
+                };
                 if self.ctx.dfg.uses_var(n, var_name) {
                     return true;
                 }
                 // Subtree extension: any descendant of `node` uses `var_name`
-                ast_subtree(self.ctx.cpg, n).iter().any(|&d| {
-                    d != n && self.ctx.dfg.uses_var(d, var_name)
-                })
+                ast_subtree(self.ctx.cpg, n)
+                    .iter()
+                    .any(|&d| d != n && self.ctx.dfg.uses_var(d, var_name))
             }
         }
     }
@@ -568,7 +611,9 @@ impl<'a> RuleRunner<'a> {
             EvalValue::Node(id) => id,
             _ => return false,
         };
-        let Some(node) = self.ctx.cpg.ast.get(&node_id) else { return false };
+        let Some(node) = self.ctx.cpg.ast.get(&node_id) else {
+            return false;
+        };
 
         // Check type matches — NodeType uses raw string comparison against node_type field
         match ty {
@@ -601,16 +646,32 @@ impl<'a> RuleRunner<'a> {
 
     fn extract_field(&self, node: &IrNode, field: &str, node_id: NodeId) -> EvalValue {
         match field {
-            "name" => node.name.as_deref().map(|s| EvalValue::Str(s.to_owned())).unwrap_or(EvalValue::Null),
-            "text" => node.text.as_deref().map(|s| EvalValue::Str(s.to_owned())).unwrap_or(EvalValue::Null),
+            "name" => node
+                .name
+                .as_deref()
+                .map(|s| EvalValue::Str(s.to_owned()))
+                .unwrap_or(EvalValue::Null),
+            "text" => node
+                .text
+                .as_deref()
+                .map(|s| EvalValue::Str(s.to_owned()))
+                .unwrap_or(EvalValue::Null),
             "raw_kind" => EvalValue::Str(node.node_type.clone()),
             "lit_kind" => node
                 .lit_kind
                 .as_ref()
                 .map(|k| EvalValue::Str(lit_kind_str(k).to_owned()))
                 .unwrap_or(EvalValue::Null),
-            "namespace" => node.namespace.as_deref().map(|s| EvalValue::Str(s.to_owned())).unwrap_or(EvalValue::Null),
-            "visibility" => node.visibility.as_deref().map(|s| EvalValue::Str(s.to_owned())).unwrap_or(EvalValue::Null),
+            "namespace" => node
+                .namespace
+                .as_deref()
+                .map(|s| EvalValue::Str(s.to_owned()))
+                .unwrap_or(EvalValue::Null),
+            "visibility" => node
+                .visibility
+                .as_deref()
+                .map(|s| EvalValue::Str(s.to_owned()))
+                .unwrap_or(EvalValue::Null),
             "line" => EvalValue::Int(node.line as i64),
             "end_line" => EvalValue::Int(node.end_line as i64),
             _ => {
@@ -651,12 +712,7 @@ impl<'a> RuleRunner<'a> {
         }
     }
 
-    fn eval_method_step(
-        &self,
-        val: EvalValue,
-        step: &MethodStep,
-        env: &BindingEnv,
-    ) -> EvalValue {
+    fn eval_method_step(&self, val: EvalValue, step: &MethodStep, env: &BindingEnv) -> EvalValue {
         // A MetaNode is the result of `node.cpp_meta` (etc.); the next step accesses
         // a field on the language-specific metadata side-table.
         if let EvalValue::MetaNode(meta_id, ref ns) = val {
@@ -674,23 +730,53 @@ impl<'a> RuleRunner<'a> {
 
         match step.method.as_str() {
             // ── Universal node properties ─────────────────────────────────────
-            "name" => node.name.as_deref().map(|s| EvalValue::Str(s.to_owned())).unwrap_or(EvalValue::Null),
-            "text" => node.text.as_deref().map(|s| EvalValue::Str(s.to_owned())).unwrap_or(EvalValue::Null),
+            "name" => node
+                .name
+                .as_deref()
+                .map(|s| EvalValue::Str(s.to_owned()))
+                .unwrap_or(EvalValue::Null),
+            "text" => node
+                .text
+                .as_deref()
+                .map(|s| EvalValue::Str(s.to_owned()))
+                .unwrap_or(EvalValue::Null),
             "raw_kind" => EvalValue::Str(node.node_type.clone()),
             // `kind` returns the IrNodeKind as a PascalCase string (e.g. "Call", "Identifier").
             // This lets rules write `n.arg(0).kind == "Identifier"` to check the IR type.
             "kind" => EvalValue::Str(format!("{:?}", node.kind)),
-            "namespace" => node.namespace.as_deref().map(|s| EvalValue::Str(s.to_owned())).unwrap_or(EvalValue::Null),
-            "class_context" => node.class_context.as_deref().map(|s| EvalValue::Str(s.to_owned())).unwrap_or(EvalValue::Null),
-            "visibility" => node.visibility.as_deref().map(|s| EvalValue::Str(s.to_owned())).unwrap_or(EvalValue::Null),
+            "namespace" => node
+                .namespace
+                .as_deref()
+                .map(|s| EvalValue::Str(s.to_owned()))
+                .unwrap_or(EvalValue::Null),
+            "class_context" => node
+                .class_context
+                .as_deref()
+                .map(|s| EvalValue::Str(s.to_owned()))
+                .unwrap_or(EvalValue::Null),
+            "visibility" => node
+                .visibility
+                .as_deref()
+                .map(|s| EvalValue::Str(s.to_owned()))
+                .unwrap_or(EvalValue::Null),
             // The literal operator token for BinaryOp/UnaryOp nodes (e.g. "/", "%", "+"),
             // so rules can match on the actual operator instead of regexing the node's
             // full source text (which also matches unrelated substrings, e.g. a "/"
             // inside a string-literal operand).
-            "operator" => node.operator.as_deref().map(|s| EvalValue::Str(s.to_owned())).unwrap_or(EvalValue::Null),
+            "operator" => node
+                .operator
+                .as_deref()
+                .map(|s| EvalValue::Str(s.to_owned()))
+                .unwrap_or(EvalValue::Null),
             "line" => EvalValue::Int(node.line as i64),
             "end_line" => EvalValue::Int(node.end_line as i64),
-            "file" => self.ctx.cpg.source_file.as_deref().map(|s| EvalValue::Str(s.to_owned())).unwrap_or(EvalValue::Null),
+            "file" => self
+                .ctx
+                .cpg
+                .source_file
+                .as_deref()
+                .map(|s| EvalValue::Str(s.to_owned()))
+                .unwrap_or(EvalValue::Null),
             "is_some" => EvalValue::Bool(true), // node was valid if we got here
             "is_none" => EvalValue::Bool(false),
 
@@ -700,14 +786,24 @@ impl<'a> RuleRunner<'a> {
             // a relationship against one *specific* node, or compared with `==`/`!=`.
             "id" => EvalValue::Node(node_id),
 
-            "parent" => node.parent_id.map(EvalValue::Node).unwrap_or(EvalValue::Null),
+            "parent" => node
+                .parent_id
+                .map(EvalValue::Node)
+                .unwrap_or(EvalValue::Null),
 
-            "function_id" => node.function_id.map(EvalValue::Node).unwrap_or(EvalValue::Null),
+            "function_id" => node
+                .function_id
+                .map(EvalValue::Node)
+                .unwrap_or(EvalValue::Null),
 
             "basic_block" => {
                 // Returns the block ID (as an integer) for the block containing this node
-                let Some(fn_id) = node.function_id else { return EvalValue::Null };
-                let Some(cfg) = self.ctx.cfg_cache.get(&fn_id) else { return EvalValue::Null };
+                let Some(fn_id) = node.function_id else {
+                    return EvalValue::Null;
+                };
+                let Some(cfg) = self.ctx.cfg_cache.get(&fn_id) else {
+                    return EvalValue::Null;
+                };
                 match cfg.block_id_for_node(node_id) {
                     Some(block_id) => EvalValue::Int(block_id as i64),
                     None => EvalValue::Null,
@@ -720,14 +816,26 @@ impl<'a> RuleRunner<'a> {
                     .first()
                     .and_then(|a| eval_as_index(self.eval_plan_expr(a, env)))
                     .unwrap_or(0);
-                node.children.get(n).copied().map(EvalValue::Node).unwrap_or(EvalValue::Null)
+                node.children
+                    .get(n)
+                    .copied()
+                    .map(EvalValue::Node)
+                    .unwrap_or(EvalValue::Null)
             }
 
             "ancestor" => {
                 // Walk up parent_id chain, return first ancestor matching type arg
-                let ty_str = step.args.first()
+                let ty_str = step
+                    .args
+                    .first()
                     .map(|a| self.eval_plan_expr(a, env))
-                    .and_then(|v| if let EvalValue::Str(s) = v { Some(s) } else { None });
+                    .and_then(|v| {
+                        if let EvalValue::Str(s) = v {
+                            Some(s)
+                        } else {
+                            None
+                        }
+                    });
                 self.find_ancestor(node_id, ty_str.as_deref())
             }
 
@@ -743,18 +851,30 @@ impl<'a> RuleRunner<'a> {
                     Some(EvalValue::Node(target)) => {
                         EvalValue::Bool(self.ancestor_id_match(node_id, target))
                     }
-                    Some(EvalValue::Str(ty)) => {
-                        EvalValue::Bool(!matches!(self.find_ancestor(node_id, Some(&ty)), EvalValue::Null))
-                    }
-                    _ => EvalValue::Bool(!matches!(self.find_ancestor(node_id, None), EvalValue::Null)),
+                    Some(EvalValue::Str(ty)) => EvalValue::Bool(!matches!(
+                        self.find_ancestor(node_id, Some(&ty)),
+                        EvalValue::Null
+                    )),
+                    _ => EvalValue::Bool(!matches!(
+                        self.find_ancestor(node_id, None),
+                        EvalValue::Null
+                    )),
                 }
             }
 
             "descendant" => {
                 // BFS over children, return first descendant matching type arg
-                let ty_str = step.args.first()
+                let ty_str = step
+                    .args
+                    .first()
                     .map(|a| self.eval_plan_expr(a, env))
-                    .and_then(|v| if let EvalValue::Str(s) = v { Some(s) } else { None });
+                    .and_then(|v| {
+                        if let EvalValue::Str(s) = v {
+                            Some(s)
+                        } else {
+                            None
+                        }
+                    });
                 self.find_descendant(node_id, ty_str.as_deref())
             }
 
@@ -764,16 +884,24 @@ impl<'a> RuleRunner<'a> {
                     Some(EvalValue::Node(target)) => {
                         EvalValue::Bool(self.descendant_id_match(node_id, target))
                     }
-                    Some(EvalValue::Str(ty)) => {
-                        EvalValue::Bool(!matches!(self.find_descendant(node_id, Some(&ty)), EvalValue::Null))
-                    }
-                    _ => EvalValue::Bool(!matches!(self.find_descendant(node_id, None), EvalValue::Null)),
+                    Some(EvalValue::Str(ty)) => EvalValue::Bool(!matches!(
+                        self.find_descendant(node_id, Some(&ty)),
+                        EvalValue::Null
+                    )),
+                    _ => EvalValue::Bool(!matches!(
+                        self.find_descendant(node_id, None),
+                        EvalValue::Null
+                    )),
                 }
             }
 
             "children" => {
                 // Return first child (list not representable; use child(n) for indexed access)
-                node.children.first().copied().map(EvalValue::Node).unwrap_or(EvalValue::Null)
+                node.children
+                    .first()
+                    .copied()
+                    .map(EvalValue::Node)
+                    .unwrap_or(EvalValue::Null)
             }
 
             // ── Call node methods ─────────────────────────────────────────────
@@ -793,7 +921,8 @@ impl<'a> RuleRunner<'a> {
                         None
                     }
                 });
-                arg_id.or_else(|| node.children.get(n).copied())
+                arg_id
+                    .or_else(|| node.children.get(n).copied())
                     .map(EvalValue::Node)
                     .unwrap_or(EvalValue::Null)
             }
@@ -802,9 +931,17 @@ impl<'a> RuleRunner<'a> {
 
             "has_arg" => {
                 // has_arg(target_node) — true if target_node is in call's children
-                let target = step.args.first()
+                let target = step
+                    .args
+                    .first()
                     .map(|a| self.eval_plan_expr(a, env))
-                    .and_then(|v| if let EvalValue::Node(id) = v { Some(id) } else { None });
+                    .and_then(|v| {
+                        if let EvalValue::Node(id) = v {
+                            Some(id)
+                        } else {
+                            None
+                        }
+                    });
                 match target {
                     Some(target_id) => EvalValue::Bool(node.children.contains(&target_id)),
                     None => EvalValue::Bool(false),
@@ -813,29 +950,41 @@ impl<'a> RuleRunner<'a> {
 
             "callee_name" => {
                 // Simple (unqualified) callee name for this Call node.
-                self.ctx.kind_index.call_site_for_node(node_id)
+                self.ctx
+                    .kind_index
+                    .call_site_for_node(node_id)
                     .map(|cs| EvalValue::Str(cs.callee.clone()))
                     .unwrap_or_else(|| {
-                        node.name.as_deref().map(|s| EvalValue::Str(s.to_owned())).unwrap_or(EvalValue::Null)
+                        node.name
+                            .as_deref()
+                            .map(|s| EvalValue::Str(s.to_owned()))
+                            .unwrap_or(EvalValue::Null)
                     })
             }
 
             "qualified_callee" => {
                 // Fully-qualified callee name (e.g. "std::string::append", "com.example.Foo.bar").
                 // Falls back to simple callee name when no qualified form is available.
-                self.ctx.kind_index.call_site_for_node(node_id)
+                self.ctx
+                    .kind_index
+                    .call_site_for_node(node_id)
                     .map(|cs| {
                         let name = cs.qualified_callee.as_deref().unwrap_or(cs.callee.as_str());
                         EvalValue::Str(name.to_owned())
                     })
                     .unwrap_or_else(|| {
-                        node.name.as_deref().map(|s| EvalValue::Str(s.to_owned())).unwrap_or(EvalValue::Null)
+                        node.name
+                            .as_deref()
+                            .map(|s| EvalValue::Str(s.to_owned()))
+                            .unwrap_or(EvalValue::Null)
                     })
             }
 
             "callee_kind" => {
                 // Returns the callee kind string for this Call node.
-                self.ctx.kind_index.call_site_for_node(node_id)
+                self.ctx
+                    .kind_index
+                    .call_site_for_node(node_id)
                     .map(|cs| {
                         use web_sitter::FunctionKind;
                         let kind_str = match cs.callee_kind {
@@ -851,7 +1000,11 @@ impl<'a> RuleRunner<'a> {
 
             "receiver" => {
                 // The implicit receiver object (first child if it's a member access)
-                node.children.first().copied().map(EvalValue::Node).unwrap_or(EvalValue::Null)
+                node.children
+                    .first()
+                    .copied()
+                    .map(EvalValue::Node)
+                    .unwrap_or(EvalValue::Null)
             }
 
             "return_value" => {
@@ -864,9 +1017,11 @@ impl<'a> RuleRunner<'a> {
             "is_destructor" => EvalValue::Bool(node.is_destructor.unwrap_or(false)),
             "is_virtual" => EvalValue::Bool(node.is_virtual.unwrap_or(false)),
 
-            "return_type" => {
-                node.signature.as_deref().map(|s| EvalValue::Str(s.to_owned())).unwrap_or(EvalValue::Null)
-            }
+            "return_type" => node
+                .signature
+                .as_deref()
+                .map(|s| EvalValue::Str(s.to_owned()))
+                .unwrap_or(EvalValue::Null),
 
             "param" => {
                 // param(n) — nth parameter of a MethodDef.
@@ -881,7 +1036,11 @@ impl<'a> RuleRunner<'a> {
                     .and_then(|a| eval_as_index(self.eval_plan_expr(a, env)))
                     .unwrap_or(0);
                 let params = collect_param_nodes(self.ctx.cpg, node);
-                params.get(n).copied().map(EvalValue::Node).unwrap_or(EvalValue::Null)
+                params
+                    .get(n)
+                    .copied()
+                    .map(EvalValue::Node)
+                    .unwrap_or(EvalValue::Null)
             }
 
             "param_count" => {
@@ -899,16 +1058,23 @@ impl<'a> RuleRunner<'a> {
             "string_value" => {
                 // Returns the string content for String/Template literals
                 match &node.lit_kind {
-                    Some(LiteralKind::String) | Some(LiteralKind::Template) => {
-                        node.text.as_deref().map(|s| EvalValue::Str(s.to_owned())).unwrap_or(EvalValue::Null)
-                    }
-                    _ => node.text.as_deref().map(|s| EvalValue::Str(s.to_owned())).unwrap_or(EvalValue::Null),
+                    Some(LiteralKind::String) | Some(LiteralKind::Template) => node
+                        .text
+                        .as_deref()
+                        .map(|s| EvalValue::Str(s.to_owned()))
+                        .unwrap_or(EvalValue::Null),
+                    _ => node
+                        .text
+                        .as_deref()
+                        .map(|s| EvalValue::Str(s.to_owned()))
+                        .unwrap_or(EvalValue::Null),
                 }
             }
 
             "int_value" => {
                 // Parse the text content as an integer
-                node.text.as_deref()
+                node.text
+                    .as_deref()
                     .and_then(|s| s.parse::<i64>().ok())
                     .map(EvalValue::Int)
                     .unwrap_or(EvalValue::Null)
@@ -917,7 +1083,8 @@ impl<'a> RuleRunner<'a> {
             // ── ClassDef node methods ─────────────────────────────────────────
             "base_classes" => {
                 // Return first base class name (full list not representable as scalar)
-                node.base_classes.as_ref()
+                node.base_classes
+                    .as_ref()
                     .and_then(|classes| classes.first())
                     .map(|s| EvalValue::Str(s.clone()))
                     .unwrap_or(EvalValue::Null)
@@ -925,7 +1092,8 @@ impl<'a> RuleRunner<'a> {
 
             "implements" => {
                 // For Java-style: same as base_classes (interface list stored there)
-                node.base_classes.as_ref()
+                node.base_classes
+                    .as_ref()
                     .and_then(|classes| classes.first())
                     .map(|s| EvalValue::Str(s.clone()))
                     .unwrap_or(EvalValue::Null)
@@ -936,10 +1104,11 @@ impl<'a> RuleRunner<'a> {
             // ancestor, then return its "condition" field child.  This lets rules
             // do things like `n.branch_condition().eval_bool()` to ask "is the
             // guard that dominates n statically known to be true/false?"
-            "branch_condition" => {
-                find_enclosing_condition(self.ctx.cpg, node_id,
-                    &[IrNodeKind::Conditional, IrNodeKind::Switch])
-            }
+            "branch_condition" => find_enclosing_condition(
+                self.ctx.cpg,
+                node_id,
+                &[IrNodeKind::Conditional, IrNodeKind::Switch],
+            ),
 
             // Same as branch_condition but walks up to the nearest Loop ancestor.
             "loop_condition" => {
@@ -952,7 +1121,9 @@ impl<'a> RuleRunner<'a> {
                 // graph. For any other node (typically an Identifier used as
                 // a variable reference), fall back to name-based resolution
                 // against LocalDef/ParamDef/FieldDef declarations.
-                self.ctx.kind_index.call_site_for_node(node_id)
+                self.ctx
+                    .kind_index
+                    .call_site_for_node(node_id)
                     .and_then(|cs| cs.callee_id)
                     .or_else(|| resolve_var_declaration(self.ctx.cpg, node_id, node))
                     .map(EvalValue::Node)
@@ -962,7 +1133,9 @@ impl<'a> RuleRunner<'a> {
             // ── Alias / pointer analysis ─────────────────────────────────────
             "points_to" => {
                 // Returns the first POINTS_TO target for this node, or Null.
-                self.ctx.alias.points_to_set(node_id)
+                self.ctx
+                    .alias
+                    .points_to_set(node_id)
                     .and_then(|s| s.iter().next().copied())
                     .map(EvalValue::Node)
                     .unwrap_or(EvalValue::Null)
@@ -970,7 +1143,9 @@ impl<'a> RuleRunner<'a> {
 
             "alias_target" => {
                 // Synonym for points_to — first POINTS_TO target.
-                self.ctx.alias.points_to_set(node_id)
+                self.ctx
+                    .alias
+                    .points_to_set(node_id)
                     .and_then(|s| s.iter().next().copied())
                     .map(EvalValue::Node)
                     .unwrap_or(EvalValue::Null)
@@ -997,13 +1172,13 @@ impl<'a> RuleRunner<'a> {
             }
 
             // ── Nullability ───────────────────────────────────────────────────
-            "may_be_null" => {
-                EvalValue::Bool(self.ctx.nullability.may_be_null(node_id))
-            }
+            "may_be_null" => EvalValue::Bool(self.ctx.nullability.may_be_null(node_id)),
 
             "null_source" => {
                 // Returns the original null-producing seed node, or Null.
-                self.ctx.nullability.null_origin_of(node_id)
+                self.ctx
+                    .nullability
+                    .null_origin_of(node_id)
                     .map(EvalValue::Node)
                     .unwrap_or(EvalValue::Null)
             }
@@ -1096,13 +1271,13 @@ impl<'a> RuleRunner<'a> {
 
             // ── Language metadata side-table accessors ────────────────────────
             // Return a MetaNode sentinel; the next chained step resolves the field.
-            "cpp_meta"    => EvalValue::MetaNode(node_id, "cpp".to_owned()),
-            "go_meta"     => EvalValue::MetaNode(node_id, "go".to_owned()),
+            "cpp_meta" => EvalValue::MetaNode(node_id, "cpp".to_owned()),
+            "go_meta" => EvalValue::MetaNode(node_id, "go".to_owned()),
             "python_meta" => EvalValue::MetaNode(node_id, "python".to_owned()),
-            "java_meta"   => EvalValue::MetaNode(node_id, "java".to_owned()),
-            "js_meta"     => EvalValue::MetaNode(node_id, "js".to_owned()),
-            "ts_meta"     => EvalValue::MetaNode(node_id, "ts".to_owned()),
-            "rust_meta"   => EvalValue::MetaNode(node_id, "rust".to_owned()),
+            "java_meta" => EvalValue::MetaNode(node_id, "java".to_owned()),
+            "js_meta" => EvalValue::MetaNode(node_id, "js".to_owned()),
+            "ts_meta" => EvalValue::MetaNode(node_id, "ts".to_owned()),
+            "rust_meta" => EvalValue::MetaNode(node_id, "rust".to_owned()),
 
             _ => EvalValue::Null,
         }
@@ -1120,8 +1295,12 @@ impl<'a> RuleRunner<'a> {
             if steps > 512 {
                 break; // guard against malformed parent chains
             }
-            let Some(cur) = self.ctx.cpg.ast.get(&cur_id) else { break };
-            let Some(parent_id) = cur.parent_id else { break };
+            let Some(cur) = self.ctx.cpg.ast.get(&cur_id) else {
+                break;
+            };
+            let Some(parent_id) = cur.parent_id else {
+                break;
+            };
             if parent_id == cur_id {
                 break; // self-loop guard
             }
@@ -1156,17 +1335,22 @@ impl<'a> RuleRunner<'a> {
             if steps > 512 {
                 break; // guard against malformed parent chains
             }
-            let Some(cur) = self.ctx.cpg.ast.get(&cur_id) else { break };
-            let Some(parent_id) = cur.parent_id else { break };
+            let Some(cur) = self.ctx.cpg.ast.get(&cur_id) else {
+                break;
+            };
+            let Some(parent_id) = cur.parent_id else {
+                break;
+            };
             if parent_id == cur_id {
                 break; // self-loop guard
             }
-            let Some(parent) = self.ctx.cpg.ast.get(&parent_id) else { break };
+            let Some(parent) = self.ctx.cpg.ast.get(&parent_id) else {
+                break;
+            };
             let matches = match &ty_lc {
                 None => true, // no type filter → return immediate parent
                 Some(ty) => {
-                    parent.node_type == *ty
-                        || format!("{:?}", parent.kind).to_lowercase() == *ty
+                    parent.node_type == *ty || format!("{:?}", parent.kind).to_lowercase() == *ty
                 }
             };
             if matches {
@@ -1187,7 +1371,9 @@ impl<'a> RuleRunner<'a> {
         queue.push_back(node_id);
         visited.insert(node_id);
         // Skip the root itself
-        let Some(root) = self.ctx.cpg.ast.get(&node_id) else { return EvalValue::Null };
+        let Some(root) = self.ctx.cpg.ast.get(&node_id) else {
+            return EvalValue::Null;
+        };
         for &child_id in &root.children {
             if visited.insert(child_id) {
                 queue.push_back(child_id);
@@ -1197,13 +1383,12 @@ impl<'a> RuleRunner<'a> {
             if cur_id == node_id {
                 continue;
             }
-            let Some(cur) = self.ctx.cpg.ast.get(&cur_id) else { continue };
+            let Some(cur) = self.ctx.cpg.ast.get(&cur_id) else {
+                continue;
+            };
             let matches = match &ty_lc {
                 None => true,
-                Some(ty) => {
-                    cur.node_type == *ty
-                        || format!("{:?}", cur.kind).to_lowercase() == *ty
-                }
+                Some(ty) => cur.node_type == *ty || format!("{:?}", cur.kind).to_lowercase() == *ty,
             };
             if matches {
                 return EvalValue::Node(cur_id);
@@ -1226,17 +1411,17 @@ impl<'a> RuleRunner<'a> {
                     return EvalValue::Null;
                 };
                 match field {
-                    "class_context"      => opt_str(&m.class_context),
-                    "namespace"          => opt_str(&m.namespace),
-                    "visibility"         => opt_str(&m.visibility),
-                    "qualified_name"     => opt_str(&m.qualified_name),
-                    "is_constructor"     => EvalValue::Bool(m.is_constructor.unwrap_or(false)),
-                    "is_destructor"      => EvalValue::Bool(m.is_destructor.unwrap_or(false)),
-                    "is_virtual"         => EvalValue::Bool(m.is_virtual.unwrap_or(false)),
+                    "class_context" => opt_str(&m.class_context),
+                    "namespace" => opt_str(&m.namespace),
+                    "visibility" => opt_str(&m.visibility),
+                    "qualified_name" => opt_str(&m.qualified_name),
+                    "is_constructor" => EvalValue::Bool(m.is_constructor.unwrap_or(false)),
+                    "is_destructor" => EvalValue::Bool(m.is_destructor.unwrap_or(false)),
+                    "is_virtual" => EvalValue::Bool(m.is_virtual.unwrap_or(false)),
                     "is_virtual_dispatch" => EvalValue::Bool(m.is_virtual_dispatch),
-                    "template_params"    => first_str(&m.template_params),
-                    "base_classes"       => first_str(&m.base_classes),
-                    _                    => EvalValue::Null,
+                    "template_params" => first_str(&m.template_params),
+                    "base_classes" => first_str(&m.base_classes),
+                    _ => EvalValue::Null,
                 }
             }
             "go" => {
@@ -1244,22 +1429,22 @@ impl<'a> RuleRunner<'a> {
                     return EvalValue::Null;
                 };
                 match field {
-                    "package_name"       => opt_str(&m.package_name),
-                    "receiver_type"      => opt_str(&m.receiver_type),
-                    "receiver_name"      => opt_str(&m.receiver_name),
-                    "qualified_name"     => opt_str(&m.qualified_name),
-                    "is_exported"        => EvalValue::Bool(m.is_exported),
-                    "is_variadic"        => EvalValue::Bool(m.is_variadic),
-                    "is_interface"       => EvalValue::Bool(m.is_interface),
-                    "is_goroutine"       => EvalValue::Bool(m.is_goroutine),
-                    "is_deferred"        => EvalValue::Bool(m.is_deferred),
-                    "is_closure"         => EvalValue::Bool(m.is_closure),
-                    "is_init"            => EvalValue::Bool(m.is_init),
-                    "is_alias"           => EvalValue::Bool(m.is_alias),
-                    "is_const"           => EvalValue::Bool(m.is_const),
+                    "package_name" => opt_str(&m.package_name),
+                    "receiver_type" => opt_str(&m.receiver_type),
+                    "receiver_name" => opt_str(&m.receiver_name),
+                    "qualified_name" => opt_str(&m.qualified_name),
+                    "is_exported" => EvalValue::Bool(m.is_exported),
+                    "is_variadic" => EvalValue::Bool(m.is_variadic),
+                    "is_interface" => EvalValue::Bool(m.is_interface),
+                    "is_goroutine" => EvalValue::Bool(m.is_goroutine),
+                    "is_deferred" => EvalValue::Bool(m.is_deferred),
+                    "is_closure" => EvalValue::Bool(m.is_closure),
+                    "is_init" => EvalValue::Bool(m.is_init),
+                    "is_alias" => EvalValue::Bool(m.is_alias),
+                    "is_const" => EvalValue::Bool(m.is_const),
                     "embedded_interfaces" => first_str(&m.embedded_interfaces),
                     "generic_type_params" => first_str(&m.generic_type_params),
-                    _                    => EvalValue::Null,
+                    _ => EvalValue::Null,
                 }
             }
             "python" => {
@@ -1267,29 +1452,29 @@ impl<'a> RuleRunner<'a> {
                     return EvalValue::Null;
                 };
                 match field {
-                    "is_async"            => EvalValue::Bool(m.is_async),
-                    "is_generator"        => EvalValue::Bool(m.is_generator),
-                    "is_staticmethod"     => EvalValue::Bool(m.is_staticmethod),
-                    "is_classmethod"      => EvalValue::Bool(m.is_classmethod),
-                    "is_property"         => EvalValue::Bool(m.is_property),
-                    "is_abstract"         => EvalValue::Bool(m.is_abstract),
-                    "is_augmented"        => EvalValue::Bool(m.is_augmented),
+                    "is_async" => EvalValue::Bool(m.is_async),
+                    "is_generator" => EvalValue::Bool(m.is_generator),
+                    "is_staticmethod" => EvalValue::Bool(m.is_staticmethod),
+                    "is_classmethod" => EvalValue::Bool(m.is_classmethod),
+                    "is_property" => EvalValue::Bool(m.is_property),
+                    "is_abstract" => EvalValue::Bool(m.is_abstract),
+                    "is_augmented" => EvalValue::Bool(m.is_augmented),
                     "is_constructor_call" => EvalValue::Bool(m.is_constructor_call),
-                    "is_super_call"       => EvalValue::Bool(m.is_super_call),
-                    "is_dunder_call"      => EvalValue::Bool(m.is_dunder_call),
-                    "is_yield_from"       => EvalValue::Bool(m.is_yield_from),
-                    "has_star_args"       => EvalValue::Bool(m.has_star_args),
+                    "is_super_call" => EvalValue::Bool(m.is_super_call),
+                    "is_dunder_call" => EvalValue::Bool(m.is_dunder_call),
+                    "is_yield_from" => EvalValue::Bool(m.is_yield_from),
+                    "has_star_args" => EvalValue::Bool(m.has_star_args),
                     "has_double_star_args" => EvalValue::Bool(m.has_double_star_args),
-                    "is_star_param"       => EvalValue::Bool(m.is_star_param),
+                    "is_star_param" => EvalValue::Bool(m.is_star_param),
                     "is_double_star_param" => EvalValue::Bool(m.is_double_star_param),
-                    "is_keyword_only"     => EvalValue::Bool(m.is_keyword_only),
-                    "return_annotation"   => opt_str(&m.return_annotation),
-                    "annotation"          => opt_str(&m.annotation),
-                    "metaclass"           => opt_str(&m.metaclass),
-                    "call_receiver_text"  => opt_str(&m.call_receiver_text),
-                    "decorators"          => first_str_vec(&m.decorators),
-                    "closure_vars"        => first_str_vec(&m.closure_vars),
-                    _                     => EvalValue::Null,
+                    "is_keyword_only" => EvalValue::Bool(m.is_keyword_only),
+                    "return_annotation" => opt_str(&m.return_annotation),
+                    "annotation" => opt_str(&m.annotation),
+                    "metaclass" => opt_str(&m.metaclass),
+                    "call_receiver_text" => opt_str(&m.call_receiver_text),
+                    "decorators" => first_str_vec(&m.decorators),
+                    "closure_vars" => first_str_vec(&m.closure_vars),
+                    _ => EvalValue::Null,
                 }
             }
             "java" => {
@@ -1297,34 +1482,34 @@ impl<'a> RuleRunner<'a> {
                     return EvalValue::Null;
                 };
                 match field {
-                    "package_name"          => opt_str(&m.package_name),
+                    "package_name" => opt_str(&m.package_name),
                     "fully_qualified_class" => opt_str(&m.fully_qualified_class),
-                    "enclosing_class"       => opt_str(&m.enclosing_class),
-                    "extends_type"          => opt_str(&m.extends_type),
-                    "label_target"          => opt_str(&m.label_target),
-                    "is_interface"          => EvalValue::Bool(m.is_interface),
-                    "is_enum"               => EvalValue::Bool(m.is_enum),
-                    "is_record"             => EvalValue::Bool(m.is_record),
-                    "is_abstract"           => EvalValue::Bool(m.is_abstract),
-                    "is_final"              => EvalValue::Bool(m.is_final),
-                    "is_sealed"             => EvalValue::Bool(m.is_sealed),
-                    "is_anonymous"          => EvalValue::Bool(m.is_anonymous),
-                    "is_static"             => EvalValue::Bool(m.is_static),
-                    "is_synchronized"       => EvalValue::Bool(m.is_synchronized),
-                    "is_native"             => EvalValue::Bool(m.is_native),
-                    "is_varargs"            => EvalValue::Bool(m.is_varargs),
-                    "is_virtual_dispatch"   => EvalValue::Bool(m.is_virtual_dispatch),
-                    "is_this_call"          => EvalValue::Bool(m.is_this_call),
-                    "is_super_call"         => EvalValue::Bool(m.is_super_call),
-                    "is_static_import"      => EvalValue::Bool(m.is_static_import),
-                    "has_finally"           => EvalValue::Bool(m.has_finally),
-                    "access_modifiers"      => first_str_vec(&m.access_modifiers),
-                    "annotations"           => first_str_vec(&m.annotations),
-                    "throws_types"          => first_str_vec(&m.throws_types),
-                    "generic_type_params"   => first_str_vec(&m.generic_type_params),
-                    "implements_types"      => first_str_vec(&m.implements_types),
-                    "catch_types"           => first_str_vec(&m.catch_types),
-                    _                       => EvalValue::Null,
+                    "enclosing_class" => opt_str(&m.enclosing_class),
+                    "extends_type" => opt_str(&m.extends_type),
+                    "label_target" => opt_str(&m.label_target),
+                    "is_interface" => EvalValue::Bool(m.is_interface),
+                    "is_enum" => EvalValue::Bool(m.is_enum),
+                    "is_record" => EvalValue::Bool(m.is_record),
+                    "is_abstract" => EvalValue::Bool(m.is_abstract),
+                    "is_final" => EvalValue::Bool(m.is_final),
+                    "is_sealed" => EvalValue::Bool(m.is_sealed),
+                    "is_anonymous" => EvalValue::Bool(m.is_anonymous),
+                    "is_static" => EvalValue::Bool(m.is_static),
+                    "is_synchronized" => EvalValue::Bool(m.is_synchronized),
+                    "is_native" => EvalValue::Bool(m.is_native),
+                    "is_varargs" => EvalValue::Bool(m.is_varargs),
+                    "is_virtual_dispatch" => EvalValue::Bool(m.is_virtual_dispatch),
+                    "is_this_call" => EvalValue::Bool(m.is_this_call),
+                    "is_super_call" => EvalValue::Bool(m.is_super_call),
+                    "is_static_import" => EvalValue::Bool(m.is_static_import),
+                    "has_finally" => EvalValue::Bool(m.has_finally),
+                    "access_modifiers" => first_str_vec(&m.access_modifiers),
+                    "annotations" => first_str_vec(&m.annotations),
+                    "throws_types" => first_str_vec(&m.throws_types),
+                    "generic_type_params" => first_str_vec(&m.generic_type_params),
+                    "implements_types" => first_str_vec(&m.implements_types),
+                    "catch_types" => first_str_vec(&m.catch_types),
+                    _ => EvalValue::Null,
                 }
             }
             "js" => {
@@ -1332,23 +1517,23 @@ impl<'a> RuleRunner<'a> {
                     return EvalValue::Null;
                 };
                 match field {
-                    "is_async"       => EvalValue::Bool(m.is_async),
-                    "is_generator"   => EvalValue::Bool(m.is_generator),
-                    "is_arrow"       => EvalValue::Bool(m.is_arrow),
+                    "is_async" => EvalValue::Bool(m.is_async),
+                    "is_generator" => EvalValue::Bool(m.is_generator),
+                    "is_arrow" => EvalValue::Bool(m.is_arrow),
                     "is_constructor" => EvalValue::Bool(m.is_constructor),
-                    "is_getter"      => EvalValue::Bool(m.is_getter),
-                    "is_setter"      => EvalValue::Bool(m.is_setter),
-                    "is_static"      => EvalValue::Bool(m.is_static),
-                    "is_private"     => EvalValue::Bool(m.is_private),
-                    "is_delegate"    => EvalValue::Bool(m.is_delegate),
-                    "is_for_of"      => EvalValue::Bool(m.is_for_of),
-                    "module_kind"    => opt_str(&m.module_kind),
-                    "scope_kind"     => opt_str(&m.scope_kind),
-                    "class_context"  => opt_str(&m.class_context),
-                    "export_kind"    => opt_str(&m.export_kind),
-                    "import_source"  => opt_str(&m.import_source),
+                    "is_getter" => EvalValue::Bool(m.is_getter),
+                    "is_setter" => EvalValue::Bool(m.is_setter),
+                    "is_static" => EvalValue::Bool(m.is_static),
+                    "is_private" => EvalValue::Bool(m.is_private),
+                    "is_delegate" => EvalValue::Bool(m.is_delegate),
+                    "is_for_of" => EvalValue::Bool(m.is_for_of),
+                    "module_kind" => opt_str(&m.module_kind),
+                    "scope_kind" => opt_str(&m.scope_kind),
+                    "class_context" => opt_str(&m.class_context),
+                    "export_kind" => opt_str(&m.export_kind),
+                    "import_source" => opt_str(&m.import_source),
                     "decorator_names" => first_str_vec(&m.decorator_names),
-                    _                => EvalValue::Null,
+                    _ => EvalValue::Null,
                 }
             }
             "ts" => {
@@ -1356,28 +1541,30 @@ impl<'a> RuleRunner<'a> {
                     return EvalValue::Null;
                 };
                 match field {
-                    "is_async"               => EvalValue::Bool(m.is_async),
-                    "is_abstract"            => EvalValue::Bool(m.is_abstract),
-                    "is_readonly"            => EvalValue::Bool(m.is_readonly),
-                    "is_optional"            => EvalValue::Bool(m.is_optional),
+                    "is_async" => EvalValue::Bool(m.is_async),
+                    "is_abstract" => EvalValue::Bool(m.is_abstract),
+                    "is_readonly" => EvalValue::Bool(m.is_readonly),
+                    "is_optional" => EvalValue::Bool(m.is_optional),
                     "is_definite_assignment" => EvalValue::Bool(m.is_definite_assignment),
-                    "is_ambient"             => EvalValue::Bool(m.is_ambient),
-                    "is_declare"             => EvalValue::Bool(m.is_declare),
-                    "is_override"            => EvalValue::Bool(m.is_override),
-                    "is_using"               => EvalValue::Bool(m.is_using),
-                    "enum_is_const"          => EvalValue::Bool(m.enum_is_const),
-                    "module_is_namespace"    => EvalValue::Bool(m.module_is_namespace),
-                    "access_modifier"        => opt_str(&m.access_modifier),
-                    "type_annotation"        => opt_str(&m.type_annotation),
-                    "extends_type"           => opt_str(&m.extends_type),
-                    "satisfies_type"         => opt_str(&m.satisfies_type),
-                    "decorator_names"        => first_str_vec(&m.decorator_names),
-                    "implements_types"       => first_str_vec(&m.implements_types),
-                    "type_arguments"         => first_str_vec(&m.type_arguments),
-                    "generic_constraints"    => m.generic_constraints.first()
+                    "is_ambient" => EvalValue::Bool(m.is_ambient),
+                    "is_declare" => EvalValue::Bool(m.is_declare),
+                    "is_override" => EvalValue::Bool(m.is_override),
+                    "is_using" => EvalValue::Bool(m.is_using),
+                    "enum_is_const" => EvalValue::Bool(m.enum_is_const),
+                    "module_is_namespace" => EvalValue::Bool(m.module_is_namespace),
+                    "access_modifier" => opt_str(&m.access_modifier),
+                    "type_annotation" => opt_str(&m.type_annotation),
+                    "extends_type" => opt_str(&m.extends_type),
+                    "satisfies_type" => opt_str(&m.satisfies_type),
+                    "decorator_names" => first_str_vec(&m.decorator_names),
+                    "implements_types" => first_str_vec(&m.implements_types),
+                    "type_arguments" => first_str_vec(&m.type_arguments),
+                    "generic_constraints" => m
+                        .generic_constraints
+                        .first()
                         .map(|(n, _)| EvalValue::Str(n.clone()))
                         .unwrap_or(EvalValue::Null),
-                    _                        => EvalValue::Null,
+                    _ => EvalValue::Null,
                 }
             }
             "rust" => {
@@ -1385,25 +1572,25 @@ impl<'a> RuleRunner<'a> {
                     return EvalValue::Null;
                 };
                 match field {
-                    "visibility"        => opt_str(&m.visibility),
-                    "abi"               => opt_str(&m.abi),
-                    "self_type"         => opt_str(&m.self_type),
-                    "trait_type"        => opt_str(&m.trait_type),
-                    "is_async"          => EvalValue::Bool(m.is_async),
-                    "is_unsafe"         => EvalValue::Bool(m.is_unsafe),
-                    "is_const"          => EvalValue::Bool(m.is_const),
-                    "is_extern"         => EvalValue::Bool(m.is_extern),
-                    "is_mut"            => EvalValue::Bool(m.is_mut),
-                    "is_move_closure"   => EvalValue::Bool(m.is_move_closure),
-                    "use_after_move"    => EvalValue::Bool(m.use_after_move),
+                    "visibility" => opt_str(&m.visibility),
+                    "abi" => opt_str(&m.abi),
+                    "self_type" => opt_str(&m.self_type),
+                    "trait_type" => opt_str(&m.trait_type),
+                    "is_async" => EvalValue::Bool(m.is_async),
+                    "is_unsafe" => EvalValue::Bool(m.is_unsafe),
+                    "is_const" => EvalValue::Bool(m.is_const),
+                    "is_extern" => EvalValue::Bool(m.is_extern),
+                    "is_mut" => EvalValue::Bool(m.is_mut),
+                    "is_move_closure" => EvalValue::Bool(m.is_move_closure),
+                    "use_after_move" => EvalValue::Bool(m.use_after_move),
                     "is_unsafe_context" => EvalValue::Bool(m.is_unsafe_context),
-                    "is_no_std"         => EvalValue::Bool(m.is_no_std),
-                    "derive_macros"     => first_str_vec(&m.derive_macros),
-                    "lifetimes"         => first_str_vec(&m.lifetimes),
-                    "generic_params"    => first_str_vec(&m.generic_params),
-                    "where_clauses"     => first_str_vec(&m.where_clauses),
-                    "trait_bounds"      => first_str_vec(&m.trait_bounds),
-                    _                   => EvalValue::Null,
+                    "is_no_std" => EvalValue::Bool(m.is_no_std),
+                    "derive_macros" => first_str_vec(&m.derive_macros),
+                    "lifetimes" => first_str_vec(&m.lifetimes),
+                    "generic_params" => first_str_vec(&m.generic_params),
+                    "where_clauses" => first_str_vec(&m.where_clauses),
+                    "trait_bounds" => first_str_vec(&m.trait_bounds),
+                    _ => EvalValue::Null,
                 }
             }
             _ => EvalValue::Null,
@@ -1490,7 +1677,9 @@ fn eval_value_of_literal(lit: &Literal) -> EvalValue {
         Literal::Str(s) => EvalValue::Str(s.clone()),
         Literal::Null => EvalValue::Null,
         Literal::List(items) => EvalValue::List(items.iter().map(eval_value_of_literal).collect()),
-        Literal::Regex(raw) => compile_wql_regex(raw).map(EvalValue::Regex).unwrap_or(EvalValue::Null),
+        Literal::Regex(raw) => compile_wql_regex(raw)
+            .map(EvalValue::Regex)
+            .unwrap_or(EvalValue::Null),
         _ => EvalValue::Null,
     }
 }
@@ -1510,7 +1699,9 @@ fn compare_values(lhs: &EvalValue, op: CmpOp, rhs: &EvalValue) -> bool {
             // Fall back to substring containment when the RHS is a plain string
             // (e.g. `text() in /pattern/`-style checks against a scalar), so
             // `in` still behaves sensibly outside of list-literal membership.
-            EvalValue::Str(s) => matches!(lhs, EvalValue::Str(needle) if s.contains(needle.as_str())),
+            EvalValue::Str(s) => {
+                matches!(lhs, EvalValue::Str(needle) if s.contains(needle.as_str()))
+            }
             _ => false,
         },
     }
@@ -1535,19 +1726,30 @@ fn numeric_cmp(a: &EvalValue, b: &EvalValue) -> Option<i64> {
 }
 
 fn eval_as_index(val: EvalValue) -> Option<usize> {
-    if let EvalValue::Int(i) = val { Some(i as usize) } else { None }
+    if let EvalValue::Int(i) = val {
+        Some(i as usize)
+    } else {
+        None
+    }
 }
 
 fn opt_str(s: &Option<String>) -> EvalValue {
-    s.as_deref().map(|v| EvalValue::Str(v.to_owned())).unwrap_or(EvalValue::Null)
+    s.as_deref()
+        .map(|v| EvalValue::Str(v.to_owned()))
+        .unwrap_or(EvalValue::Null)
 }
 
 fn first_str(v: &Option<Vec<String>>) -> EvalValue {
-    v.as_ref().and_then(|list| list.first()).map(|s| EvalValue::Str(s.clone())).unwrap_or(EvalValue::Null)
+    v.as_ref()
+        .and_then(|list| list.first())
+        .map(|s| EvalValue::Str(s.clone()))
+        .unwrap_or(EvalValue::Null)
 }
 
 fn first_str_vec(v: &[String]) -> EvalValue {
-    v.first().map(|s| EvalValue::Str(s.clone())).unwrap_or(EvalValue::Null)
+    v.first()
+        .map(|s| EvalValue::Str(s.clone()))
+        .unwrap_or(EvalValue::Null)
 }
 
 // ── Symbolic / path-sensitive helpers ────────────────────────────────────────
@@ -1570,13 +1772,18 @@ fn find_enclosing_condition(cpg: &Cpg, start: NodeId, targets: &[IrNodeKind]) ->
         };
         if targets.contains(&node.kind) {
             // Find "condition" field child
-            let cond = node.children.iter().enumerate().find_map(|(i, &cid)| {
-                if node.field_names.get(i).and_then(|f| f.as_deref()) == Some("condition") {
-                    Some(cid)
-                } else {
-                    None
-                }
-            }).or_else(|| node.children.first().copied());
+            let cond = node
+                .children
+                .iter()
+                .enumerate()
+                .find_map(|(i, &cid)| {
+                    if node.field_names.get(i).and_then(|f| f.as_deref()) == Some("condition") {
+                        Some(cid)
+                    } else {
+                        None
+                    }
+                })
+                .or_else(|| node.children.first().copied());
             return cond.map(EvalValue::Node).unwrap_or(EvalValue::Null);
         }
         match node.parent_id {
@@ -1594,7 +1801,11 @@ fn guard_const_eval(cpg: &Cpg, node_id: NodeId) -> Option<bool> {
     let cond_val = find_enclosing_condition(
         cpg,
         node_id,
-        &[IrNodeKind::Conditional, IrNodeKind::Loop, IrNodeKind::Switch],
+        &[
+            IrNodeKind::Conditional,
+            IrNodeKind::Loop,
+            IrNodeKind::Switch,
+        ],
     );
     let cond_id = match cond_val {
         EvalValue::Node(id) => id,
@@ -1626,7 +1837,10 @@ pub(crate) fn resolve_var_declaration(cpg: &Cpg, node_id: NodeId, node: &IrNode)
         if id == node_id {
             continue;
         }
-        if !matches!(n.kind, IrNodeKind::LocalDef | IrNodeKind::ParamDef | IrNodeKind::FieldDef) {
+        if !matches!(
+            n.kind,
+            IrNodeKind::LocalDef | IrNodeKind::ParamDef | IrNodeKind::FieldDef
+        ) {
             continue;
         }
         // `.name` isn't reliably populated for every LocalDef shape (e.g. a
@@ -1656,7 +1870,10 @@ pub(crate) fn resolve_var_declaration(cpg: &Cpg, node_id: NodeId, node: &IrNode)
 fn collect_param_nodes(cpg: &Cpg, fn_node: &IrNode) -> Vec<NodeId> {
     let mut params: Vec<NodeId> = Vec::new();
     for &cid in &fn_node.children {
-        let child = match cpg.ast.get(&cid) { Some(c) => c, None => continue };
+        let child = match cpg.ast.get(&cid) {
+            Some(c) => c,
+            None => continue,
+        };
         if child.kind == IrNodeKind::ParamDef {
             params.push(cid);
         } else if matches!(
@@ -1664,7 +1881,11 @@ fn collect_param_nodes(cpg: &Cpg, fn_node: &IrNode) -> Vec<NodeId> {
             "parameter_list" | "formal_parameters" | "parameters"
         ) {
             for &gcid in &child.children {
-                if cpg.ast.get(&gcid).map_or(false, |g| g.kind == IrNodeKind::ParamDef) {
+                if cpg
+                    .ast
+                    .get(&gcid)
+                    .map_or(false, |g| g.kind == IrNodeKind::ParamDef)
+                {
                     params.push(gcid);
                 }
             }
@@ -1674,7 +1895,11 @@ fn collect_param_nodes(cpg: &Cpg, fn_node: &IrNode) -> Vec<NodeId> {
                 if let Some(gc) = cpg.ast.get(&gcid) {
                     if gc.node_type == "parameter_list" {
                         for &ggcid in &gc.children {
-                            if cpg.ast.get(&ggcid).map_or(false, |g| g.kind == IrNodeKind::ParamDef) {
+                            if cpg
+                                .ast
+                                .get(&ggcid)
+                                .map_or(false, |g| g.kind == IrNodeKind::ParamDef)
+                            {
                                 params.push(ggcid);
                             }
                         }
@@ -1693,10 +1918,18 @@ fn collect_param_nodes(cpg: &Cpg, fn_node: &IrNode) -> Vec<NodeId> {
 /// Returns true for a `parameter_declaration` node that is the C `(void)` sentinel,
 /// meaning the function takes no arguments (as opposed to an unprototyped `()`).
 fn is_c_void_param(cpg: &Cpg, param_id: NodeId) -> bool {
-    let Some(node) = cpg.ast.get(&param_id) else { return false };
-    if node.node_type != "parameter_declaration" { return false }
-    if node.name.is_some() { return false }
-    let type_children: Vec<_> = node.children.iter()
+    let Some(node) = cpg.ast.get(&param_id) else {
+        return false;
+    };
+    if node.node_type != "parameter_declaration" {
+        return false;
+    }
+    if node.name.is_some() {
+        return false;
+    }
+    let type_children: Vec<_> = node
+        .children
+        .iter()
         .filter_map(|&cid| cpg.ast.get(&cid))
         .filter(|c| c.node_type != "," && !c.node_type.starts_with('*'))
         .collect();
@@ -1719,7 +1952,9 @@ fn candidates_for_binding(kind_index: &KindIndex, binding: &RootBinding) -> Vec<
 }
 
 fn rule_applies_to_language(rule: &CompiledRule, lang: &str) -> bool {
-    let Some(langs) = &rule.languages else { return true };
+    let Some(langs) = &rule.languages else {
+        return true;
+    };
     langs.iter().any(|l| l.to_string() == lang)
 }
 

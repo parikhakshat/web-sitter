@@ -1,6 +1,6 @@
+use crate::ast::Severity;
 use serde::{Deserialize, Serialize};
 use web_sitter::NodeId;
-use crate::ast::Severity;
 
 /// The source location of a finding.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

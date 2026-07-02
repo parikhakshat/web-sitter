@@ -37,15 +37,26 @@ impl DfgIndex {
         let mut var_edges: HashMap<String, Vec<(NodeId, NodeId)>> = HashMap::new();
 
         for edge in &cpg.dataflow.edges {
-            forward.entry(edge.source).or_default().push(edge.destination);
-            backward.entry(edge.destination).or_default().push(edge.source);
+            forward
+                .entry(edge.source)
+                .or_default()
+                .push(edge.destination);
+            backward
+                .entry(edge.destination)
+                .or_default()
+                .push(edge.source);
             var_edges
                 .entry(edge.variable.clone())
                 .or_default()
                 .push((edge.source, edge.destination));
         }
 
-        Self { forward, backward, var_edges, reach_cache: RwLock::new(HashMap::new()) }
+        Self {
+            forward,
+            backward,
+            var_edges,
+            reach_cache: RwLock::new(HashMap::new()),
+        }
     }
 
     /// True if `node` is a definition site for `var_name` (it is a source of a DFG edge for that variable).
@@ -101,7 +112,10 @@ impl DfgIndex {
             // Rough per-entry footprint: one NodeId (u32) per visited node, plus
             // the HashSet's own bucket overhead — good enough for cache accounting,
             // not meant to be exact.
-            prof::cache_insert("dfg.reach_cache", (visited.len() * std::mem::size_of::<NodeId>()) as u64);
+            prof::cache_insert(
+                "dfg.reach_cache",
+                (visited.len() * std::mem::size_of::<NodeId>()) as u64,
+            );
             cache.insert(source, visited.clone());
         }
         visited
@@ -251,7 +265,13 @@ impl DfgIndex {
             }
         }
 
-        prof::count("dfg.propagate_taint_bfs.nodes_tainted", tainted.len() as u64);
-        TaintResult { tainted, sanitized_at }
+        prof::count(
+            "dfg.propagate_taint_bfs.nodes_tainted",
+            tainted.len() as u64,
+        );
+        TaintResult {
+            tainted,
+            sanitized_at,
+        }
     }
 }

@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use crate::lexer::Span;
+use serde::{Deserialize, Serialize};
 
 // ── Top-level ─────────────────────────────────────────────────────────────────
 
@@ -285,7 +285,7 @@ pub enum CmpOp {
     Gt,
     Le,
     Ge,
-    In,    // `in ["a", "b"]`  or  `in set_expr`
+    In, // `in ["a", "b"]`  or  `in set_expr`
 }
 
 /// Inline structural pattern used with `matches`:

@@ -33,50 +33,47 @@
 /// The C and C++ tables are the authoritative `web_sitter::security_patterns`
 /// tables (which hold thousands of C/POSIX/Windows/C++ entries).  They are
 /// re-exported here so callers need only this crate.
-
 pub mod c;
 pub mod cpp;
+pub mod go;
 pub mod java;
 pub mod javascript;
-pub mod typescript;
-pub mod go;
 pub mod rust;
+pub mod typescript;
 
 // ── Re-export the spec types so consumers use a single import path ─────────
-pub use web_sitter::security_patterns::{
-    AllocSpec, PropagatorSpec, SinkSpec, SourceSpec,
-};
+pub use web_sitter::security_patterns::{AllocSpec, PropagatorSpec, SinkSpec, SourceSpec};
 
 // ── Re-export C/C++ canonical helper functions ─────────────────────────────
 pub use c::{
-    c_get_propagator,
-    c_get_source_spec,
-    c_get_sink_spec,
-    c_get_alloc_spec,
-    c_is_known_stdlib,
-    c_is_string_dup_op,
-    c_is_bounded_copy_op,
-    c_is_dealloc_or_assert,
-    c_builtin_sets,
+    BUILTIN_SET_ALLOC_OPS,
+    BUILTIN_SET_BOUNDED_COPY_OPS,
     // Named constant sets
     BUILTIN_SET_C_IO_SOURCES,
-    BUILTIN_SET_FILE_OPS,
-    BUILTIN_SET_EXEC_OPS,
-    BUILTIN_SET_ALLOC_OPS,
-    BUILTIN_SET_STRING_COPY_OPS,
-    BUILTIN_SET_PATH_SANITIZERS,
     BUILTIN_SET_COMMAND_SANITIZERS,
+    BUILTIN_SET_EXEC_OPS,
+    BUILTIN_SET_FILE_OPS,
+    BUILTIN_SET_PATH_SANITIZERS,
+    BUILTIN_SET_STRING_COPY_OPS,
     BUILTIN_SET_STRING_DUP_OPS,
-    BUILTIN_SET_BOUNDED_COPY_OPS,
-    NORETURN_FUNCTIONS,
-    FREE_FUNCTIONS,
     DEALLOC_OR_ASSERT_CALLS,
-    PRIVILEGE_FUNCTIONS,
-    RESOURCE_OPENERS,
-    RESOURCE_CLOSERS,
-    STRING_TO_INT_FUNCTIONS,
+    FREE_FUNCTIONS,
     MISC_STDLIB,
+    NORETURN_FUNCTIONS,
+    PRIVILEGE_FUNCTIONS,
     PTHREAD_FUNCTIONS,
+    RESOURCE_CLOSERS,
+    RESOURCE_OPENERS,
+    STRING_TO_INT_FUNCTIONS,
+    c_builtin_sets,
+    c_get_alloc_spec,
+    c_get_propagator,
+    c_get_sink_spec,
+    c_get_source_spec,
+    c_is_bounded_copy_op,
+    c_is_dealloc_or_assert,
+    c_is_known_stdlib,
+    c_is_string_dup_op,
 };
 
 use std::collections::{BTreeMap, HashMap};
@@ -117,7 +114,11 @@ fn callee_names_by_node(cpg: &web_sitter::Cpg) -> HashMap<web_sitter::NodeId, St
 /// `argument_list`/`arguments` container child most languages wrap arguments
 /// in (falling back to the call node's direct children for shapes that
 /// don't). Mirrors the `arg()` node method in `engine.rs`.
-fn call_arg_node(cpg: &web_sitter::Cpg, call_id: web_sitter::NodeId, idx: usize) -> Option<web_sitter::NodeId> {
+fn call_arg_node(
+    cpg: &web_sitter::Cpg,
+    call_id: web_sitter::NodeId,
+    idx: usize,
+) -> Option<web_sitter::NodeId> {
     let node = cpg.ast.get(&call_id)?;
     let arg_id = node.children.iter().find_map(|&cid| {
         let child = cpg.ast.get(&cid)?;
@@ -197,32 +198,33 @@ static ALL_SINK_MAP: LazyLock<std::collections::HashMap<&'static str, &'static S
 
 // ── Propagators ───────────────────────────────────────────────────────────────
 
-static ALL_PROPAGATOR_MAP: LazyLock<std::collections::HashMap<&'static str, &'static PropagatorSpec>> =
-    LazyLock::new(|| {
-        let mut m = std::collections::HashMap::new();
-        for (name, spec) in c::C_TAINT_PROPAGATORS.iter() {
-            m.insert(*name, spec);
-        }
-        for (name, spec) in cpp::CPP_TAINT_PROPAGATORS.iter() {
-            m.insert(*name, spec);
-        }
-        for (name, spec) in java::JAVA_TAINT_PROPAGATORS.iter() {
-            m.insert(*name, spec);
-        }
-        for (name, spec) in javascript::JS_TAINT_PROPAGATORS.iter() {
-            m.insert(*name, spec);
-        }
-        for (name, spec) in typescript::TS_TAINT_PROPAGATORS.iter() {
-            m.insert(*name, spec);
-        }
-        for (name, spec) in go::GO_TAINT_PROPAGATORS.iter() {
-            m.insert(*name, spec);
-        }
-        for (name, spec) in rust::RUST_TAINT_PROPAGATORS.iter() {
-            m.insert(*name, spec);
-        }
-        m
-    });
+static ALL_PROPAGATOR_MAP: LazyLock<
+    std::collections::HashMap<&'static str, &'static PropagatorSpec>,
+> = LazyLock::new(|| {
+    let mut m = std::collections::HashMap::new();
+    for (name, spec) in c::C_TAINT_PROPAGATORS.iter() {
+        m.insert(*name, spec);
+    }
+    for (name, spec) in cpp::CPP_TAINT_PROPAGATORS.iter() {
+        m.insert(*name, spec);
+    }
+    for (name, spec) in java::JAVA_TAINT_PROPAGATORS.iter() {
+        m.insert(*name, spec);
+    }
+    for (name, spec) in javascript::JS_TAINT_PROPAGATORS.iter() {
+        m.insert(*name, spec);
+    }
+    for (name, spec) in typescript::TS_TAINT_PROPAGATORS.iter() {
+        m.insert(*name, spec);
+    }
+    for (name, spec) in go::GO_TAINT_PROPAGATORS.iter() {
+        m.insert(*name, spec);
+    }
+    for (name, spec) in rust::RUST_TAINT_PROPAGATORS.iter() {
+        m.insert(*name, spec);
+    }
+    m
+});
 
 // =============================================================================
 // Per-language lookup helpers
@@ -244,12 +246,12 @@ pub enum Language {
 /// Prefer [`get_source_spec`] for cross-language lookups.
 pub fn get_source_spec_for(name: &str, lang: Language) -> Option<&'static SourceSpec> {
     let table: &[(&str, SourceSpec)] = match lang {
-        Language::C | Language::Cpp  => c::C_TAINT_SOURCES,
-        Language::Java               => java::JAVA_TAINT_SOURCES,
-        Language::JavaScript         => javascript::JS_TAINT_SOURCES,
-        Language::TypeScript         => typescript::TS_TAINT_SOURCES,
-        Language::Go                 => go::GO_TAINT_SOURCES,
-        Language::Rust               => rust::RUST_TAINT_SOURCES,
+        Language::C | Language::Cpp => c::C_TAINT_SOURCES,
+        Language::Java => java::JAVA_TAINT_SOURCES,
+        Language::JavaScript => javascript::JS_TAINT_SOURCES,
+        Language::TypeScript => typescript::TS_TAINT_SOURCES,
+        Language::Go => go::GO_TAINT_SOURCES,
+        Language::Rust => rust::RUST_TAINT_SOURCES,
     };
     table.iter().find(|(n, _)| *n == name).map(|(_, s)| s)
 }
@@ -257,12 +259,12 @@ pub fn get_source_spec_for(name: &str, lang: Language) -> Option<&'static Source
 /// Returns the [`SinkSpec`] for `name` in the given `language` table only.
 pub fn get_sink_spec_for(name: &str, lang: Language) -> Option<&'static SinkSpec> {
     let table: &[(&str, SinkSpec)] = match lang {
-        Language::C | Language::Cpp  => c::C_TAINT_SINKS,
-        Language::Java               => java::JAVA_TAINT_SINKS,
-        Language::JavaScript         => javascript::JS_TAINT_SINKS,
-        Language::TypeScript         => typescript::TS_TAINT_SINKS,
-        Language::Go                 => go::GO_TAINT_SINKS,
-        Language::Rust               => rust::RUST_TAINT_SINKS,
+        Language::C | Language::Cpp => c::C_TAINT_SINKS,
+        Language::Java => java::JAVA_TAINT_SINKS,
+        Language::JavaScript => javascript::JS_TAINT_SINKS,
+        Language::TypeScript => typescript::TS_TAINT_SINKS,
+        Language::Go => go::GO_TAINT_SINKS,
+        Language::Rust => rust::RUST_TAINT_SINKS,
     };
     table.iter().find(|(n, _)| *n == name).map(|(_, s)| s)
 }
@@ -270,12 +272,12 @@ pub fn get_sink_spec_for(name: &str, lang: Language) -> Option<&'static SinkSpec
 /// Returns the [`PropagatorSpec`] for `name` in the given `language` table only.
 pub fn get_propagator_for(name: &str, lang: Language) -> Option<&'static PropagatorSpec> {
     let table: &[(&str, PropagatorSpec)] = match lang {
-        Language::C | Language::Cpp  => c::C_TAINT_PROPAGATORS,
-        Language::Java               => java::JAVA_TAINT_PROPAGATORS,
-        Language::JavaScript         => javascript::JS_TAINT_PROPAGATORS,
-        Language::TypeScript         => typescript::TS_TAINT_PROPAGATORS,
-        Language::Go                 => go::GO_TAINT_PROPAGATORS,
-        Language::Rust               => rust::RUST_TAINT_PROPAGATORS,
+        Language::C | Language::Cpp => c::C_TAINT_PROPAGATORS,
+        Language::Java => java::JAVA_TAINT_PROPAGATORS,
+        Language::JavaScript => javascript::JS_TAINT_PROPAGATORS,
+        Language::TypeScript => typescript::TS_TAINT_PROPAGATORS,
+        Language::Go => go::GO_TAINT_PROPAGATORS,
+        Language::Rust => rust::RUST_TAINT_PROPAGATORS,
     };
     table.iter().find(|(n, _)| *n == name).map(|(_, s)| s)
 }
@@ -345,82 +347,98 @@ pub fn builtin_sets() -> BTreeMap<String, Vec<String>> {
     }
 
     // ── C / POSIX / Windows ───────────────────────────────────────────────────
-    insert_set!("c", "io_sources",          BUILTIN_SET_C_IO_SOURCES);
-    insert_set!("c", "file_ops",            BUILTIN_SET_FILE_OPS);
-    insert_set!("c", "exec_ops",            BUILTIN_SET_EXEC_OPS);
-    insert_set!("c", "alloc_ops",           BUILTIN_SET_ALLOC_OPS);
-    insert_set!("c", "string_copy_ops",     BUILTIN_SET_STRING_COPY_OPS);
-    insert_set!("c", "path_sanitizers",     BUILTIN_SET_PATH_SANITIZERS);
-    insert_set!("c", "command_sanitizers",  BUILTIN_SET_COMMAND_SANITIZERS);
-    insert_set!("c", "string_dup_ops",      BUILTIN_SET_STRING_DUP_OPS);
-    insert_set!("c", "bounded_copy_ops",    BUILTIN_SET_BOUNDED_COPY_OPS);
-    insert_set!("c", "noreturn",            NORETURN_FUNCTIONS);
-    insert_set!("c", "free_functions",      FREE_FUNCTIONS);
-    insert_set!("c", "dealloc_or_assert",   DEALLOC_OR_ASSERT_CALLS);
-    insert_set!("c", "privilege",           PRIVILEGE_FUNCTIONS);
-    insert_set!("c", "resource_openers",    RESOURCE_OPENERS);
-    insert_set!("c", "resource_closers",    RESOURCE_CLOSERS);
-    insert_set!("c", "string_to_int",       STRING_TO_INT_FUNCTIONS);
-    insert_set!("c", "misc_stdlib",         MISC_STDLIB);
-    insert_set!("c", "pthread",             PTHREAD_FUNCTIONS);
+    insert_set!("c", "io_sources", BUILTIN_SET_C_IO_SOURCES);
+    insert_set!("c", "file_ops", BUILTIN_SET_FILE_OPS);
+    insert_set!("c", "exec_ops", BUILTIN_SET_EXEC_OPS);
+    insert_set!("c", "alloc_ops", BUILTIN_SET_ALLOC_OPS);
+    insert_set!("c", "string_copy_ops", BUILTIN_SET_STRING_COPY_OPS);
+    insert_set!("c", "path_sanitizers", BUILTIN_SET_PATH_SANITIZERS);
+    insert_set!("c", "command_sanitizers", BUILTIN_SET_COMMAND_SANITIZERS);
+    insert_set!("c", "string_dup_ops", BUILTIN_SET_STRING_DUP_OPS);
+    insert_set!("c", "bounded_copy_ops", BUILTIN_SET_BOUNDED_COPY_OPS);
+    insert_set!("c", "noreturn", NORETURN_FUNCTIONS);
+    insert_set!("c", "free_functions", FREE_FUNCTIONS);
+    insert_set!("c", "dealloc_or_assert", DEALLOC_OR_ASSERT_CALLS);
+    insert_set!("c", "privilege", PRIVILEGE_FUNCTIONS);
+    insert_set!("c", "resource_openers", RESOURCE_OPENERS);
+    insert_set!("c", "resource_closers", RESOURCE_CLOSERS);
+    insert_set!("c", "string_to_int", STRING_TO_INT_FUNCTIONS);
+    insert_set!("c", "misc_stdlib", MISC_STDLIB);
+    insert_set!("c", "pthread", PTHREAD_FUNCTIONS);
 
     // ── C++ ───────────────────────────────────────────────────────────────────
-    insert_set!("cpp", "format_sinks",      cpp::CPP_FORMAT_SINKS);
-    insert_set!("cpp", "exec_ops",          cpp::CPP_EXEC_OPS);
+    insert_set!("cpp", "format_sinks", cpp::CPP_FORMAT_SINKS);
+    insert_set!("cpp", "exec_ops", cpp::CPP_EXEC_OPS);
 
     // ── Java ──────────────────────────────────────────────────────────────────
-    insert_set!("java", "http_sources",         java::JAVA_HTTP_SOURCES);
-    insert_set!("java", "sql_sinks",            java::JAVA_SQL_SINKS);
-    insert_set!("java", "exec_sinks",           java::JAVA_EXEC_SINKS);
-    insert_set!("java", "reflection_sinks",     java::JAVA_REFLECTION_SINKS);
-    insert_set!("java", "deserialization_sources", java::JAVA_DESERIALIZATION_SOURCES);
-    insert_set!("java", "http_response_sinks",  java::JAVA_HTTP_RESPONSE_SINKS);
-    insert_set!("java", "log_sinks",            java::JAVA_LOG_SINKS);
-    insert_set!("java", "jndi_sinks",           java::JAVA_JNDI_SINKS);
-    insert_set!("java", "xpath_sinks",          java::JAVA_XPATH_SINKS);
-    insert_set!("java", "ldap_sinks",           java::JAVA_LDAP_SINKS);
-    insert_set!("java", "xxe_sinks",            java::JAVA_XXE_SINKS);
-    insert_set!("java", "template_sinks",       java::JAVA_TEMPLATE_SINKS);
-    insert_set!("java", "ssrf_sinks",           java::JAVA_SSRF_SINKS);
+    insert_set!("java", "http_sources", java::JAVA_HTTP_SOURCES);
+    insert_set!("java", "sql_sinks", java::JAVA_SQL_SINKS);
+    insert_set!("java", "exec_sinks", java::JAVA_EXEC_SINKS);
+    insert_set!("java", "reflection_sinks", java::JAVA_REFLECTION_SINKS);
+    insert_set!(
+        "java",
+        "deserialization_sources",
+        java::JAVA_DESERIALIZATION_SOURCES
+    );
+    insert_set!(
+        "java",
+        "http_response_sinks",
+        java::JAVA_HTTP_RESPONSE_SINKS
+    );
+    insert_set!("java", "log_sinks", java::JAVA_LOG_SINKS);
+    insert_set!("java", "jndi_sinks", java::JAVA_JNDI_SINKS);
+    insert_set!("java", "xpath_sinks", java::JAVA_XPATH_SINKS);
+    insert_set!("java", "ldap_sinks", java::JAVA_LDAP_SINKS);
+    insert_set!("java", "xxe_sinks", java::JAVA_XXE_SINKS);
+    insert_set!("java", "template_sinks", java::JAVA_TEMPLATE_SINKS);
+    insert_set!("java", "ssrf_sinks", java::JAVA_SSRF_SINKS);
 
     // ── JavaScript ────────────────────────────────────────────────────────────
-    insert_set!("js", "dom_xss_sinks",      javascript::JS_DOM_XSS_SINKS);
-    insert_set!("js", "exec_sinks",         javascript::JS_EXEC_SINKS);
-    insert_set!("js", "file_write_sinks",   javascript::JS_FILE_WRITE_SINKS);
-    insert_set!("js", "db_sinks",           javascript::JS_DB_SINKS);
-    insert_set!("js", "ssrf_sinks",         javascript::JS_SSRF_SINKS);
-    insert_set!("js", "eval_sinks",         javascript::JS_EVAL_SINKS);
-    insert_set!("js", "template_sinks",     javascript::JS_TEMPLATE_SINKS);
-    insert_set!("js", "redirect_sinks",     javascript::JS_REDIRECT_SINKS);
-    insert_set!("js", "deserialization_sinks", javascript::JS_DESERIALIZATION_SINKS);
-    insert_set!("js", "ldap_sinks",         javascript::JS_LDAP_SINKS);
-    insert_set!("js", "vm_sinks",           javascript::JS_VM_SINKS);
+    insert_set!("js", "dom_xss_sinks", javascript::JS_DOM_XSS_SINKS);
+    insert_set!("js", "exec_sinks", javascript::JS_EXEC_SINKS);
+    insert_set!("js", "file_write_sinks", javascript::JS_FILE_WRITE_SINKS);
+    insert_set!("js", "db_sinks", javascript::JS_DB_SINKS);
+    insert_set!("js", "ssrf_sinks", javascript::JS_SSRF_SINKS);
+    insert_set!("js", "eval_sinks", javascript::JS_EVAL_SINKS);
+    insert_set!("js", "template_sinks", javascript::JS_TEMPLATE_SINKS);
+    insert_set!("js", "redirect_sinks", javascript::JS_REDIRECT_SINKS);
+    insert_set!(
+        "js",
+        "deserialization_sinks",
+        javascript::JS_DESERIALIZATION_SINKS
+    );
+    insert_set!("js", "ldap_sinks", javascript::JS_LDAP_SINKS);
+    insert_set!("js", "vm_sinks", javascript::JS_VM_SINKS);
 
     // ── TypeScript ────────────────────────────────────────────────────────────
-    insert_set!("ts", "typeorm_sinks",      typescript::TS_TYPEORM_SINKS);
-    insert_set!("ts", "prisma_raw_sinks",   typescript::TS_PRISMA_RAW_SINKS);
-    insert_set!("ts", "angular_bypass_sinks", typescript::TS_ANGULAR_BYPASS_SINKS);
-    insert_set!("ts", "nestjs_sources",     typescript::TS_NESTJS_SOURCES);
+    insert_set!("ts", "typeorm_sinks", typescript::TS_TYPEORM_SINKS);
+    insert_set!("ts", "prisma_raw_sinks", typescript::TS_PRISMA_RAW_SINKS);
+    insert_set!(
+        "ts",
+        "angular_bypass_sinks",
+        typescript::TS_ANGULAR_BYPASS_SINKS
+    );
+    insert_set!("ts", "nestjs_sources", typescript::TS_NESTJS_SOURCES);
 
     // ── Go ────────────────────────────────────────────────────────────────────
-    insert_set!("go", "exec_sinks",         go::GO_EXEC_SINKS);
-    insert_set!("go", "sql_sinks",          go::GO_SQL_SINKS);
-    insert_set!("go", "file_sinks",         go::GO_FILE_SINKS);
-    insert_set!("go", "net_sinks",          go::GO_NET_SINKS);
-    insert_set!("go", "http_response_sinks",go::GO_HTTP_RESPONSE_SINKS);
-    insert_set!("go", "template_sinks",     go::GO_TEMPLATE_SINKS);
-    insert_set!("go", "env_sources",        go::GO_ENV_SOURCES);
+    insert_set!("go", "exec_sinks", go::GO_EXEC_SINKS);
+    insert_set!("go", "sql_sinks", go::GO_SQL_SINKS);
+    insert_set!("go", "file_sinks", go::GO_FILE_SINKS);
+    insert_set!("go", "net_sinks", go::GO_NET_SINKS);
+    insert_set!("go", "http_response_sinks", go::GO_HTTP_RESPONSE_SINKS);
+    insert_set!("go", "template_sinks", go::GO_TEMPLATE_SINKS);
+    insert_set!("go", "env_sources", go::GO_ENV_SOURCES);
     insert_set!("go", "http_request_sources", go::GO_HTTP_REQUEST_SOURCES);
-    insert_set!("go", "read_sources",       go::GO_READ_SOURCES);
-    insert_set!("go", "flag_sources",       go::GO_FLAG_SOURCES);
+    insert_set!("go", "read_sources", go::GO_READ_SOURCES);
+    insert_set!("go", "flag_sources", go::GO_FLAG_SOURCES);
 
     // ── Rust ──────────────────────────────────────────────────────────────────
-    insert_set!("rust", "exec_sinks",       rust::RUST_EXEC_SINKS);
-    insert_set!("rust", "file_sinks",       rust::RUST_FILE_SINKS);
-    insert_set!("rust", "net_sinks",        rust::RUST_NET_SINKS);
-    insert_set!("rust", "db_sinks",         rust::RUST_DB_SINKS);
-    insert_set!("rust", "env_sources",      rust::RUST_ENV_SOURCES);
-    insert_set!("rust", "io_sources",       rust::RUST_IO_SOURCES);
+    insert_set!("rust", "exec_sinks", rust::RUST_EXEC_SINKS);
+    insert_set!("rust", "file_sinks", rust::RUST_FILE_SINKS);
+    insert_set!("rust", "net_sinks", rust::RUST_NET_SINKS);
+    insert_set!("rust", "db_sinks", rust::RUST_DB_SINKS);
+    insert_set!("rust", "env_sources", rust::RUST_ENV_SOURCES);
+    insert_set!("rust", "io_sources", rust::RUST_IO_SOURCES);
 
     // Also merge the C builtin_sets map under the "c" namespace
     for (k, v) in c_builtin_sets() {
@@ -487,10 +505,13 @@ pub fn builtin_endpoint_registry() -> crate::taint::EndpointRegistry {
             let set: &'static [&'static str] = $set;
             $registry.register($name, move |cpg| {
                 let call_names = callee_names_by_node(cpg);
-                cpg.ast.iter()
+                cpg.ast
+                    .iter()
                     .filter(|(id, n)| {
-                        n.kind == IrNodeKind::Call &&
-                        call_names.get(id).map_or(false, |nm| set.contains(&nm.as_str()))
+                        n.kind == IrNodeKind::Call
+                            && call_names
+                                .get(id)
+                                .map_or(false, |nm| set.contains(&nm.as_str()))
                     })
                     .map(|(id, _)| *id)
                     .collect()
@@ -523,7 +544,9 @@ pub fn builtin_endpoint_registry() -> crate::taint::EndpointRegistry {
                     if n.kind != IrNodeKind::Call {
                         continue;
                     }
-                    let Some(callee) = call_names.get(id) else { continue };
+                    let Some(callee) = call_names.get(id) else {
+                        continue;
+                    };
                     if !set.contains(&callee.as_str()) {
                         continue;
                     }
@@ -558,24 +581,28 @@ pub fn builtin_endpoint_registry() -> crate::taint::EndpointRegistry {
     }
 
     // ── C / POSIX / Windows ──────────────────────────────────────────────────
-    reg_source!(registry, "c.io_sources",         BUILTIN_SET_C_IO_SOURCES);
-    reg_sink!(  registry, "c.exec_ops",           BUILTIN_SET_EXEC_OPS);
-    reg_sink!(  registry, "c.file_ops",           BUILTIN_SET_FILE_OPS);
-    reg_sink!(  registry, "c.alloc_ops",          BUILTIN_SET_ALLOC_OPS);
-    reg_sink!(  registry, "c.string_copy_ops",    BUILTIN_SET_STRING_COPY_OPS);
-    reg_source!(registry, "c.string_dup_ops",     BUILTIN_SET_STRING_DUP_OPS);
-    reg_sink!(  registry, "c.bounded_copy_ops",   BUILTIN_SET_BOUNDED_COPY_OPS);
-    reg_source!(registry, "c.path_sanitizers",    BUILTIN_SET_PATH_SANITIZERS);
-    reg_source!(registry, "c.command_sanitizers", BUILTIN_SET_COMMAND_SANITIZERS);
-    reg_sink!(  registry, "c.free_functions",     FREE_FUNCTIONS);
-    reg_sink!(  registry, "c.dealloc_or_assert",  DEALLOC_OR_ASSERT_CALLS);
-    reg_source!(registry, "c.noreturn",           NORETURN_FUNCTIONS);
-    reg_source!(registry, "c.misc_stdlib",        MISC_STDLIB);
-    reg_source!(registry, "c.pthread",            PTHREAD_FUNCTIONS);
-    reg_source!(registry, "c.resource_openers",   RESOURCE_OPENERS);
-    reg_sink!(  registry, "c.resource_closers",   RESOURCE_CLOSERS);
-    reg_source!(registry, "c.string_to_int",      STRING_TO_INT_FUNCTIONS);
-    reg_source!(registry, "c.privilege",          PRIVILEGE_FUNCTIONS);
+    reg_source!(registry, "c.io_sources", BUILTIN_SET_C_IO_SOURCES);
+    reg_sink!(registry, "c.exec_ops", BUILTIN_SET_EXEC_OPS);
+    reg_sink!(registry, "c.file_ops", BUILTIN_SET_FILE_OPS);
+    reg_sink!(registry, "c.alloc_ops", BUILTIN_SET_ALLOC_OPS);
+    reg_sink!(registry, "c.string_copy_ops", BUILTIN_SET_STRING_COPY_OPS);
+    reg_source!(registry, "c.string_dup_ops", BUILTIN_SET_STRING_DUP_OPS);
+    reg_sink!(registry, "c.bounded_copy_ops", BUILTIN_SET_BOUNDED_COPY_OPS);
+    reg_source!(registry, "c.path_sanitizers", BUILTIN_SET_PATH_SANITIZERS);
+    reg_source!(
+        registry,
+        "c.command_sanitizers",
+        BUILTIN_SET_COMMAND_SANITIZERS
+    );
+    reg_sink!(registry, "c.free_functions", FREE_FUNCTIONS);
+    reg_sink!(registry, "c.dealloc_or_assert", DEALLOC_OR_ASSERT_CALLS);
+    reg_source!(registry, "c.noreturn", NORETURN_FUNCTIONS);
+    reg_source!(registry, "c.misc_stdlib", MISC_STDLIB);
+    reg_source!(registry, "c.pthread", PTHREAD_FUNCTIONS);
+    reg_source!(registry, "c.resource_openers", RESOURCE_OPENERS);
+    reg_sink!(registry, "c.resource_closers", RESOURCE_CLOSERS);
+    reg_source!(registry, "c.string_to_int", STRING_TO_INT_FUNCTIONS);
+    reg_source!(registry, "c.privilege", PRIVILEGE_FUNCTIONS);
     // Also registered as a named propagator for explicit `propagators:` use;
     // already applied unconditionally to DFG edges in web-sitter's
     // add_taint_propagator_edges, so this is redundant-but-harmless there —
@@ -586,72 +613,116 @@ pub fn builtin_endpoint_registry() -> crate::taint::EndpointRegistry {
     // ── C++ ──────────────────────────────────────────────────────────────────
     reg_sink!(registry, "cpp.format_sinks", cpp::CPP_FORMAT_SINKS);
     reg_propagator!(registry, "cpp.propagators", cpp::CPP_TAINT_PROPAGATORS);
-    reg_sink!(registry, "cpp.exec_ops",     cpp::CPP_EXEC_OPS);
+    reg_sink!(registry, "cpp.exec_ops", cpp::CPP_EXEC_OPS);
 
     // ── Java ─────────────────────────────────────────────────────────────────
-    reg_source!(registry, "java.http_sources",            java::JAVA_HTTP_SOURCES);
-    reg_sink!(  registry, "java.sql_sinks",               java::JAVA_SQL_SINKS);
-    reg_sink!(  registry, "java.exec_sinks",              java::JAVA_EXEC_SINKS);
-    reg_sink!(  registry, "java.reflection_sinks",        java::JAVA_REFLECTION_SINKS);
-    reg_source!(registry, "java.deserialization_sources", java::JAVA_DESERIALIZATION_SOURCES);
-    reg_sink!(  registry, "java.http_response_sinks",     java::JAVA_HTTP_RESPONSE_SINKS);
-    reg_sink!(  registry, "java.log_sinks",               java::JAVA_LOG_SINKS);
-    reg_sink!(  registry, "java.jndi_sinks",              java::JAVA_JNDI_SINKS);
-    reg_sink!(  registry, "java.xpath_sinks",             java::JAVA_XPATH_SINKS);
-    reg_sink!(  registry, "java.ldap_sinks",              java::JAVA_LDAP_SINKS);
-    reg_sink!(  registry, "java.xxe_sinks",               java::JAVA_XXE_SINKS);
-    reg_sink!(  registry, "java.template_sinks",          java::JAVA_TEMPLATE_SINKS);
-    reg_sink!(  registry, "java.ssrf_sinks",              java::JAVA_SSRF_SINKS);
-    reg_propagator!(registry, "java.propagators",         java::JAVA_TAINT_PROPAGATORS);
+    reg_source!(registry, "java.http_sources", java::JAVA_HTTP_SOURCES);
+    reg_sink!(registry, "java.sql_sinks", java::JAVA_SQL_SINKS);
+    reg_sink!(registry, "java.exec_sinks", java::JAVA_EXEC_SINKS);
+    reg_sink!(
+        registry,
+        "java.reflection_sinks",
+        java::JAVA_REFLECTION_SINKS
+    );
+    reg_source!(
+        registry,
+        "java.deserialization_sources",
+        java::JAVA_DESERIALIZATION_SOURCES
+    );
+    reg_sink!(
+        registry,
+        "java.http_response_sinks",
+        java::JAVA_HTTP_RESPONSE_SINKS
+    );
+    reg_sink!(registry, "java.log_sinks", java::JAVA_LOG_SINKS);
+    reg_sink!(registry, "java.jndi_sinks", java::JAVA_JNDI_SINKS);
+    reg_sink!(registry, "java.xpath_sinks", java::JAVA_XPATH_SINKS);
+    reg_sink!(registry, "java.ldap_sinks", java::JAVA_LDAP_SINKS);
+    reg_sink!(registry, "java.xxe_sinks", java::JAVA_XXE_SINKS);
+    reg_sink!(registry, "java.template_sinks", java::JAVA_TEMPLATE_SINKS);
+    reg_sink!(registry, "java.ssrf_sinks", java::JAVA_SSRF_SINKS);
+    reg_propagator!(registry, "java.propagators", java::JAVA_TAINT_PROPAGATORS);
 
     // ── JavaScript ───────────────────────────────────────────────────────────
-    reg_sink!(  registry, "js.dom_xss_sinks",         javascript::JS_DOM_XSS_SINKS);
-    reg_sink!(  registry, "js.exec_sinks",            javascript::JS_EXEC_SINKS);
-    reg_sink!(  registry, "js.file_write_sinks",      javascript::JS_FILE_WRITE_SINKS);
-    reg_sink!(  registry, "js.db_sinks",              javascript::JS_DB_SINKS);
-    reg_sink!(  registry, "js.ssrf_sinks",            javascript::JS_SSRF_SINKS);
-    reg_sink!(  registry, "js.eval_sinks",            javascript::JS_EVAL_SINKS);
-    reg_sink!(  registry, "js.template_sinks",        javascript::JS_TEMPLATE_SINKS);
-    reg_sink!(  registry, "js.redirect_sinks",        javascript::JS_REDIRECT_SINKS);
-    reg_sink!(  registry, "js.deserialization_sinks", javascript::JS_DESERIALIZATION_SINKS);
-    reg_sink!(  registry, "js.ldap_sinks",            javascript::JS_LDAP_SINKS);
-    reg_sink!(  registry, "js.vm_sinks",              javascript::JS_VM_SINKS);
-    reg_propagator!(registry, "js.propagators",       javascript::JS_TAINT_PROPAGATORS);
+    reg_sink!(registry, "js.dom_xss_sinks", javascript::JS_DOM_XSS_SINKS);
+    reg_sink!(registry, "js.exec_sinks", javascript::JS_EXEC_SINKS);
+    reg_sink!(
+        registry,
+        "js.file_write_sinks",
+        javascript::JS_FILE_WRITE_SINKS
+    );
+    reg_sink!(registry, "js.db_sinks", javascript::JS_DB_SINKS);
+    reg_sink!(registry, "js.ssrf_sinks", javascript::JS_SSRF_SINKS);
+    reg_sink!(registry, "js.eval_sinks", javascript::JS_EVAL_SINKS);
+    reg_sink!(registry, "js.template_sinks", javascript::JS_TEMPLATE_SINKS);
+    reg_sink!(registry, "js.redirect_sinks", javascript::JS_REDIRECT_SINKS);
+    reg_sink!(
+        registry,
+        "js.deserialization_sinks",
+        javascript::JS_DESERIALIZATION_SINKS
+    );
+    reg_sink!(registry, "js.ldap_sinks", javascript::JS_LDAP_SINKS);
+    reg_sink!(registry, "js.vm_sinks", javascript::JS_VM_SINKS);
+    reg_propagator!(registry, "js.propagators", javascript::JS_TAINT_PROPAGATORS);
     // `Cpg::language` is the full name ("javascript"/"typescript", see
     // SourceLanguage::as_str in web-sitter/src/cpg_generator.rs), not the
     // "js"/"ts" short form used by the named sink sets above — register
     // under both so the `"{lang}.propagators"` auto-apply lookup in
     // `TaintEngine::run` resolves correctly.
-    reg_propagator!(registry, "javascript.propagators", javascript::JS_TAINT_PROPAGATORS);
+    reg_propagator!(
+        registry,
+        "javascript.propagators",
+        javascript::JS_TAINT_PROPAGATORS
+    );
 
     // ── TypeScript ───────────────────────────────────────────────────────────
-    reg_sink!(  registry, "ts.typeorm_sinks",         typescript::TS_TYPEORM_SINKS);
-    reg_sink!(  registry, "ts.prisma_raw_sinks",      typescript::TS_PRISMA_RAW_SINKS);
-    reg_sink!(  registry, "ts.angular_bypass_sinks",  typescript::TS_ANGULAR_BYPASS_SINKS);
-    reg_source!(registry, "ts.nestjs_sources",        typescript::TS_NESTJS_SOURCES);
-    reg_propagator!(registry, "ts.propagators",       typescript::TS_TAINT_PROPAGATORS);
-    reg_propagator!(registry, "typescript.propagators", typescript::TS_TAINT_PROPAGATORS);
+    reg_sink!(registry, "ts.typeorm_sinks", typescript::TS_TYPEORM_SINKS);
+    reg_sink!(
+        registry,
+        "ts.prisma_raw_sinks",
+        typescript::TS_PRISMA_RAW_SINKS
+    );
+    reg_sink!(
+        registry,
+        "ts.angular_bypass_sinks",
+        typescript::TS_ANGULAR_BYPASS_SINKS
+    );
+    reg_source!(registry, "ts.nestjs_sources", typescript::TS_NESTJS_SOURCES);
+    reg_propagator!(registry, "ts.propagators", typescript::TS_TAINT_PROPAGATORS);
+    reg_propagator!(
+        registry,
+        "typescript.propagators",
+        typescript::TS_TAINT_PROPAGATORS
+    );
 
     // ── Go ───────────────────────────────────────────────────────────────────
-    reg_sink!(  registry, "go.exec_sinks",              go::GO_EXEC_SINKS);
-    reg_sink!(  registry, "go.sql_sinks",               go::GO_SQL_SINKS);
-    reg_sink!(  registry, "go.file_sinks",              go::GO_FILE_SINKS);
-    reg_sink!(  registry, "go.net_sinks",               go::GO_NET_SINKS);
-    reg_sink!(  registry, "go.http_response_sinks",     go::GO_HTTP_RESPONSE_SINKS);
-    reg_sink!(  registry, "go.template_sinks",          go::GO_TEMPLATE_SINKS);
-    reg_source!(registry, "go.env_sources",             go::GO_ENV_SOURCES);
-    reg_source!(registry, "go.http_request_sources",    go::GO_HTTP_REQUEST_SOURCES);
-    reg_source!(registry, "go.read_sources",            go::GO_READ_SOURCES);
-    reg_source!(registry, "go.flag_sources",            go::GO_FLAG_SOURCES);
-    reg_propagator!(registry, "go.propagators",         go::GO_TAINT_PROPAGATORS);
+    reg_sink!(registry, "go.exec_sinks", go::GO_EXEC_SINKS);
+    reg_sink!(registry, "go.sql_sinks", go::GO_SQL_SINKS);
+    reg_sink!(registry, "go.file_sinks", go::GO_FILE_SINKS);
+    reg_sink!(registry, "go.net_sinks", go::GO_NET_SINKS);
+    reg_sink!(
+        registry,
+        "go.http_response_sinks",
+        go::GO_HTTP_RESPONSE_SINKS
+    );
+    reg_sink!(registry, "go.template_sinks", go::GO_TEMPLATE_SINKS);
+    reg_source!(registry, "go.env_sources", go::GO_ENV_SOURCES);
+    reg_source!(
+        registry,
+        "go.http_request_sources",
+        go::GO_HTTP_REQUEST_SOURCES
+    );
+    reg_source!(registry, "go.read_sources", go::GO_READ_SOURCES);
+    reg_source!(registry, "go.flag_sources", go::GO_FLAG_SOURCES);
+    reg_propagator!(registry, "go.propagators", go::GO_TAINT_PROPAGATORS);
 
     // ── Rust ─────────────────────────────────────────────────────────────────
-    reg_sink!(  registry, "rust.exec_sinks",   rust::RUST_EXEC_SINKS);
-    reg_sink!(  registry, "rust.file_sinks",   rust::RUST_FILE_SINKS);
-    reg_sink!(  registry, "rust.net_sinks",    rust::RUST_NET_SINKS);
-    reg_sink!(  registry, "rust.db_sinks",     rust::RUST_DB_SINKS);
-    reg_source!(registry, "rust.env_sources",  rust::RUST_ENV_SOURCES);
-    reg_source!(registry, "rust.io_sources",   rust::RUST_IO_SOURCES);
+    reg_sink!(registry, "rust.exec_sinks", rust::RUST_EXEC_SINKS);
+    reg_sink!(registry, "rust.file_sinks", rust::RUST_FILE_SINKS);
+    reg_sink!(registry, "rust.net_sinks", rust::RUST_NET_SINKS);
+    reg_sink!(registry, "rust.db_sinks", rust::RUST_DB_SINKS);
+    reg_source!(registry, "rust.env_sources", rust::RUST_ENV_SOURCES);
+    reg_source!(registry, "rust.io_sources", rust::RUST_IO_SOURCES);
     reg_propagator!(registry, "rust.propagators", rust::RUST_TAINT_PROPAGATORS);
 
     registry
@@ -669,8 +740,13 @@ fn propagator_edges_for(
 ) -> Vec<(web_sitter::NodeId, web_sitter::NodeId)> {
     use web_sitter::IrNodeKind;
 
-    fn call_arg_nodes(cpg: &web_sitter::Cpg, call_id: web_sitter::NodeId) -> Vec<web_sitter::NodeId> {
-        let Some(node) = cpg.ast.get(&call_id) else { return Vec::new() };
+    fn call_arg_nodes(
+        cpg: &web_sitter::Cpg,
+        call_id: web_sitter::NodeId,
+    ) -> Vec<web_sitter::NodeId> {
+        let Some(node) = cpg.ast.get(&call_id) else {
+            return Vec::new();
+        };
         for &cid in &node.children {
             if let Some(child) = cpg.ast.get(&cid) {
                 if matches!(child.node_type.as_str(), "argument_list" | "arguments") {
@@ -687,8 +763,12 @@ fn propagator_edges_for(
         if node.kind != IrNodeKind::Call {
             continue;
         }
-        let Some(name) = call_names.get(&call_id) else { continue };
-        let Some((_, spec)) = table.iter().find(|(n, _)| *n == name.as_str()) else { continue };
+        let Some(name) = call_names.get(&call_id) else {
+            continue;
+        };
+        let Some((_, spec)) = table.iter().find(|(n, _)| *n == name.as_str()) else {
+            continue;
+        };
 
         let args = call_arg_nodes(cpg, call_id);
         let dst_node = if spec.dst >= 0 {

@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-use web_sitter::IrNodeKind;
 use crate::ast::{
     Binding, CmpOp, Expr, ExprKind, FindExpr, Language, Literal, NamedRef, NodePattern,
     PredicateDef, PropagatorDef, RuleClause, RuleFile, SanitizerDef, SearchClause, SinkDef,
@@ -7,10 +5,12 @@ use crate::ast::{
 };
 use crate::ir::{
     AstConstraint, BindingValue, CfgPredicate, CompiledClause, CompiledRule, DfgPredicate,
-    FieldConstraint, MethodStep, PlanExpr, QueryPlan, RootBinding, RuleSet, SearchPlan,
-    SeedHint, StringMatcher, TaintEndpointRef, TaintSpec,
+    FieldConstraint, MethodStep, PlanExpr, QueryPlan, RootBinding, RuleSet, SearchPlan, SeedHint,
+    StringMatcher, TaintEndpointRef, TaintSpec,
 };
 use crate::types::{check_method_on_type, expand_type};
+use std::collections::HashMap;
+use web_sitter::IrNodeKind;
 
 // ── Errors ────────────────────────────────────────────────────────────────────
 
@@ -23,7 +23,11 @@ pub enum PlanError {
     #[error("type error in `{context}`: {msg}")]
     TypeError { context: String, msg: String },
     #[error("arity mismatch calling `{name}`: expected {expected}, got {got}")]
-    ArityMismatch { name: String, expected: usize, got: usize },
+    ArityMismatch {
+        name: String,
+        expected: usize,
+        got: usize,
+    },
     #[error("unsupported feature: {0}")]
     Unsupported(String),
 }
@@ -75,7 +79,9 @@ pub struct Planner {
 
 impl Planner {
     pub fn new() -> Self {
-        Self { defs: HashMap::new() }
+        Self {
+            defs: HashMap::new(),
+        }
     }
 
     /// Compile a full rule file into a RuleSet.
@@ -84,7 +90,8 @@ impl Planner {
         for item in &file.items {
             match item {
                 TopLevelItem::PredicateDef(p) => {
-                    self.defs.insert(p.name.clone(), DefKind::Predicate(p.clone()));
+                    self.defs
+                        .insert(p.name.clone(), DefKind::Predicate(p.clone()));
                 }
                 TopLevelItem::SourceDef(s) => {
                     self.defs.insert(s.name.clone(), DefKind::Source(s.clone()));
@@ -93,10 +100,12 @@ impl Planner {
                     self.defs.insert(s.name.clone(), DefKind::Sink(s.clone()));
                 }
                 TopLevelItem::SanitizerDef(s) => {
-                    self.defs.insert(s.name.clone(), DefKind::Sanitizer(s.clone()));
+                    self.defs
+                        .insert(s.name.clone(), DefKind::Sanitizer(s.clone()));
                 }
                 TopLevelItem::PropagatorDef(p) => {
-                    self.defs.insert(p.name.clone(), DefKind::Propagator(p.clone()));
+                    self.defs
+                        .insert(p.name.clone(), DefKind::Propagator(p.clone()));
                 }
                 TopLevelItem::Rule(_) => {}
             }
@@ -120,7 +129,8 @@ impl Planner {
             match def {
                 DefKind::Predicate(p) => {
                     let mut scope = Scope::default();
-                    let param_names: Vec<String> = p.params.iter().map(|p| p.name.clone()).collect();
+                    let param_names: Vec<String> =
+                        p.params.iter().map(|p| p.name.clone()).collect();
                     for param in &p.params {
                         scope.vars.insert(param.name.clone(), param.ty.clone());
                     }
@@ -187,10 +197,7 @@ impl Planner {
         })
     }
 
-    fn compile_search_clause(
-        &self,
-        sc: &SearchClause,
-    ) -> PlanResult<(SearchPlan, Vec<SeedHint>)> {
+    fn compile_search_clause(&self, sc: &SearchClause) -> PlanResult<(SearchPlan, Vec<SeedHint>)> {
         let mut scope = Scope::default();
         let mut root_bindings = Vec::new();
 
@@ -211,7 +218,11 @@ impl Planner {
         let hints = root_bindings.iter().flat_map(|b| b.hints.clone()).collect();
 
         Ok((
-            SearchPlan { root_bindings, plan, report_vars },
+            SearchPlan {
+                root_bindings,
+                plan,
+                report_vars,
+            },
             hints,
         ))
     }
@@ -242,11 +253,19 @@ impl Planner {
         let root_bindings = plans[0].root_bindings.clone();
         let report_vars = plans[0].report_vars.clone();
         let combined = QueryPlan::OrAny(plans.into_iter().map(|sp| sp.plan).collect());
-        Ok(SearchPlan { root_bindings, plan: combined, report_vars })
+        Ok(SearchPlan {
+            root_bindings,
+            plan: combined,
+            report_vars,
+        })
     }
 
     fn compile_find_expr(&self, fe: &FindExpr) -> PlanResult<(SearchPlan, Vec<SeedHint>)> {
-        let sc = SearchClause { span: fe.span, bindings: fe.bindings.clone(), condition: fe.condition.clone() };
+        let sc = SearchClause {
+            span: fe.span,
+            bindings: fe.bindings.clone(),
+            condition: fe.condition.clone(),
+        };
         self.compile_search_clause(&sc)
     }
 
@@ -287,7 +306,10 @@ impl Planner {
             .iter()
             .map(|a| self.compile_plan_expr(a, scope))
             .collect::<PlanResult<Vec<_>>>()?;
-        Ok(TaintEndpointRef { name: nr.name.clone(), args })
+        Ok(TaintEndpointRef {
+            name: nr.name.clone(),
+            args,
+        })
     }
 
     // ── Expression compilation ────────────────────────────────────────────────
@@ -304,9 +326,7 @@ impl Planner {
                 self.compile_expr(b, scope)?,
             ])),
 
-            ExprKind::Not(inner) => {
-                Ok(QueryPlan::Not(Box::new(self.compile_expr(inner, scope)?)))
-            }
+            ExprKind::Not(inner) => Ok(QueryPlan::Not(Box::new(self.compile_expr(inner, scope)?))),
 
             ExprKind::Compare { lhs, op, rhs } => {
                 let lhs_pe = self.compile_plan_expr(lhs, scope)?;
@@ -348,7 +368,10 @@ impl Planner {
                         .iter()
                         .map(|a| self.compile_plan_expr(a, scope))
                         .collect::<PlanResult<Vec<_>>>()?;
-                    Ok(QueryPlan::PredicateCall { name: name.clone(), args: arg_exprs })
+                    Ok(QueryPlan::PredicateCall {
+                        name: name.clone(),
+                        args: arg_exprs,
+                    })
                 } else {
                     Err(PlanError::UndefinedPredicate(name.clone()))
                 }
@@ -366,7 +389,10 @@ impl Planner {
                 Ok(QueryPlan::AstConstraint(AstConstraint {
                     lhs: PlanExpr::MethodChain {
                         receiver: Box::new(PlanExpr::Var(name.clone())),
-                        steps: vec![MethodStep { method: "is_some".into(), args: vec![] }],
+                        steps: vec![MethodStep {
+                            method: "is_some".into(),
+                            args: vec![],
+                        }],
                     },
                     op: CmpOp::Eq,
                     rhs: PlanExpr::Lit(Literal::Bool(true)),
@@ -388,7 +414,11 @@ impl Planner {
                 })
             }
 
-            ExprKind::MethodCall { receiver, method, args } => {
+            ExprKind::MethodCall {
+                receiver,
+                method,
+                args,
+            } => {
                 // Try to compile as a relational CFG/DFG predicate first.
                 if let Some(plan) = self.try_compile_relational(receiver, method, args, scope)? {
                     return Ok(plan);
@@ -427,9 +457,9 @@ impl Planner {
         let get_var = |expr: &Expr, label: &str| -> PlanResult<String> {
             match &expr.kind {
                 ExprKind::Ident(n) if scope.lookup(n).is_some() => Ok(n.clone()),
-                _ => Err(PlanError::Unsupported(
-                    format!("`{method}`: argument `{label}` must be a bound variable"),
-                )),
+                _ => Err(PlanError::Unsupported(format!(
+                    "`{method}`: argument `{label}` must be a bound variable"
+                ))),
             }
         };
 
@@ -438,9 +468,9 @@ impl Planner {
             match &expr.kind {
                 ExprKind::Literal(Literal::Str(s)) => Ok(s.clone()),
                 ExprKind::Ident(n) => Ok(n.clone()), // bare ident as var name
-                _ => Err(PlanError::Unsupported(
-                    format!("`{method}`: argument must be a string literal or identifier"),
-                )),
+                _ => Err(PlanError::Unsupported(format!(
+                    "`{method}`: argument must be a string literal or identifier"
+                ))),
             }
         };
 
@@ -536,7 +566,7 @@ impl Planner {
             _ => {
                 return Err(PlanError::Unsupported(
                     "`matches` LHS must be a variable or method chain".into(),
-                ))
+                ));
             }
         }
 
@@ -570,7 +600,11 @@ impl Planner {
 
             ExprKind::Literal(lit) => Ok(PlanExpr::Lit(lit.clone())),
 
-            ExprKind::MethodCall { receiver, method, args } => {
+            ExprKind::MethodCall {
+                receiver,
+                method,
+                args,
+            } => {
                 let recv_pe = self.compile_plan_expr(receiver, scope)?;
                 let arg_pes = args
                     .iter()
@@ -579,13 +613,25 @@ impl Planner {
 
                 // Flatten nested MethodChain into a single chain with appended step
                 match recv_pe {
-                    PlanExpr::MethodChain { receiver: inner, mut steps } => {
-                        steps.push(MethodStep { method: method.clone(), args: arg_pes });
-                        Ok(PlanExpr::MethodChain { receiver: inner, steps })
+                    PlanExpr::MethodChain {
+                        receiver: inner,
+                        mut steps,
+                    } => {
+                        steps.push(MethodStep {
+                            method: method.clone(),
+                            args: arg_pes,
+                        });
+                        Ok(PlanExpr::MethodChain {
+                            receiver: inner,
+                            steps,
+                        })
                     }
                     other => Ok(PlanExpr::MethodChain {
                         receiver: Box::new(other),
-                        steps: vec![MethodStep { method: method.clone(), args: arg_pes }],
+                        steps: vec![MethodStep {
+                            method: method.clone(),
+                            args: arg_pes,
+                        }],
                     }),
                 }
             }
@@ -608,7 +654,9 @@ impl Planner {
 
     fn typecheck_plan_expr(&self, expr: &Expr, scope: &Scope) -> PlanResult<()> {
         match &expr.kind {
-            ExprKind::MethodCall { receiver, method, .. } => {
+            ExprKind::MethodCall {
+                receiver, method, ..
+            } => {
                 // Determine the receiver type from scope
                 if let Some(ty) = self.infer_type(receiver, scope) {
                     check_method_on_type(method, &ty).map_err(|msg| PlanError::TypeError {
@@ -625,7 +673,9 @@ impl Planner {
     fn infer_type<'a>(&self, expr: &'a Expr, scope: &'a Scope) -> Option<TypeExpr> {
         match &expr.kind {
             ExprKind::Ident(name) => scope.lookup(name).cloned(),
-            ExprKind::MethodCall { receiver, method, .. } => {
+            ExprKind::MethodCall {
+                receiver, method, ..
+            } => {
                 // Most methods return Node or String; simplified inference
                 let recv_ty = self.infer_type(receiver, scope)?;
                 Some(return_type_of_method(method, &recv_ty))

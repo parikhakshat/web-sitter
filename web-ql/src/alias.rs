@@ -41,7 +41,11 @@ impl AliasIndex {
             }
         }
 
-        Self { points_to, pointed_by, var_to_ptrs }
+        Self {
+            points_to,
+            pointed_by,
+            var_to_ptrs,
+        }
     }
 
     /// All nodes that `ptr_node` may point to (empty slice if none).

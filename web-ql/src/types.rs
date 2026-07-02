@@ -1,5 +1,5 @@
-use web_sitter::IrNodeKind;
 use crate::ast::TypeExpr;
+use web_sitter::IrNodeKind;
 
 /// Expand a `TypeExpr` alias into the set of `IrNodeKind` values it covers.
 /// Returns `None` for `NodeType(raw)` (raw kind match, not an IrNodeKind).
@@ -52,82 +52,215 @@ pub fn kind_in_type(kind: IrNodeKind, ty: &TypeExpr) -> bool {
 fn all_ir_kinds() -> Vec<IrNodeKind> {
     // All variants from the taxonomy (structural + lang-specific)
     vec![
-        IrNodeKind::File, IrNodeKind::Namespace, IrNodeKind::ClassDef, IrNodeKind::MethodDef,
-        IrNodeKind::ParamDef, IrNodeKind::LocalDef, IrNodeKind::FieldDef, IrNodeKind::TypeAlias,
-        IrNodeKind::Block, IrNodeKind::Return, IrNodeKind::Loop, IrNodeKind::Conditional,
-        IrNodeKind::Switch, IrNodeKind::Case, IrNodeKind::SwitchDefault, IrNodeKind::Break,
-        IrNodeKind::Continue, IrNodeKind::Goto, IrNodeKind::Label, IrNodeKind::Throw,
-        IrNodeKind::Try, IrNodeKind::Catch, IrNodeKind::ExprStmt,
-        IrNodeKind::Call, IrNodeKind::Assign, IrNodeKind::BinaryOp, IrNodeKind::UnaryOp,
-        IrNodeKind::TernaryOp, IrNodeKind::Cast, IrNodeKind::Subscript, IrNodeKind::MemberAccess,
-        IrNodeKind::LambdaDef, IrNodeKind::NewExpr, IrNodeKind::DeleteExpr, IrNodeKind::SizeofExpr,
-        IrNodeKind::Identifier, IrNodeKind::Literal, IrNodeKind::TypeRef,
+        IrNodeKind::File,
+        IrNodeKind::Namespace,
+        IrNodeKind::ClassDef,
+        IrNodeKind::MethodDef,
+        IrNodeKind::ParamDef,
+        IrNodeKind::LocalDef,
+        IrNodeKind::FieldDef,
+        IrNodeKind::TypeAlias,
+        IrNodeKind::Block,
+        IrNodeKind::Return,
+        IrNodeKind::Loop,
+        IrNodeKind::Conditional,
+        IrNodeKind::Switch,
+        IrNodeKind::Case,
+        IrNodeKind::SwitchDefault,
+        IrNodeKind::Break,
+        IrNodeKind::Continue,
+        IrNodeKind::Goto,
+        IrNodeKind::Label,
+        IrNodeKind::Throw,
+        IrNodeKind::Try,
+        IrNodeKind::Catch,
+        IrNodeKind::ExprStmt,
+        IrNodeKind::Call,
+        IrNodeKind::Assign,
+        IrNodeKind::BinaryOp,
+        IrNodeKind::UnaryOp,
+        IrNodeKind::TernaryOp,
+        IrNodeKind::Cast,
+        IrNodeKind::Subscript,
+        IrNodeKind::MemberAccess,
+        IrNodeKind::LambdaDef,
+        IrNodeKind::NewExpr,
+        IrNodeKind::DeleteExpr,
+        IrNodeKind::SizeofExpr,
+        IrNodeKind::Identifier,
+        IrNodeKind::Literal,
+        IrNodeKind::TypeRef,
         IrNodeKind::Unknown,
-        IrNodeKind::Import, IrNodeKind::Yield, IrNodeKind::Await, IrNodeKind::Comprehension,
-        IrNodeKind::With, IrNodeKind::Assert, IrNodeKind::Delete, IrNodeKind::Global,
-        IrNodeKind::Decorator, IrNodeKind::NamedExpr, IrNodeKind::CollectionExpr,
-        IrNodeKind::GoStmt, IrNodeKind::DeferStmt, IrNodeKind::SelectStmt, IrNodeKind::CommCase,
-        IrNodeKind::SendStmt, IrNodeKind::ReceiveExpr, IrNodeKind::ShortVarDecl,
-        IrNodeKind::IncDecStmt, IrNodeKind::TypeAssertion, IrNodeKind::TypeSwitch,
-        IrNodeKind::TypeCase, IrNodeKind::CompositeLit, IrNodeKind::Fallthrough,
-        IrNodeKind::EnumDef, IrNodeKind::EnumConstant, IrNodeKind::SwitchExpr,
-        IrNodeKind::SwitchRule, IrNodeKind::Finally, IrNodeKind::Synchronized,
-        IrNodeKind::InstanceofExpr, IrNodeKind::MethodRef, IrNodeKind::NewArray,
-        IrNodeKind::ArrayInit, IrNodeKind::ModuleDecl, IrNodeKind::StringTemplate,
-        IrNodeKind::ClassLiteral, IrNodeKind::ThisExpr,
-        IrNodeKind::AwaitExpr, IrNodeKind::YieldExpr, IrNodeKind::TemplateStr,
-        IrNodeKind::SpreadExpr, IrNodeKind::OptionalChain, IrNodeKind::JsxElement,
-        IrNodeKind::Export, IrNodeKind::SequenceExpr,
-        IrNodeKind::InterfaceDecl, IrNodeKind::EnumDecl, IrNodeKind::AsExpr,
-        IrNodeKind::NonNullExpr, IrNodeKind::SatisfiesExpr, IrNodeKind::AmbientDecl,
+        IrNodeKind::Import,
+        IrNodeKind::Yield,
+        IrNodeKind::Await,
+        IrNodeKind::Comprehension,
+        IrNodeKind::With,
+        IrNodeKind::Assert,
+        IrNodeKind::Delete,
+        IrNodeKind::Global,
+        IrNodeKind::Decorator,
+        IrNodeKind::NamedExpr,
+        IrNodeKind::CollectionExpr,
+        IrNodeKind::GoStmt,
+        IrNodeKind::DeferStmt,
+        IrNodeKind::SelectStmt,
+        IrNodeKind::CommCase,
+        IrNodeKind::SendStmt,
+        IrNodeKind::ReceiveExpr,
+        IrNodeKind::ShortVarDecl,
+        IrNodeKind::IncDecStmt,
+        IrNodeKind::TypeAssertion,
+        IrNodeKind::TypeSwitch,
+        IrNodeKind::TypeCase,
+        IrNodeKind::CompositeLit,
+        IrNodeKind::Fallthrough,
+        IrNodeKind::EnumDef,
+        IrNodeKind::EnumConstant,
+        IrNodeKind::SwitchExpr,
+        IrNodeKind::SwitchRule,
+        IrNodeKind::Finally,
+        IrNodeKind::Synchronized,
+        IrNodeKind::InstanceofExpr,
+        IrNodeKind::MethodRef,
+        IrNodeKind::NewArray,
+        IrNodeKind::ArrayInit,
+        IrNodeKind::ModuleDecl,
+        IrNodeKind::StringTemplate,
+        IrNodeKind::ClassLiteral,
+        IrNodeKind::ThisExpr,
+        IrNodeKind::AwaitExpr,
+        IrNodeKind::YieldExpr,
+        IrNodeKind::TemplateStr,
+        IrNodeKind::SpreadExpr,
+        IrNodeKind::OptionalChain,
+        IrNodeKind::JsxElement,
+        IrNodeKind::Export,
+        IrNodeKind::SequenceExpr,
+        IrNodeKind::InterfaceDecl,
+        IrNodeKind::EnumDecl,
+        IrNodeKind::AsExpr,
+        IrNodeKind::NonNullExpr,
+        IrNodeKind::SatisfiesExpr,
+        IrNodeKind::AmbientDecl,
         IrNodeKind::TypePredicate,
-        IrNodeKind::MatchExpr, IrNodeKind::MatchArm, IrNodeKind::ImplBlock, IrNodeKind::TraitDef,
-        IrNodeKind::UnsafeBlock, IrNodeKind::ClosureExpr, IrNodeKind::MacroInvocation,
-        IrNodeKind::TryExpr, IrNodeKind::LoopExpr, IrNodeKind::RangeExpr, IrNodeKind::StructExpr,
-        IrNodeKind::ModDef, IrNodeKind::BreakExpr, IrNodeKind::LifetimeRef, IrNodeKind::UseDecl,
+        IrNodeKind::MatchExpr,
+        IrNodeKind::MatchArm,
+        IrNodeKind::ImplBlock,
+        IrNodeKind::TraitDef,
+        IrNodeKind::UnsafeBlock,
+        IrNodeKind::ClosureExpr,
+        IrNodeKind::MacroInvocation,
+        IrNodeKind::TryExpr,
+        IrNodeKind::LoopExpr,
+        IrNodeKind::RangeExpr,
+        IrNodeKind::StructExpr,
+        IrNodeKind::ModDef,
+        IrNodeKind::BreakExpr,
+        IrNodeKind::LifetimeRef,
+        IrNodeKind::UseDecl,
         IrNodeKind::SehLeave,
     ]
 }
 
 fn expr_kinds() -> Vec<IrNodeKind> {
     vec![
-        IrNodeKind::Call, IrNodeKind::Assign, IrNodeKind::BinaryOp, IrNodeKind::UnaryOp,
-        IrNodeKind::TernaryOp, IrNodeKind::Cast, IrNodeKind::Subscript, IrNodeKind::MemberAccess,
-        IrNodeKind::LambdaDef, IrNodeKind::NewExpr, IrNodeKind::DeleteExpr, IrNodeKind::SizeofExpr,
-        IrNodeKind::Identifier, IrNodeKind::Literal, IrNodeKind::TypeRef,
-        IrNodeKind::Yield, IrNodeKind::Await, IrNodeKind::Comprehension, IrNodeKind::NamedExpr,
-        IrNodeKind::CollectionExpr, IrNodeKind::ReceiveExpr, IrNodeKind::TypeAssertion,
-        IrNodeKind::CompositeLit, IrNodeKind::SwitchExpr, IrNodeKind::InstanceofExpr,
-        IrNodeKind::MethodRef, IrNodeKind::NewArray, IrNodeKind::ArrayInit,
-        IrNodeKind::ClassLiteral, IrNodeKind::ThisExpr,
-        IrNodeKind::AwaitExpr, IrNodeKind::YieldExpr, IrNodeKind::TemplateStr,
-        IrNodeKind::SpreadExpr, IrNodeKind::OptionalChain, IrNodeKind::JsxElement,
-        IrNodeKind::SequenceExpr, IrNodeKind::AsExpr, IrNodeKind::NonNullExpr,
-        IrNodeKind::SatisfiesExpr, IrNodeKind::MatchExpr, IrNodeKind::ClosureExpr,
-        IrNodeKind::TryExpr, IrNodeKind::LoopExpr, IrNodeKind::RangeExpr,
-        IrNodeKind::StructExpr, IrNodeKind::BreakExpr,
+        IrNodeKind::Call,
+        IrNodeKind::Assign,
+        IrNodeKind::BinaryOp,
+        IrNodeKind::UnaryOp,
+        IrNodeKind::TernaryOp,
+        IrNodeKind::Cast,
+        IrNodeKind::Subscript,
+        IrNodeKind::MemberAccess,
+        IrNodeKind::LambdaDef,
+        IrNodeKind::NewExpr,
+        IrNodeKind::DeleteExpr,
+        IrNodeKind::SizeofExpr,
+        IrNodeKind::Identifier,
+        IrNodeKind::Literal,
+        IrNodeKind::TypeRef,
+        IrNodeKind::Yield,
+        IrNodeKind::Await,
+        IrNodeKind::Comprehension,
+        IrNodeKind::NamedExpr,
+        IrNodeKind::CollectionExpr,
+        IrNodeKind::ReceiveExpr,
+        IrNodeKind::TypeAssertion,
+        IrNodeKind::CompositeLit,
+        IrNodeKind::SwitchExpr,
+        IrNodeKind::InstanceofExpr,
+        IrNodeKind::MethodRef,
+        IrNodeKind::NewArray,
+        IrNodeKind::ArrayInit,
+        IrNodeKind::ClassLiteral,
+        IrNodeKind::ThisExpr,
+        IrNodeKind::AwaitExpr,
+        IrNodeKind::YieldExpr,
+        IrNodeKind::TemplateStr,
+        IrNodeKind::SpreadExpr,
+        IrNodeKind::OptionalChain,
+        IrNodeKind::JsxElement,
+        IrNodeKind::SequenceExpr,
+        IrNodeKind::AsExpr,
+        IrNodeKind::NonNullExpr,
+        IrNodeKind::SatisfiesExpr,
+        IrNodeKind::MatchExpr,
+        IrNodeKind::ClosureExpr,
+        IrNodeKind::TryExpr,
+        IrNodeKind::LoopExpr,
+        IrNodeKind::RangeExpr,
+        IrNodeKind::StructExpr,
+        IrNodeKind::BreakExpr,
     ]
 }
 
 fn stmt_kinds() -> Vec<IrNodeKind> {
     vec![
-        IrNodeKind::Block, IrNodeKind::Return, IrNodeKind::Loop, IrNodeKind::Conditional,
-        IrNodeKind::Switch, IrNodeKind::Case, IrNodeKind::SwitchDefault, IrNodeKind::Break,
-        IrNodeKind::Continue, IrNodeKind::Goto, IrNodeKind::Label, IrNodeKind::Throw,
-        IrNodeKind::Try, IrNodeKind::Catch, IrNodeKind::ExprStmt,
-        IrNodeKind::Import, IrNodeKind::With, IrNodeKind::Assert, IrNodeKind::Delete,
+        IrNodeKind::Block,
+        IrNodeKind::Return,
+        IrNodeKind::Loop,
+        IrNodeKind::Conditional,
+        IrNodeKind::Switch,
+        IrNodeKind::Case,
+        IrNodeKind::SwitchDefault,
+        IrNodeKind::Break,
+        IrNodeKind::Continue,
+        IrNodeKind::Goto,
+        IrNodeKind::Label,
+        IrNodeKind::Throw,
+        IrNodeKind::Try,
+        IrNodeKind::Catch,
+        IrNodeKind::ExprStmt,
+        IrNodeKind::Import,
+        IrNodeKind::With,
+        IrNodeKind::Assert,
+        IrNodeKind::Delete,
         IrNodeKind::Global,
-        IrNodeKind::GoStmt, IrNodeKind::DeferStmt, IrNodeKind::SelectStmt, IrNodeKind::SendStmt,
-        IrNodeKind::ShortVarDecl, IrNodeKind::IncDecStmt, IrNodeKind::Fallthrough,
-        IrNodeKind::TypeSwitch, IrNodeKind::Synchronized, IrNodeKind::Finally,
-        IrNodeKind::UseDecl, IrNodeKind::ModDef, IrNodeKind::SehLeave,
+        IrNodeKind::GoStmt,
+        IrNodeKind::DeferStmt,
+        IrNodeKind::SelectStmt,
+        IrNodeKind::SendStmt,
+        IrNodeKind::ShortVarDecl,
+        IrNodeKind::IncDecStmt,
+        IrNodeKind::Fallthrough,
+        IrNodeKind::TypeSwitch,
+        IrNodeKind::Synchronized,
+        IrNodeKind::Finally,
+        IrNodeKind::UseDecl,
+        IrNodeKind::ModDef,
+        IrNodeKind::SehLeave,
     ]
 }
 
 fn decl_kinds() -> Vec<IrNodeKind> {
     vec![
-        IrNodeKind::ParamDef, IrNodeKind::LocalDef, IrNodeKind::FieldDef,
-        IrNodeKind::MethodDef, IrNodeKind::ClassDef, IrNodeKind::TypeAlias,
+        IrNodeKind::ParamDef,
+        IrNodeKind::LocalDef,
+        IrNodeKind::FieldDef,
+        IrNodeKind::MethodDef,
+        IrNodeKind::ClassDef,
+        IrNodeKind::TypeAlias,
     ]
 }
 
@@ -217,7 +350,10 @@ pub fn check_method_on_type(method: &str, ty: &TypeExpr) -> Result<(), String> {
     match group {
         MethodGroup::Universal => Ok(()),
         MethodGroup::CallOnly => {
-            if matches!(ty, TypeExpr::Call | TypeExpr::Node | TypeExpr::Expr | TypeExpr::Named(_)) {
+            if matches!(
+                ty,
+                TypeExpr::Call | TypeExpr::Node | TypeExpr::Expr | TypeExpr::Named(_)
+            ) {
                 Ok(())
             } else {
                 Err(format!(
@@ -227,7 +363,10 @@ pub fn check_method_on_type(method: &str, ty: &TypeExpr) -> Result<(), String> {
             }
         }
         MethodGroup::MethodDefOnly => {
-            if matches!(ty, TypeExpr::MethodDef | TypeExpr::Node | TypeExpr::Decl | TypeExpr::Named(_)) {
+            if matches!(
+                ty,
+                TypeExpr::MethodDef | TypeExpr::Node | TypeExpr::Decl | TypeExpr::Named(_)
+            ) {
                 Ok(())
             } else {
                 Err(format!(
@@ -237,7 +376,10 @@ pub fn check_method_on_type(method: &str, ty: &TypeExpr) -> Result<(), String> {
             }
         }
         MethodGroup::LiteralOnly => {
-            if matches!(ty, TypeExpr::Literal | TypeExpr::Node | TypeExpr::Expr | TypeExpr::Named(_)) {
+            if matches!(
+                ty,
+                TypeExpr::Literal | TypeExpr::Node | TypeExpr::Expr | TypeExpr::Named(_)
+            ) {
                 Ok(())
             } else {
                 Err(format!(
@@ -246,7 +388,10 @@ pub fn check_method_on_type(method: &str, ty: &TypeExpr) -> Result<(), String> {
             }
         }
         MethodGroup::ClassDefOnly => {
-            if matches!(ty, TypeExpr::ClassDef | TypeExpr::Node | TypeExpr::Decl | TypeExpr::Named(_)) {
+            if matches!(
+                ty,
+                TypeExpr::ClassDef | TypeExpr::Node | TypeExpr::Decl | TypeExpr::Named(_)
+            ) {
                 Ok(())
             } else {
                 Err(format!(
@@ -255,7 +400,10 @@ pub fn check_method_on_type(method: &str, ty: &TypeExpr) -> Result<(), String> {
             }
         }
         MethodGroup::IdentifierOnly => {
-            if matches!(ty, TypeExpr::Identifier | TypeExpr::Node | TypeExpr::Expr | TypeExpr::Named(_)) {
+            if matches!(
+                ty,
+                TypeExpr::Identifier | TypeExpr::Node | TypeExpr::Expr | TypeExpr::Named(_)
+            ) {
                 Ok(())
             } else {
                 Err(format!(

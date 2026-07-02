@@ -1,9 +1,9 @@
+use crate::symbolic::{SymbolicEval, SymbolicValue};
+use roaring::RoaringBitmap;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::RwLock;
-use roaring::RoaringBitmap;
-use web_sitter::{BasicBlock, Cpg, IrNodeKind, NodeId};
 use web_profiler as prof;
-use crate::symbolic::{SymbolicEval, SymbolicValue};
+use web_sitter::{BasicBlock, Cpg, IrNodeKind, NodeId};
 
 /// Unique identifier for a basic block within a function.
 pub type BlockId = u32;
@@ -27,7 +27,11 @@ impl DomTree {
     pub fn compute(succs: &[Vec<BlockId>], entry: BlockId) -> Self {
         let n = succs.len();
         if n == 0 {
-            return Self { idom: vec![], df: vec![], n: 0 };
+            return Self {
+                idom: vec![],
+                df: vec![],
+                n: 0,
+            };
         }
 
         // Build predecessor lists
@@ -77,14 +81,16 @@ impl DomTree {
             }
         }
 
-        let idom_vec: Vec<BlockId> = (0..n)
-            .map(|i| idom[i].unwrap_or(i as BlockId))
-            .collect();
+        let idom_vec: Vec<BlockId> = (0..n).map(|i| idom[i].unwrap_or(i as BlockId)).collect();
 
         // Compute dominance frontiers
         let df = compute_df(&idom_vec, &preds, n);
 
-        Self { idom: idom_vec, df, n }
+        Self {
+            idom: idom_vec,
+            df,
+            n,
+        }
     }
 
     /// Returns true if `dominator` strictly dominates `dominated`.
@@ -140,7 +146,10 @@ impl CfgReachability {
     pub fn compute(succs: &[Vec<BlockId>]) -> Self {
         let n = succs.len();
         if n == 0 {
-            return Self { reach: vec![], n: 0 };
+            return Self {
+                reach: vec![],
+                n: 0,
+            };
         }
 
         let (scc_id, scc_members) = tarjan_sccs(succs);
@@ -237,7 +246,10 @@ impl FunctionCfg {
         // Lexicographic sort would mis-order these ("bb_100" < "bb_5").
         fn_blocks.sort_by(|(a, _), (b, _)| {
             let num = |s: &str| -> u64 {
-                s.rsplit('_').next().and_then(|n| n.parse().ok()).unwrap_or(0)
+                s.rsplit('_')
+                    .next()
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(0)
             };
             num(a).cmp(&num(b))
         });
@@ -249,9 +261,20 @@ impl FunctionCfg {
                 succs: vec![],
                 preds: vec![],
                 node_to_block: HashMap::new(),
-                dom: DomTree { idom: vec![], df: vec![], n: 0 },
-                post_dom: DomTree { idom: vec![], df: vec![], n: 0 },
-                reach: CfgReachability { reach: vec![], n: 0 },
+                dom: DomTree {
+                    idom: vec![],
+                    df: vec![],
+                    n: 0,
+                },
+                post_dom: DomTree {
+                    idom: vec![],
+                    df: vec![],
+                    n: 0,
+                },
+                reach: CfgReachability {
+                    reach: vec![],
+                    n: 0,
+                },
                 entry: 0,
                 exception_blocks: HashSet::new(),
                 block_to_condition: HashMap::new(),
@@ -338,17 +361,25 @@ impl FunctionCfg {
             if node.function_id != Some(fn_id) {
                 continue;
             }
-            if !matches!(node.kind, IrNodeKind::Conditional | IrNodeKind::Loop | IrNodeKind::Switch) {
+            if !matches!(
+                node.kind,
+                IrNodeKind::Conditional | IrNodeKind::Loop | IrNodeKind::Switch
+            ) {
                 continue;
             }
             // Prefer the "condition" named field; fall back to the first child.
-            let cond_child = node.children.iter().enumerate().find_map(|(i, &cid)| {
-                if node.field_names.get(i).and_then(|f| f.as_deref()) == Some("condition") {
-                    Some(cid)
-                } else {
-                    None
-                }
-            }).or_else(|| node.children.first().copied());
+            let cond_child = node
+                .children
+                .iter()
+                .enumerate()
+                .find_map(|(i, &cid)| {
+                    if node.field_names.get(i).and_then(|f| f.as_deref()) == Some("condition") {
+                        Some(cid)
+                    } else {
+                        None
+                    }
+                })
+                .or_else(|| node.children.first().copied());
 
             if let Some(cid) = cond_child {
                 if let Some(&blk) = node_to_block.get(&cid) {
@@ -362,8 +393,16 @@ impl FunctionCfg {
         }
 
         Self {
-            succs, preds, node_to_block, dom, post_dom, reach, entry, exception_blocks,
-            block_to_condition, feasible_reach_cache: RwLock::new(HashMap::new()),
+            succs,
+            preds,
+            node_to_block,
+            dom,
+            post_dom,
+            reach,
+            entry,
+            exception_blocks,
+            block_to_condition,
+            feasible_reach_cache: RwLock::new(HashMap::new()),
         }
     }
 
@@ -401,8 +440,12 @@ impl FunctionCfg {
 
     /// True if `node` is inside a loop (i.e., its block is part of the loop's SCC).
     pub fn node_in_loop(&self, node: NodeId) -> bool {
-        let Some(&block) = self.node_to_block.get(&node) else { return false };
-        let Some(header) = self.find_loop_header(block) else { return false };
+        let Some(&block) = self.node_to_block.get(&node) else {
+            return false;
+        };
+        let Some(header) = self.find_loop_header(block) else {
+            return false;
+        };
         // The block IS the header (back edge discovered on header's predecessors), or
         // the block can reach the header (proving it's in the SCC, not just dominated by it).
         block == header || self.reach.can_reach(block, header)
@@ -430,9 +473,13 @@ impl FunctionCfg {
     /// True if `node` is inside a loop whose strongly-connected component has
     /// no exit edge to outside the loop body (i.e., infinite loop with no break/return).
     pub fn node_loop_has_no_exit(&self, node: NodeId, cpg: &Cpg) -> bool {
-        let Some(&block) = self.node_to_block.get(&node) else { return false };
+        let Some(&block) = self.node_to_block.get(&node) else {
+            return false;
+        };
         let n = self.succs.len();
-        let Some(header) = self.find_loop_header(block) else { return false };
+        let Some(header) = self.find_loop_header(block) else {
+            return false;
+        };
 
         // Symbolic short-circuit: if the loop header's condition is constant-true,
         // the structural "exit" edge is dead and the loop never terminates.
@@ -449,9 +496,7 @@ impl FunctionCfg {
 
         // Structural check: no block in the SCC has an exit edge.
         let in_scc = |b: u32| -> bool {
-            (b as usize) < n
-                && self.reach.can_reach(header, b)
-                && self.reach.can_reach(b, header)
+            (b as usize) < n && self.reach.can_reach(header, b) && self.reach.can_reach(b, header)
         };
         for b in 0..n as u32 {
             if !in_scc(b) {
@@ -468,7 +513,9 @@ impl FunctionCfg {
 
     /// True if `node` is on an exception-handling path.
     pub fn node_in_exception_path(&self, node: NodeId) -> bool {
-        let Some(&block) = self.node_to_block.get(&node) else { return false };
+        let Some(&block) = self.node_to_block.get(&node) else {
+            return false;
+        };
         self.exception_blocks.contains(&block)
     }
 
@@ -507,10 +554,8 @@ impl FunctionCfg {
     ///   "else"/"exit" arm).
     /// Falls back to following all successors when the condition isn't constant.
     pub fn feasible_reaches(&self, from: NodeId, to: NodeId, cpg: &Cpg) -> bool {
-        let (Some(&bf), Some(&bt)) = (
-            self.node_to_block.get(&from),
-            self.node_to_block.get(&to),
-        ) else {
+        let (Some(&bf), Some(&bt)) = (self.node_to_block.get(&from), self.node_to_block.get(&to))
+        else {
             return false;
         };
         self.feasible_reachable_blocks(bf, cpg).contains(&bt)
@@ -522,8 +567,12 @@ impl FunctionCfg {
     /// entry block instead of the `O(|node_to_block|)` scan callers used to do
     /// to find *some* node in the entry block first.
     pub fn node_in_dead_branch(&self, node: NodeId, cpg: &Cpg) -> bool {
-        let Some(&block) = self.node_to_block.get(&node) else { return false };
-        !self.feasible_reachable_blocks(self.entry, cpg).contains(&block)
+        let Some(&block) = self.node_to_block.get(&node) else {
+            return false;
+        };
+        !self
+            .feasible_reachable_blocks(self.entry, cpg)
+            .contains(&block)
     }
 
     /// Symbolic-pruned forward-reachable block set from `from`, memoized in
@@ -590,7 +639,9 @@ impl FunctionCfg {
 
     /// Returns the dominance frontier of the block containing `node`.
     pub fn dominance_frontier_for_node(&self, node: NodeId) -> Vec<BlockId> {
-        let Some(&block) = self.node_to_block.get(&node) else { return vec![] };
+        let Some(&block) = self.node_to_block.get(&node) else {
+            return vec![];
+        };
         self.dom.frontier(block).iter().collect()
     }
 }

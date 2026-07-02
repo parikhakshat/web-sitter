@@ -1,15 +1,15 @@
-use std::collections::{HashMap, HashSet};
-use std::collections::VecDeque;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use web_profiler as prof;
-use web_sitter::{Cpg, FunctionSummary, IrNode, IrNodeKind, NodeId};
 use crate::dfg::{DfgIndex, TaintConfig};
 use crate::engine::resolve_var_declaration;
 use crate::guard;
 use crate::ir::{TaintEndpointRef, TaintSpec};
 use crate::node_ref::NodeRef;
 use crate::size_tracking::AllocSizeIndex;
+use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use web_profiler as prof;
+use web_sitter::{Cpg, FunctionSummary, IrNode, IrNodeKind, NodeId};
 
 // ── Taint endpoint resolution ─────────────────────────────────────────────────
 
@@ -30,7 +30,8 @@ pub struct EndpointRegistry {
     /// `Arc`, not `Box`: per-scan registries (see `QueryEngine::build_taint_registry`)
     /// need to cheaply copy the base registry's propagator closures into a
     /// fresh, per-rule registry without consuming the (borrowed) base registry.
-    propagator_extractors: HashMap<String, Arc<dyn Fn(&Cpg) -> Vec<(NodeId, NodeId)> + Send + Sync>>,
+    propagator_extractors:
+        HashMap<String, Arc<dyn Fn(&Cpg) -> Vec<(NodeId, NodeId)> + Send + Sync>>,
 }
 
 impl EndpointRegistry {
@@ -52,7 +53,8 @@ impl EndpointRegistry {
     /// Register a pre-computed static list of node IDs for a given endpoint name.
     /// Useful for registering per-CPG source/sink nodes derived from SearchPlan evaluation.
     pub fn register_static(&mut self, name: impl Into<String>, nodes: Vec<NodeId>) {
-        self.extractors.insert(name.into(), Box::new(move |_| nodes.clone()));
+        self.extractors
+            .insert(name.into(), Box::new(move |_| nodes.clone()));
     }
 
     /// Merge all entries from `other` into this registry, with `other` taking precedence.
@@ -91,7 +93,10 @@ impl EndpointRegistry {
         match self.extractors.get(&endpoint.name) {
             Some(f) => f(cpg)
                 .into_iter()
-                .map(|node| ResolvedEndpoint { node, def_name: endpoint.name.clone() })
+                .map(|node| ResolvedEndpoint {
+                    node,
+                    def_name: endpoint.name.clone(),
+                })
                 .collect(),
             None => vec![],
         }
@@ -174,8 +179,14 @@ impl<'a> TaintEngine<'a> {
         summaries: &'a HashMap<String, FunctionSummary>,
     ) -> Self {
         Self {
-            registry, dfg, cpg, current_file, summaries,
-            cross_file: None, cfg_cache: None, sizes: None,
+            registry,
+            dfg,
+            cpg,
+            current_file,
+            summaries,
+            cross_file: None,
+            cfg_cache: None,
+            sizes: None,
         }
     }
 
@@ -222,8 +233,8 @@ impl<'a> TaintEngine<'a> {
         // top of whatever the rule explicitly listed — rule authors
         // shouldn't have to opt in to standard-library dataflow semantics
         // (StringBuilder.append, String.concat, sprintf, etc.) per rule.
-        let mut propagator_edges: Vec<(NodeId, NodeId)> = self
-            .resolve_propagator_edges(&spec.propagators);
+        let mut propagator_edges: Vec<(NodeId, NodeId)> =
+            self.resolve_propagator_edges(&spec.propagators);
         propagator_edges.extend(
             self.registry
                 .resolve_propagator(&format!("{}.propagators", self.cpg.language), self.cpg),
@@ -257,7 +268,12 @@ impl<'a> TaintEngine<'a> {
         // the call node itself as tainted (representing the return value) and
         // re-propagate. This handles library functions without DFG edges.
         if spec.require_interprocedural && !self.summaries.is_empty() {
-            self.expand_interprocedural(&mut result, &sanitizer_nodes, &taint_cfg, &mut interproc_edges);
+            self.expand_interprocedural(
+                &mut result,
+                &sanitizer_nodes,
+                &taint_cfg,
+                &mut interproc_edges,
+            );
         }
 
         // Cross-file interprocedural expansion: propagate taint into callee files
@@ -291,8 +307,12 @@ impl<'a> TaintEngine<'a> {
                     // propagator-aware reachability check instead so the two
                     // stay consistent. Also fold in `interproc_edges` so
                     // interprocedural/cross-file-only paths agree the same way.
-                    if self.reaches_with_propagators(src.node, sink.node, &taint_cfg, &interproc_edges)
-                    {
+                    if self.reaches_with_propagators(
+                        src.node,
+                        sink.node,
+                        &taint_cfg,
+                        &interproc_edges,
+                    ) {
                         // Enforce same-function constraint when requested
                         if spec.require_same_function {
                             let src_fn = self.cpg.ast.get(&src.node).and_then(|n| n.function_id);
@@ -336,11 +356,20 @@ impl<'a> TaintEngine<'a> {
     /// sharing a straight-line block with the sink would "dominate" it
     /// regardless of order, so the guard's line must also precede the sink's.
     fn is_guarded(&self, finding: &TaintFinding, guard_names: &[String]) -> bool {
-        let Some(cfg_cache) = self.cfg_cache else { return false };
-        let Some(sink_fn) = self.cpg.ast.get(&finding.sink_node).and_then(|n| n.function_id) else {
+        let Some(cfg_cache) = self.cfg_cache else {
             return false;
         };
-        let Some(fn_cfg) = cfg_cache.get(&sink_fn) else { return false };
+        let Some(sink_fn) = self
+            .cpg
+            .ast
+            .get(&finding.sink_node)
+            .and_then(|n| n.function_id)
+        else {
+            return false;
+        };
+        let Some(fn_cfg) = cfg_cache.get(&sink_fn) else {
+            return false;
+        };
         let Some(sink_line) = self.cpg.ast.get(&finding.sink_node).map(|n| n.line) else {
             return false;
         };
@@ -366,14 +395,21 @@ impl<'a> TaintEngine<'a> {
     /// function, additionally verify the comparison it sits in actually
     /// bounds the value (see `verify_length_guard`) rather than just
     /// accepting that the function was called somewhere in the condition.
-    fn condition_calls_guard(&self, cond_node: NodeId, guard_names: &[String], finding: &TaintFinding) -> bool {
+    fn condition_calls_guard(
+        &self,
+        cond_node: NodeId,
+        guard_names: &[String],
+        finding: &TaintFinding,
+    ) -> bool {
         let mut stack = vec![cond_node];
         let mut seen = HashSet::new();
         while let Some(id) = stack.pop() {
             if !seen.insert(id) {
                 continue;
             }
-            let Some(node) = self.cpg.ast.get(&id) else { continue };
+            let Some(node) = self.cpg.ast.get(&id) else {
+                continue;
+            };
             if node.kind == IrNodeKind::Call {
                 let callee = self
                     .cpg
@@ -386,9 +422,9 @@ impl<'a> TaintEngine<'a> {
                 if let Some(name) = callee {
                     if guard_names.iter().any(|g| g == name) {
                         let args = call_argument_nodes(self.cpg, id);
-                        let reaches = args
-                            .iter()
-                            .any(|&a| self.dfg.reaches(finding.source_node, a) || finding.source_node == a);
+                        let reaches = args.iter().any(|&a| {
+                            self.dfg.reaches(finding.source_node, a) || finding.source_node == a
+                        });
                         if reaches {
                             if guard::KNOWN_LENGTH_FUNCTIONS.contains(&name) {
                                 if self.verify_length_guard(cond_node, finding) {
@@ -423,7 +459,14 @@ impl<'a> TaintEngine<'a> {
         let capacity = self
             .sizes
             .and_then(|sizes| sink_destination_capacity(self.cpg, sizes, finding.sink_node));
-        guard::upper_bounds(self.cpg, self.dfg, finding.source_node, cond_node, finding.sink_node, capacity)
+        guard::upper_bounds(
+            self.cpg,
+            self.dfg,
+            finding.source_node,
+            cond_node,
+            finding.sink_node,
+            capacity,
+        )
     }
 
     fn resolve_propagator_edges(&self, propagators: &[TaintEndpointRef]) -> Vec<(NodeId, NodeId)> {
@@ -472,8 +515,12 @@ impl<'a> TaintEngine<'a> {
                 if sanitizer_nodes.contains(&call_id) || result.tainted.contains(&call_id) {
                     continue;
                 }
-                let Some(node) = self.cpg.ast.get(&call_id) else { continue };
-                let Some(arg_ids) = call_args.get(&call_id) else { continue };
+                let Some(node) = self.cpg.ast.get(&call_id) else {
+                    continue;
+                };
+                let Some(arg_ids) = call_args.get(&call_id) else {
+                    continue;
+                };
                 let tainted_args: HashSet<usize> = arg_ids
                     .iter()
                     .enumerate()
@@ -485,7 +532,11 @@ impl<'a> TaintEngine<'a> {
                 }
 
                 let expansion = expand_call_with_summary(node, &tainted_args, self.summaries);
-                if let TaintExpansionResult::Known { return_tainted: true, .. } = expansion {
+                if let TaintExpansionResult::Known {
+                    return_tainted: true,
+                    ..
+                } = expansion
+                {
                     result.tainted.insert(call_id);
                     new_tainted.push(call_id);
                     // Record the tainted-argument → call-node relationship that just
@@ -534,7 +585,9 @@ impl<'a> TaintEngine<'a> {
         taint_cfg: &TaintConfig<'_>,
         extra_edges: &mut Vec<(NodeId, NodeId)>,
     ) -> bool {
-        let Some(ctx) = self.cross_file else { return false };
+        let Some(ctx) = self.cross_file else {
+            return false;
+        };
         let _span = prof::span("taint.expand_cross_file");
         let mut changed = false;
         let mut examined: u64 = 0;
@@ -560,10 +613,14 @@ impl<'a> TaintEngine<'a> {
             if result.tainted.contains(node_id) {
                 continue;
             }
-            let Some(node) = self.cpg.ast.get(node_id) else { continue };
+            let Some(node) = self.cpg.ast.get(node_id) else {
+                continue;
+            };
 
             for (callee_file, callee_params) in callee_list {
-                let Some((callee_dfg, callee_cpg)) = ctx.file_dfgs.get(callee_file) else { continue };
+                let Some((callee_dfg, callee_cpg)) = ctx.file_dfgs.get(callee_file) else {
+                    continue;
+                };
 
                 // Find which argument nodes at this call site are tainted, and map
                 // them to the corresponding callee param nodes.
@@ -578,7 +635,8 @@ impl<'a> TaintEngine<'a> {
                 if tainted_args.is_empty() {
                     continue;
                 }
-                let tainted_param_nodes: Vec<NodeId> = tainted_args.iter().map(|&(_, p)| p).collect();
+                let tainted_param_nodes: Vec<NodeId> =
+                    tainted_args.iter().map(|&(_, p)| p).collect();
 
                 let sanitizers_empty = HashSet::new();
                 let props_empty = [];
@@ -655,12 +713,7 @@ impl<'a> TaintEngine<'a> {
         false
     }
 
-    fn shortest_path(
-        &self,
-        from: NodeId,
-        to: NodeId,
-        cfg: &TaintConfig<'_>,
-    ) -> Vec<NodeId> {
+    fn shortest_path(&self, from: NodeId, to: NodeId, cfg: &TaintConfig<'_>) -> Vec<NodeId> {
         let _span = prof::span("taint.shortest_path_bfs");
         let mut visited: HashMap<NodeId, NodeId> = HashMap::new(); // node → parent
         let mut queue = VecDeque::new();
@@ -702,9 +755,7 @@ impl<'a> TaintEngine<'a> {
 /// per-language call shapes used elsewhere in this module), plus the reverse index
 /// (argument node id → calls that read it). Used to drive the interprocedural taint
 /// expansion worklist without rescanning the whole AST on every round.
-fn index_call_arguments(
-    cpg: &Cpg,
-) -> (HashMap<NodeId, Vec<NodeId>>, HashMap<NodeId, Vec<NodeId>>) {
+fn index_call_arguments(cpg: &Cpg) -> (HashMap<NodeId, Vec<NodeId>>, HashMap<NodeId, Vec<NodeId>>) {
     let mut call_args: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
     let mut arg_to_calls: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
 
@@ -726,7 +777,9 @@ fn index_call_arguments(
 /// `arguments` container child most languages wrap arguments in (falling
 /// back to the call's direct children for shapes that don't).
 fn call_argument_nodes(cpg: &Cpg, call_id: NodeId) -> Vec<NodeId> {
-    let Some(node) = cpg.ast.get(&call_id) else { return Vec::new() };
+    let Some(node) = cpg.ast.get(&call_id) else {
+        return Vec::new();
+    };
     node.children
         .iter()
         .find_map(|&cid| {
@@ -802,7 +855,10 @@ pub fn expand_call_with_summary(
             }
         }
 
-        TaintExpansionResult::Known { return_tainted, is_sink }
+        TaintExpansionResult::Known {
+            return_tainted,
+            is_sink,
+        }
     } else {
         TaintExpansionResult::Unknown
     }
@@ -858,8 +914,20 @@ mod tests {
         // call(1) with direct children [10, 11] (no argument_list wrapper).
         let cpg = cpg_from(vec![
             (1, call_node("f", vec![10, 11])),
-            (10, IrNode { kind: IrNodeKind::Identifier, ..IrNode::default() }),
-            (11, IrNode { kind: IrNodeKind::Identifier, ..IrNode::default() }),
+            (
+                10,
+                IrNode {
+                    kind: IrNodeKind::Identifier,
+                    ..IrNode::default()
+                },
+            ),
+            (
+                11,
+                IrNode {
+                    kind: IrNodeKind::Identifier,
+                    ..IrNode::default()
+                },
+            ),
         ]);
         let (call_args, arg_to_calls) = index_call_arguments(&cpg);
 
@@ -874,8 +942,20 @@ mod tests {
         let cpg = cpg_from(vec![
             (1, call_node("f", vec![2])),
             (2, args_container_node(vec![10, 11])),
-            (10, IrNode { kind: IrNodeKind::Identifier, ..IrNode::default() }),
-            (11, IrNode { kind: IrNodeKind::Identifier, ..IrNode::default() }),
+            (
+                10,
+                IrNode {
+                    kind: IrNodeKind::Identifier,
+                    ..IrNode::default()
+                },
+            ),
+            (
+                11,
+                IrNode {
+                    kind: IrNodeKind::Identifier,
+                    ..IrNode::default()
+                },
+            ),
         ]);
         let (call_args, arg_to_calls) = index_call_arguments(&cpg);
 
@@ -892,7 +972,13 @@ mod tests {
         let cpg = cpg_from(vec![
             (1, call_node("inner", vec![10])),
             (2, call_node("outer", vec![1])),
-            (10, IrNode { kind: IrNodeKind::Identifier, ..IrNode::default() }),
+            (
+                10,
+                IrNode {
+                    kind: IrNodeKind::Identifier,
+                    ..IrNode::default()
+                },
+            ),
         ]);
         let (_call_args, arg_to_calls) = index_call_arguments(&cpg);
 
@@ -902,9 +988,13 @@ mod tests {
 
     #[test]
     fn index_call_arguments_ignores_non_call_nodes() {
-        let cpg = cpg_from(vec![
-            (1, IrNode { kind: IrNodeKind::MethodDef, ..IrNode::default() }),
-        ]);
+        let cpg = cpg_from(vec![(
+            1,
+            IrNode {
+                kind: IrNodeKind::MethodDef,
+                ..IrNode::default()
+            },
+        )]);
         let (call_args, arg_to_calls) = index_call_arguments(&cpg);
         assert!(call_args.is_empty());
         assert!(arg_to_calls.is_empty());
@@ -948,14 +1038,27 @@ mod tests {
         summaries.insert("wrap2".to_owned(), summary_with_taint_return("wrap2", 0));
 
         let registry = EndpointRegistry::new();
-        let engine = TaintEngine::new(&registry, &dfg, &cpg, std::path::Path::new("test.c"), &summaries);
+        let engine = TaintEngine::new(
+            &registry,
+            &dfg,
+            &cpg,
+            std::path::Path::new("test.c"),
+            &summaries,
+        );
 
-        let mut result = dfg.propagate_taint(&[SOURCE], &TaintConfig {
-            sanitizer_nodes: &HashSet::new(),
-            propagator_edges: &[],
-            max_depth: 20,
-        });
-        assert_eq!(result.tainted, HashSet::from([SOURCE]), "sanity: no DFG edges yet");
+        let mut result = dfg.propagate_taint(
+            &[SOURCE],
+            &TaintConfig {
+                sanitizer_nodes: &HashSet::new(),
+                propagator_edges: &[],
+                max_depth: 20,
+            },
+        );
+        assert_eq!(
+            result.tainted,
+            HashSet::from([SOURCE]),
+            "sanity: no DFG edges yet"
+        );
 
         let sanitizer_nodes = HashSet::new();
         let taint_cfg = TaintConfig {
@@ -966,7 +1069,10 @@ mod tests {
         let mut extra_edges = Vec::new();
         engine.expand_interprocedural(&mut result, &sanitizer_nodes, &taint_cfg, &mut extra_edges);
 
-        assert!(result.tainted.contains(&WRAP1), "first hop (wrap1) should become tainted");
+        assert!(
+            result.tainted.contains(&WRAP1),
+            "first hop (wrap1) should become tainted"
+        );
         assert!(
             result.tainted.contains(&WRAP2),
             "second hop (wrap2) should become tainted via the nested-call worklist, \
@@ -989,7 +1095,13 @@ mod tests {
         summaries.insert("wrap1".to_owned(), summary_with_taint_return("wrap1", 0));
 
         let registry = EndpointRegistry::new();
-        let engine = TaintEngine::new(&registry, &dfg, &cpg, std::path::Path::new("test.c"), &summaries);
+        let engine = TaintEngine::new(
+            &registry,
+            &dfg,
+            &cpg,
+            std::path::Path::new("test.c"),
+            &summaries,
+        );
 
         let mut result = crate::dfg::TaintResult {
             tainted: HashSet::from([SOURCE]),
