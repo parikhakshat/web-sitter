@@ -60,7 +60,8 @@ impl WebMcpServer {
             call_graph: Arc::new(call_graph),
             tool_router: Self::lookup_tool_router()
                 + Self::callgraph_tool_router()
-                + Self::dataflow_tool_router(),
+                + Self::dataflow_tool_router()
+                + Self::impact_tool_router(),
         }
     }
 }
