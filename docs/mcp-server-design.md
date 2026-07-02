@@ -53,7 +53,7 @@ web-mcp/
       shard.rs             # per-shard (directory/module) load/evict/lock management
       findings.rs           # persistent finding-state tracking
     tools/
-      lookup.rs, callgraph.rs, dataflow.rs, query.rs, impact.rs, anonymize.rs   # pillar 1: memory
+      lookup.rs, callgraph.rs, dataflow.rs, query.rs, impact.rs                # pillar 1: memory
       verify.rs, scan.rs, variants.rs                                          # pillar 2: verification
     security/
       generalize.rs         # "query by example": CPG subgraph -> generated ScuzzQL query (backs find_variants)
@@ -109,9 +109,6 @@ All three read from — and, for finding-state, write to — the same on-disk st
 
 **Change-impact**
 - `impact_of_change(file, edits[])` — runs edits through `try_targeted_update`'s classification (unaffected/preserved/affected-function/affected-class) *without committing*, returning the blast radius (functions/callers needing re-verification) so an agent can decide whether a patch needs wider re-testing before applying it. Also the scoping mechanism pillar 2's scans use to avoid whole-repo reruns after a small diff.
-
-**Privacy-aware context**
-- `anonymized_context(file_or_symbol)` — wraps `SymbolAnonymizer::anonymize` (`web-sitter/src/symbol_anonymizer.rs`); the README already frames this as intentional (for sending CPGs to external/less-trusted models), the MCP tool just exposes it.
 
 ### Pillar 2 — Verification / Security Analysis
 
@@ -181,5 +178,5 @@ Today `IncrementalCpgGenerator` (single-file, edit-driven) and `Workspace`/`File
 - `web-ql/src/workspace.rs::extract_cpg_subgraph` — BFS subgraph extraction, the starting point for `find_variants`'s generalization step.
 - `web-ql-queries/` — the 52-rule CWE corpus `run_security_scan`'s default rule set draws from.
 - `web-sitter/src/function_summary.rs`, `web-sitter/src/type_inference.rs` — interprocedural summaries and type info backing `symbol_summary`.
-- `web-sitter/src/symbol_anonymizer.rs` — backs the anonymized-context tool, and is a useful reference pattern (identifier→placeholder generalization) for `security/generalize.rs`.
+- `web-sitter/src/symbol_anonymizer.rs` — a useful reference pattern (identifier→placeholder generalization) for `security/generalize.rs`.
 - Root `Cargo.toml` — where the new `web-mcp` workspace member is registered.
