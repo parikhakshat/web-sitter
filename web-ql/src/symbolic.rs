@@ -98,6 +98,14 @@ impl<'a> SymbolicEval<'a> {
             if let Some(sz) = node.array_size {
                 return SymbolicValue::Int(sz);
             }
+            // `array_size` is never actually populated on a SizeofExpr node by
+            // the lifter/enrichment pipeline (it's only set on the
+            // `array_declarator` of the *declaration* itself) — resolve
+            // `sizeof(x)`'s operand back to its declaration and read the
+            // array size from there instead.
+            if let Some(sz) = self.sizeof_operand_array_size(node_id) {
+                return SymbolicValue::Int(sz);
+            }
         }
 
         // ── Binary arithmetic / comparison ────────────────────────────────────
@@ -172,6 +180,40 @@ impl<'a> SymbolicEval<'a> {
         SymbolicValue::Unknown
     }
 
+    /// Resolve `sizeof(x)`'s declared array size by finding the identifier
+    /// inside the operand and matching it (by name, within the same
+    /// function when known) against a `LocalDef`/`ParamDef` declaration that
+    /// has an `array_size`-bearing descendant (the `array_declarator`).
+    /// Name-based resolution — doesn't model block-level shadowing — but
+    /// matches the simplification used elsewhere in this crate
+    /// (`resolve_var_declaration` in engine.rs).
+    fn sizeof_operand_array_size(&self, node_id: NodeId) -> Option<i64> {
+        let node = self.cpg.ast.get(&node_id)?;
+        let operand_id = *node.children.first()?;
+        let ident = find_first_identifier(self.cpg, operand_id)?;
+        let name = ident.text.as_deref()?;
+        let fid = ident.function_id;
+
+        let mut fallback: Option<i64> = None;
+        for (&id, n) in &self.cpg.ast {
+            if !matches!(n.kind, IrNodeKind::LocalDef | IrNodeKind::ParamDef) {
+                continue;
+            }
+            let decl_name = n.name.as_deref().or(n.text.as_deref());
+            if decl_name != Some(name) {
+                continue;
+            }
+            let Some(sz) = array_size_in_subtree(self.cpg, id) else { continue };
+            if fid.is_some() && n.function_id == fid {
+                return Some(sz);
+            }
+            if fallback.is_none() {
+                fallback = Some(sz);
+            }
+        }
+        fallback
+    }
+
     /// Evaluate to an integer if the expression is constant-foldable.
     pub fn eval_int(&mut self, node_id: NodeId) -> Option<i64> {
         match self.eval(node_id) {
@@ -192,6 +234,36 @@ impl<'a> SymbolicEval<'a> {
     pub fn is_const(&mut self, node_id: NodeId) -> bool {
         !matches!(self.eval(node_id), SymbolicValue::Unknown)
     }
+}
+
+// ── Sizeof-operand resolution helpers ──────────────────────────────────────────
+
+/// Depth-first search for the first `Identifier` descendant (inclusive).
+fn find_first_identifier(cpg: &Cpg, root: NodeId) -> Option<&web_sitter::IrNode> {
+    let mut stack = vec![root];
+    while let Some(id) = stack.pop() {
+        let Some(node) = cpg.ast.get(&id) else { continue };
+        if node.kind == IrNodeKind::Identifier {
+            return Some(node);
+        }
+        stack.extend(node.children.iter().rev().copied());
+    }
+    None
+}
+
+/// Depth-first search for an `array_size` field on `root` or any descendant
+/// (the array size lives on the `array_declarator`, one or two levels below
+/// the `LocalDef`/`ParamDef` that declares the variable).
+fn array_size_in_subtree(cpg: &Cpg, root: NodeId) -> Option<i64> {
+    let mut stack = vec![root];
+    while let Some(id) = stack.pop() {
+        let Some(node) = cpg.ast.get(&id) else { continue };
+        if let Some(sz) = node.array_size {
+            return Some(sz);
+        }
+        stack.extend(node.children.iter().rev().copied());
+    }
+    None
 }
 
 // ── Integer literal parser ────────────────────────────────────────────────────

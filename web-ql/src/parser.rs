@@ -411,6 +411,7 @@ impl Parser {
         let mut sources = Vec::new();
         let mut sinks = Vec::new();
         let mut sanitizers = Vec::new();
+        let mut guards = Vec::new();
         let mut propagators = Vec::new();
         let mut require_interprocedural = None;
         let mut max_call_depth = None;
@@ -437,6 +438,11 @@ impl Parser {
                     self.expect(&Token::Colon, "`:`")?;
                     sanitizers = self.parse_named_ref_list()?;
                 }
+                Some(Token::Guards) => {
+                    self.advance();
+                    self.expect(&Token::Colon, "`:`")?;
+                    guards = self.parse_named_ref_list()?.into_iter().map(|r| r.name).collect();
+                }
                 Some(Token::Propagators) => {
                     self.advance();
                     self.expect(&Token::Colon, "`:`")?;
@@ -461,7 +467,7 @@ impl Parser {
                     let st = self.peek().unwrap();
                     return Err(ParseError::UnexpectedToken {
                         found: format!("{:?}", st.token),
-                        expected: "sources | sinks | sanitizers | propagators | require_interprocedural | max_call_depth | `}`".to_owned(),
+                        expected: "sources | sinks | sanitizers | guards | propagators | require_interprocedural | max_call_depth | `}`".to_owned(),
                         span: st.span,
                     });
                 }
@@ -479,6 +485,7 @@ impl Parser {
             sources,
             sinks,
             sanitizers,
+            guards,
             propagators,
             require_interprocedural,
             max_call_depth,

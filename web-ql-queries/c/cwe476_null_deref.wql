@@ -84,8 +84,12 @@ rule "cwe-476-c-malloc-immediate-subscript" {
 // `ptr->field` was ever caught and plain `*ptr` dereferences were missed.
 // `Expr` covers both MemberAccess and UnaryOp, so bind there instead.
 
+// `field_expression` covers both `.` (plain struct/union member access —
+// never a NULL-pointer dereference, since there's no pointer involved) and
+// `->` (an actual pointer dereference) — scope to `->` via text so that
+// tainted-but-non-pointer struct/union field reads aren't misreported.
 sink c_ptr_deref_sinks = find n: Expr where
-    n.raw_kind() == "field_expression"
+    (n.raw_kind() == "field_expression" and n.text() in /->/)
     or (n.raw_kind() == "pointer_expression" and n.text() in /^\*/)
 
 rule "cwe-476-c-tainted-null-deref" {

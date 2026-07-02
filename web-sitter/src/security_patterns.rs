@@ -1662,18 +1662,24 @@ pub const STDLIB_TAINT_SINKS: &[(&str, SinkSpec)] = &[
     ("bcopy", SinkSpec { sink_args: &[0] }), // bcopy(src,dst,n): tainted src
     // ── String operations (buffer overflow) ──────────────────────────────────
     ("strcpy", SinkSpec { sink_args: &[1] }),
-    ("strncpy", SinkSpec { sink_args: &[1] }),
+    // `strncpy(dst, src, n)`/`strncat(dst, src, n)` are *bounded* copies —
+    // tainted content (arg 1) reaching them isn't itself dangerous (that's
+    // the whole point of using the bounded form over strcpy/strcat); a
+    // tainted *length* (arg 2, `n`) is the actual overflow risk, matching the
+    // memcpy/memmove/snprintf entries below.
+    ("strncpy", SinkSpec { sink_args: &[2] }),
     ("strcat", SinkSpec { sink_args: &[1] }),
-    ("strncat", SinkSpec { sink_args: &[1] }),
+    ("strncat", SinkSpec { sink_args: &[2] }),
     ("strdup", SinkSpec { sink_args: &[0] }),
     ("strndup", SinkSpec { sink_args: &[0] }),
     ("stpcpy", SinkSpec { sink_args: &[1] }),
     ("stpncpy", SinkSpec { sink_args: &[1] }),
     // ── Wide-character string operations ─────────────────────────────────────
     ("wcscpy", SinkSpec { sink_args: &[1] }),
-    ("wcsncpy", SinkSpec { sink_args: &[1] }),
+    // Bounded forms — see the strncpy/strncat comment above.
+    ("wcsncpy", SinkSpec { sink_args: &[2] }),
     ("wcscat", SinkSpec { sink_args: &[1] }),
-    ("wcsncat", SinkSpec { sink_args: &[1] }),
+    ("wcsncat", SinkSpec { sink_args: &[2] }),
     ("wcsdup", SinkSpec { sink_args: &[0] }),
     ("wcstombs", SinkSpec { sink_args: &[1] }),
     ("wcsnrtombs", SinkSpec { sink_args: &[1] }),

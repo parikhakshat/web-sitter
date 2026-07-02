@@ -95,7 +95,9 @@ impl<'a> RuleRunner<'a> {
                                 self.ctx.cpg,
                                 self.ctx.current_file,
                                 self.ctx.summaries,
-                            );
+                            )
+                            .with_cfg_cache(self.ctx.cfg_cache)
+                            .with_sizes(self.ctx.sizes);
                             if let Some(cf) = self.ctx.cross_file {
                                 engine = engine.with_cross_file(cf);
                             }
@@ -313,7 +315,9 @@ impl<'a> RuleRunner<'a> {
                     self.ctx.cpg,
                     self.ctx.current_file,
                     self.ctx.summaries,
-                );
+                )
+                .with_cfg_cache(self.ctx.cfg_cache)
+                .with_sizes(self.ctx.sizes);
                 if let Some(cf) = self.ctx.cross_file {
                     engine = engine.with_cross_file(cf);
                 }
@@ -1540,7 +1544,7 @@ fn guard_const_eval(cpg: &Cpg, node_id: NodeId) -> Option<bool> {
 /// back to any matching declaration (e.g. a global) otherwise. Name-based
 /// resolution is a simplification — it does not model block-level shadowing —
 /// but is sufficient for the common case of one declaration per name.
-fn resolve_var_declaration(cpg: &Cpg, node_id: NodeId, node: &IrNode) -> Option<NodeId> {
+pub(crate) fn resolve_var_declaration(cpg: &Cpg, node_id: NodeId, node: &IrNode) -> Option<NodeId> {
     if node.kind != IrNodeKind::Identifier {
         return None;
     }

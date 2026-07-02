@@ -71,6 +71,8 @@ pub enum Token {
     Sinks,
     #[token("sanitizers")]
     Sanitizers,
+    #[token("guards")]
+    Guards,
     #[token("propagators")]
     Propagators,
     #[token("require_interprocedural")]

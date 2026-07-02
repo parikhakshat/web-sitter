@@ -104,5 +104,8 @@ rule "cwe-125-c-tainted-read-size" {
     taint {
         sources: ["c.io_sources"]
         sinks:   ["c.bounded_copy_ops"]
+        // A dominating, preceding `if (strlen(tainted) < N)`-style length
+        // check gates the read (see cwe-787-c-tainted-copy-size).
+        guards: ["strlen", "strnlen", "wcslen"]
     }
 }

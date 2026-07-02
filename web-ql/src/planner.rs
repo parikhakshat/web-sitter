@@ -276,6 +276,7 @@ impl Planner {
         for nr in &tc.propagators {
             spec.propagators.push(self.compile_named_ref(nr, &scope)?);
         }
+        spec.guards = tc.guards.clone();
 
         Ok(spec)
     }

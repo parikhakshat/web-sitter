@@ -82,6 +82,11 @@ rule "cwe-787-c-tainted-copy-size" {
     taint {
         sources: ["c.io_sources"]
         sinks:   ["c.string_copy_ops"]
+        // A dominating, preceding `if (strlen(tainted) < sizeof(dst))`-style
+        // length check gates the copy — the value itself isn't transformed
+        // (so it can't be a `sanitizers` entry), but the sink is only
+        // reachable once the guard has approved the length.
+        guards: ["strlen", "strnlen", "wcslen"]
     }
 }
 

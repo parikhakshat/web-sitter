@@ -31,6 +31,9 @@ rule "cwe-190-c-tainted-copy-len" {
         sources: ["c.io_sources"]
         sinks:   ["c.string_copy_ops", "c.bounded_copy_ops"]
         sanitizers: ["c_overflow_checks"]
+        // A dominating, preceding `if (strlen(tainted) < N)`-style length
+        // check gates the copy (see cwe-787-c-tainted-copy-size).
+        guards: ["strlen", "strnlen", "wcslen"]
     }
 }
 

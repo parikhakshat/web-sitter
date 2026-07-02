@@ -245,6 +245,10 @@ pub struct TaintSpec {
     pub sinks: Vec<TaintEndpointRef>,
     pub sanitizers: Vec<TaintEndpointRef>,
     pub propagators: Vec<TaintEndpointRef>,
+    /// Function names that, when called on the tainted value inside a
+    /// dominating, textually-preceding conditional, suppress that particular
+    /// source→sink finding (see `TaintClause::guards` in ast.rs).
+    pub guards: Vec<String>,
     pub require_interprocedural: bool,
     pub max_call_depth: u32,
     pub require_same_function: bool,
@@ -257,6 +261,7 @@ impl Default for TaintSpec {
             sinks: Vec::new(),
             sanitizers: Vec::new(),
             propagators: Vec::new(),
+            guards: Vec::new(),
             require_interprocedural: true,
             max_call_depth: 10,
             require_same_function: false,

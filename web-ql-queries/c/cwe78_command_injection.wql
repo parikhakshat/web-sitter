@@ -14,6 +14,13 @@ rule "cwe-78-c-command-injection" {
         sources: ["c.io_sources"]
         sinks:   ["c.exec_ops", "cpp.exec_ops"]
         sanitizers: ["c.command_sanitizers"]
+        // A dominating, preceding `if (validate(cmd)) { exec(cmd); }`-style
+        // gate: the tainted value itself is never transformed (so it can't be
+        // a `sanitizers` entry), but the sink is only reachable once the
+        // guard approved it. Conventional validation-function names, mirrors
+        // the naming convention `c.path_sanitizers`/`c.command_sanitizers`
+        // already use for user-defined helpers.
+        guards: ["validate", "is_valid", "sanitize", "is_safe", "check_valid"]
     }
 }
 

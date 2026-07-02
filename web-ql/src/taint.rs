@@ -5,8 +5,11 @@ use std::sync::Arc;
 use web_profiler as prof;
 use web_sitter::{Cpg, FunctionSummary, IrNode, IrNodeKind, NodeId};
 use crate::dfg::{DfgIndex, TaintConfig};
+use crate::engine::resolve_var_declaration;
 use crate::ir::{TaintEndpointRef, TaintSpec};
 use crate::node_ref::NodeRef;
+use crate::size_tracking::AllocSizeIndex;
+use crate::symbolic::SymbolicEval;
 
 // ── Taint endpoint resolution ─────────────────────────────────────────────────
 
@@ -149,6 +152,17 @@ pub struct TaintEngine<'a> {
     pub summaries: &'a HashMap<String, FunctionSummary>,
     /// Optional cross-file DFG context for cross-file taint propagation.
     pub cross_file: Option<&'a CrossFileTaintCtx<'a>>,
+    /// Per-function CFGs (keyed by function-def node id), needed to evaluate
+    /// `TaintSpec::guards`. `None` disables guard filtering (guarded findings
+    /// are reported like any other, rather than risk silently dropping real
+    /// findings when CFG data isn't available).
+    pub cfg_cache: Option<&'a HashMap<NodeId, crate::cfg::FunctionCfg>>,
+    /// Buffer/allocation size index, needed to verify a length-comparison
+    /// guard's bound against the sink's actual destination capacity (see
+    /// `verify_length_guard`). `None` falls back to direction-only
+    /// verification (still real symbolic checking, just without the
+    /// numeric-magnitude cross-check).
+    pub sizes: Option<&'a AllocSizeIndex>,
 }
 
 impl<'a> TaintEngine<'a> {
@@ -159,11 +173,24 @@ impl<'a> TaintEngine<'a> {
         current_file: &'a Path,
         summaries: &'a HashMap<String, FunctionSummary>,
     ) -> Self {
-        Self { registry, dfg, cpg, current_file, summaries, cross_file: None }
+        Self {
+            registry, dfg, cpg, current_file, summaries,
+            cross_file: None, cfg_cache: None, sizes: None,
+        }
     }
 
     pub fn with_cross_file(mut self, ctx: &'a CrossFileTaintCtx<'a>) -> Self {
         self.cross_file = Some(ctx);
+        self
+    }
+
+    pub fn with_cfg_cache(mut self, cache: &'a HashMap<NodeId, crate::cfg::FunctionCfg>) -> Self {
+        self.cfg_cache = Some(cache);
+        self
+    }
+
+    pub fn with_sizes(mut self, sizes: &'a AllocSizeIndex) -> Self {
+        self.sizes = Some(sizes);
         self
     }
 
@@ -288,7 +315,156 @@ impl<'a> TaintEngine<'a> {
             }
         }
 
+        if !spec.guards.is_empty() {
+            findings.retain(|f| !self.is_guarded(f, &spec.guards));
+        }
+
         findings
+    }
+
+    /// True if a dominating, textually-preceding conditional calls one of
+    /// `guard_names` in a way that actually establishes the tainted value is
+    /// safe at the sink — i.e. `if (validate(tainted)) { sink(tainted); }`
+    /// or `if (strlen(tainted) < sizeof(dst)) { strcpy(dst, tainted); }`.
+    /// Unlike a sanitizer (a node the tainted value flows *through* and
+    /// comes out clean), this models a control-flow gate: the value itself
+    /// is never transformed, but the sink is only reachable once the guard
+    /// has approved it.
+    ///
+    /// `dominates()` is block-granular (see cwe476_null_deref.wql's
+    /// `null_checked` for the WQL-level version of this caveat) — a guard
+    /// sharing a straight-line block with the sink would "dominate" it
+    /// regardless of order, so the guard's line must also precede the sink's.
+    fn is_guarded(&self, finding: &TaintFinding, guard_names: &[String]) -> bool {
+        let Some(cfg_cache) = self.cfg_cache else { return false };
+        let Some(sink_fn) = self.cpg.ast.get(&finding.sink_node).and_then(|n| n.function_id) else {
+            return false;
+        };
+        let Some(fn_cfg) = cfg_cache.get(&sink_fn) else { return false };
+        let Some(sink_line) = self.cpg.ast.get(&finding.sink_node).map(|n| n.line) else {
+            return false;
+        };
+
+        for (&nid, node) in &self.cpg.ast {
+            if node.kind != IrNodeKind::Conditional || node.function_id != Some(sink_fn) {
+                continue;
+            }
+            if node.line > sink_line || !fn_cfg.node_dominates(nid, finding.sink_node) {
+                continue;
+            }
+            if self.condition_calls_guard(nid, guard_names, finding) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// True if the subtree rooted at `cond_node` (a Conditional's condition)
+    /// contains a call to one of `guard_names` whose argument is reachable
+    /// from `finding.source_node` — i.e. the guard is actually checking
+    /// *this* tainted value, not an unrelated variable. For a known length
+    /// function, additionally verify the comparison it sits in actually
+    /// bounds the value (see `verify_length_guard`) rather than just
+    /// accepting that the function was called somewhere in the condition.
+    fn condition_calls_guard(&self, cond_node: NodeId, guard_names: &[String], finding: &TaintFinding) -> bool {
+        let mut stack = vec![cond_node];
+        let mut seen = HashSet::new();
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            let Some(node) = self.cpg.ast.get(&id) else { continue };
+            if node.kind == IrNodeKind::Call {
+                let callee = self
+                    .cpg
+                    .call_graph
+                    .values()
+                    .flat_map(|e| &e.calls)
+                    .find(|cs| cs.call_site == Some(id))
+                    .map(|cs| cs.callee.as_str())
+                    .or(node.name.as_deref());
+                if let Some(name) = callee {
+                    if guard_names.iter().any(|g| g == name) {
+                        let args = call_argument_nodes(self.cpg, id);
+                        let reaches = args
+                            .iter()
+                            .any(|&a| self.dfg.reaches(finding.source_node, a) || finding.source_node == a);
+                        if reaches {
+                            if KNOWN_LENGTH_FUNCTIONS.contains(&name) {
+                                if self.verify_length_guard(id, cond_node, finding) {
+                                    return true;
+                                }
+                                // Wrong direction/magnitude, or no enclosing
+                                // comparison at all (`if (strlen(x))` as a
+                                // bare truthiness check) — this particular
+                                // call doesn't establish safety; keep
+                                // looking for another guard in the same
+                                // condition (e.g. `a || b`).
+                            } else {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+            stack.extend(node.children.iter().copied());
+        }
+        false
+    }
+
+    /// Verify that `len_call` (a call to a known length function, e.g.
+    /// `strlen(x)`) sits inside a comparison that actually bounds it against
+    /// the sink's destination capacity, accounting for:
+    /// - which side of the comparison the length call is on,
+    /// - which branch of `cond_node` reaches the sink (so `if (cond) return;`
+    ///   is understood as "reaching the sink requires `cond` to be false"),
+    /// - a constant offset on the length side (`strlen(x) + 1`), and
+    /// - the actual known size of the sink's destination buffer, when
+    ///   statically resolvable.
+    ///
+    /// When the destination size *isn't* statically resolvable (e.g. it's a
+    /// `size_t` parameter, not a fixed array), falls back to verifying only
+    /// that the comparison's direction is a valid upper-bound shape — still
+    /// real symbolic verification (rejects `if (strlen(x) > n)`-style
+    /// non-bounds as a guard), just without the numeric cross-check.
+    fn verify_length_guard(&self, len_call: NodeId, cond_node: NodeId, finding: &TaintFinding) -> bool {
+        let Some((_binop, value_side, bound_side, op, flipped)) =
+            find_enclosing_comparison(self.cpg, len_call, cond_node)
+        else {
+            return false;
+        };
+
+        let mut op = op.as_str();
+        if flipped {
+            op = flip_operator(op);
+        }
+        match branch_polarity(self.cpg, cond_node, finding.sink_node) {
+            Some(true) => {}
+            Some(false) => op = negate_operator(op),
+            None => return false,
+        }
+        // After polarity adjustment, the comparison must read as
+        // `value <op> bound` with `op` an upper-bound shape — anything else
+        // (`>`, `>=`, `==`, `!=`) doesn't establish that the value is small
+        // enough, regardless of which function produced it.
+        if op != "<" && op != "<=" {
+            return false;
+        }
+
+        let offset = extract_length_offset(self.cpg, value_side, len_call).unwrap_or(0);
+
+        let Some(sizes) = self.sizes else { return true };
+        let mut se = SymbolicEval::new(self.cpg);
+        let Some(bound_val) = se.eval_int(bound_side) else { return true };
+        let Some(dest_capacity) = sink_destination_capacity(self.cpg, sizes, finding.sink_node) else {
+            return true;
+        };
+        let threshold = dest_capacity.saturating_add(offset);
+        if op == "<" {
+            bound_val <= threshold
+        } else {
+            bound_val < threshold
+        }
     }
 
     fn resolve_propagator_edges(&self, propagators: &[TaintEndpointRef]) -> Vec<(NodeId, NodeId)> {
@@ -577,19 +753,7 @@ fn index_call_arguments(
         if node.kind != IrNodeKind::Call {
             continue;
         }
-        let arg_ids: Vec<NodeId> = node
-            .children
-            .iter()
-            .find_map(|&cid| {
-                let child = cpg.ast.get(&cid)?;
-                if matches!(child.node_type.as_str(), "argument_list" | "arguments") {
-                    Some(child.children.iter().copied().collect::<Vec<_>>())
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_else(|| node.children.iter().copied().collect());
-
+        let arg_ids = call_argument_nodes(cpg, node_id);
         for &arg_id in &arg_ids {
             arg_to_calls.entry(arg_id).or_default().push(node_id);
         }
@@ -597,6 +761,204 @@ fn index_call_arguments(
     }
 
     (call_args, arg_to_calls)
+}
+
+/// Argument nodes of a single `Call`, descending into the `argument_list`/
+/// `arguments` container child most languages wrap arguments in (falling
+/// back to the call's direct children for shapes that don't).
+fn call_argument_nodes(cpg: &Cpg, call_id: NodeId) -> Vec<NodeId> {
+    let Some(node) = cpg.ast.get(&call_id) else { return Vec::new() };
+    node.children
+        .iter()
+        .find_map(|&cid| {
+            let child = cpg.ast.get(&cid)?;
+            if matches!(child.node_type.as_str(), "argument_list" | "arguments") {
+                Some(child.children.iter().copied().collect::<Vec<_>>())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| node.children.iter().copied().collect())
+}
+
+// ── Length-guard symbolic verification helpers ─────────────────────────────────
+
+/// Length functions whose comparison against a bound this engine can
+/// actually verify symbolically (direction + magnitude), as opposed to
+/// opaque user-defined validators (`validate`, `is_valid`, ...) which can
+/// only be recognized by name — there's no way to know what an arbitrary
+/// function's return value means, so those are accepted on presence alone.
+/// `strlen`-family functions have known, fixed semantics: the engine can
+/// find the comparison they sit in, work out which direction and magnitude
+/// it establishes, and check that against the sink's actual destination
+/// capacity.
+const KNOWN_LENGTH_FUNCTIONS: &[&str] = &["strlen", "strnlen", "wcslen"];
+
+/// True if `ancestor` is `node` itself or one of its AST ancestors.
+fn is_ancestor(cpg: &Cpg, ancestor: NodeId, node: NodeId) -> bool {
+    let mut cur = node;
+    for _ in 0..500 {
+        if cur == ancestor {
+            return true;
+        }
+        match cpg.ast.get(&cur).and_then(|n| n.parent_id) {
+            Some(p) if p != cur => cur = p,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// Walk up from `from` (a length-function call) looking for the nearest
+/// enclosing comparison `BinaryOp`, stopping at `stop_at` (the Conditional's
+/// condition root — don't walk past it into unrelated code). Returns
+/// `(binop, value_side, bound_side, operator, flipped)` where `value_side`
+/// is whichever operand contains `from`, `bound_side` is the other operand,
+/// and `flipped` is true when `from` was on the right (so the caller must
+/// mirror the operator to read the comparison as `value <op> bound`).
+fn find_enclosing_comparison(
+    cpg: &Cpg,
+    from: NodeId,
+    stop_at: NodeId,
+) -> Option<(NodeId, NodeId, NodeId, String, bool)> {
+    let mut cur = from;
+    for _ in 0..200 {
+        if cur == stop_at {
+            return None;
+        }
+        let node = cpg.ast.get(&cur)?;
+        if node.kind == IrNodeKind::BinaryOp && node.children.len() >= 2 {
+            if let Some(op) = node.operator.as_deref() {
+                if matches!(op, "<" | "<=" | ">" | ">=" | "==" | "!=") {
+                    let lhs = node.children[0];
+                    let rhs = *node.children.last().unwrap();
+                    if is_ancestor(cpg, lhs, from) {
+                        return Some((cur, lhs, rhs, op.to_owned(), false));
+                    }
+                    if is_ancestor(cpg, rhs, from) {
+                        return Some((cur, rhs, lhs, op.to_owned(), true));
+                    }
+                }
+            }
+        }
+        match node.parent_id {
+            Some(p) if p != cur => cur = p,
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn flip_operator(op: &str) -> &'static str {
+    match op {
+        "<" => ">",
+        "<=" => ">=",
+        ">" => "<",
+        ">=" => "<=",
+        "==" => "==",
+        _ => "!=",
+    }
+}
+
+fn negate_operator(op: &str) -> &'static str {
+    match op {
+        "<" => ">=",
+        "<=" => ">",
+        ">" => "<=",
+        ">=" => "<",
+        "==" => "!=",
+        _ => "==",
+    }
+}
+
+/// Which branch of `cond_node` (a Conditional) reaches `target`: `Some(true)`
+/// if `target` is inside the "consequence" (then) subtree, `Some(false)` if
+/// inside "alternative" (else) — or, when `target` is outside both (the
+/// common `if (cond) return;` early-exit idiom, where the sink sits after
+/// the whole if-statement), `Some(false)` on the assumption that the
+/// consequence branch terminates (return/break/continue/goto) rather than
+/// falling through itself. Doesn't verify that assumption structurally; a
+/// non-terminating consequence with no `alternative` is rare enough in
+/// practice that getting it wrong here just means an occasional guard isn't
+/// recognized (a missed suppression, not a wrong one).
+fn branch_polarity(cpg: &Cpg, cond_node: NodeId, target: NodeId) -> Option<bool> {
+    let node = cpg.ast.get(&cond_node)?;
+    let mut consequence = None;
+    let mut alternative = None;
+    for (i, &child) in node.children.iter().enumerate() {
+        match node.field_names.get(i).and_then(|f| f.as_deref()) {
+            Some("consequence") => consequence = Some(child),
+            Some("alternative") => alternative = Some(child),
+            _ => {}
+        }
+    }
+    if let Some(c) = consequence {
+        if is_ancestor(cpg, c, target) {
+            return Some(true);
+        }
+    }
+    if let Some(a) = alternative {
+        if is_ancestor(cpg, a, target) {
+            return Some(false);
+        }
+    }
+    Some(false)
+}
+
+/// If `value_expr` is exactly `len_call` (offset 0) or `len_call + CONST` /
+/// `CONST + len_call` (offset `CONST`), return the offset — handles the
+/// common null-terminator idiom (`strlen(x) + 1`). Any other shape (a
+/// non-constant second operand, subtraction, multiplication, ...) returns
+/// `None` rather than guess; the caller treats that as offset 0, which is
+/// conservative for `<`/`<=` bounds (a wrongly-assumed offset of 0 instead
+/// of a positive one under-credits the guard, never over-credits it).
+fn extract_length_offset(cpg: &Cpg, value_expr: NodeId, len_call: NodeId) -> Option<i64> {
+    if value_expr == len_call {
+        return Some(0);
+    }
+    let node = cpg.ast.get(&value_expr)?;
+    if node.is_parenthesized() {
+        return extract_length_offset(cpg, *node.children.first()?, len_call);
+    }
+    if node.kind == IrNodeKind::BinaryOp && node.children.len() >= 2 {
+        let op = node.operator.as_deref()?;
+        let lhs = node.children[0];
+        let rhs = *node.children.last().unwrap();
+        let mut se = SymbolicEval::new(cpg);
+        if lhs == len_call && op == "+" {
+            return se.eval_int(rhs);
+        }
+        if lhs == len_call && op == "-" {
+            return se.eval_int(rhs).map(|c| -c);
+        }
+        if rhs == len_call && op == "+" {
+            return se.eval_int(lhs);
+        }
+    }
+    None
+}
+
+/// The statically-known capacity of the sink's actual destination buffer:
+/// walk up from `sink_node` to its enclosing `Call` (the copy/read
+/// operation), take that call's first argument (the destination, by
+/// convention for the C stdlib functions these rules target), resolve it to
+/// its declaration, and look up the declared size.
+fn sink_destination_capacity(cpg: &Cpg, sizes: &AllocSizeIndex, sink_node: NodeId) -> Option<i64> {
+    let mut cur = sink_node;
+    let call_id = loop {
+        let node = cpg.ast.get(&cur)?;
+        if node.kind == IrNodeKind::Call {
+            break cur;
+        }
+        match node.parent_id {
+            Some(p) if p != cur => cur = p,
+            _ => return None,
+        }
+    };
+    let dest = *call_argument_nodes(cpg, call_id).first()?;
+    let dest_node = cpg.ast.get(&dest)?;
+    let decl = resolve_var_declaration(cpg, dest, dest_node).unwrap_or(dest);
+    sizes.concrete_size(decl)
 }
 
 // ── Interprocedural expansion ─────────────────────────────────────────────────
