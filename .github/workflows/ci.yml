@@ -31,5 +31,59 @@ jobs:
       - name: Build
         run: cargo build --workspace
 
+      # Includes web-mcp's differential incremental-vs-full-rebuild fuzz test
+      # (tests/incremental_parity_fuzz.rs) and cold-start perf-regression gate
+      # (tests/perf_gate.rs) — both are ordinary `cargo test` targets, no separate job
+      # needed for them.
       - name: Test
         run: cargo test --workspace --no-fail-fast
+
+  # Scoped to web-mcp (this design effort's own crate) rather than the whole workspace:
+  # web-sitter/web-profiler/most of web-ql predate this work and are not yet
+  # clippy-clean/rustfmt-clean end to end (293+ pre-existing clippy findings, large
+  # unformatted tests/examples trees) — gating the whole workspace today would fail CI for
+  # reasons unrelated to any change under review. Widening this gate crate-by-crate as each
+  # is brought to a clean baseline is a documented follow-up (see task list), not something
+  # to blanket-apply here.
+  clippy:
+    name: Clippy (web-mcp)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      # --no-deps: web-sitter/web-ql are path dependencies (workspace members), so without
+      # this clippy would also lint *them* under this invocation's -D warnings and fail on
+      # their pre-existing findings — same scoping rationale as the job comment above.
+      - name: Clippy
+        run: cargo clippy -p web-mcp --bins --tests --no-deps -- -D warnings
+
+  fmt:
+    name: Format (web-mcp, web-ql src)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: |
+          cargo fmt --check -p web-mcp
+          find web-ql/src -name '*.rs' -print0 | xargs -0 rustfmt --edition 2024 --check
