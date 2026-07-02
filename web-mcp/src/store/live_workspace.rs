@@ -214,6 +214,13 @@ impl LiveWorkspace {
     pub fn live_file_count(&self) -> usize {
         self.files.len()
     }
+
+    /// Access to the underlying `WorkspaceStore` — for callers (namely
+    /// `store::load_test`) that need to inspect hot-cache/persistence stats directly
+    /// rather than through `LiveWorkspace`'s edit-oriented API.
+    pub(crate) fn store(&self) -> &WorkspaceStore {
+        &self.store
+    }
 }
 
 #[cfg(test)]

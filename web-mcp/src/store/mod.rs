@@ -14,6 +14,8 @@
 pub mod findings;
 pub mod incremental_file;
 pub mod live_workspace;
+#[cfg(test)]
+mod load_test;
 pub mod persistence;
 pub mod revision;
 pub mod shard;
@@ -29,6 +31,14 @@ use web_sitter::Cpg;
 
 pub use persistence::PersistentStore;
 pub use shard::ShardId;
+
+/// Default `WorkspaceStore` hot-cache capacity, pending a real `--hot-capacity` CLI flag
+/// once `LiveWorkspace` is wired into `WebMcpServer` (still batch-`Workspace`-only as of
+/// this task — see `crate::index`). Chosen from `store::load_test`'s benchmark: 200 hot
+/// entries keeps steady-state memory bounded independent of total repo size while still
+/// giving a typical multi-file edit session (a handful of files touched per turn) a very
+/// high hit rate before anything gets evicted.
+pub const DEFAULT_HOT_CAPACITY: usize = 200;
 
 pub struct WorkspaceStore {
     persistent: PersistentStore,
