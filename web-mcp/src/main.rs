@@ -1,4 +1,6 @@
+mod index;
 mod server;
+mod tools;
 
 use std::path::PathBuf;
 
@@ -29,9 +31,16 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let root = cli.root.canonicalize().unwrap_or(cli.root);
-    tracing::info!(root = %root.display(), "starting web-mcp");
+    tracing::info!(root = %root.display(), "indexing workspace");
 
-    let server = WebMcpServer::new(root)
+    let (workspace, reverse_index) = index::build_workspace(&root)?;
+    tracing::info!(
+        files = workspace.files.len(),
+        symbols = reverse_index.symbol_count(),
+        "workspace indexed, starting web-mcp"
+    );
+
+    let server = WebMcpServer::new(root, workspace, reverse_index)
         .serve(stdio())
         .await
         .inspect_err(|e| tracing::error!("serving error: {e:?}"))?;

@@ -1,31 +1,49 @@
 //! The MCP server: implements `rmcp`'s `ServerHandler` trait over a workspace root.
 //!
-//! This is Phase 1's skeleton — an empty tool registry (`list_tools` uses the default
-//! `Ok(ListToolsResult::default())`, i.e. no tools yet) that completes the MCP
-//! `initialize` handshake over stdio. Tools (lookup, call-graph, dataflow, change-impact,
-//! anonymized-context, verification) are added file-by-file in subsequent tasks; this
-//! struct is where their `#[tool]` methods will live.
+//! `WebMcpServer` holds the batch-built `Workspace`/`ReverseSymbolIndex` (see
+//! `crate::index`) and the combined `ToolRouter` assembled from every `tools/*.rs`
+//! module's own `#[tool_router]` impl block. Phase 1 scope: read-only, single-shard,
+//! built once at startup — no live updates yet (Phase 2).
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use rmcp::ServerHandler;
+use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
+use rmcp::tool_handler;
+use web_ql::Workspace;
+use web_ql::symbol_index::ReverseSymbolIndex;
 
-/// The MCP server's top-level state. `workspace_root` is the directory this server
-/// indexes — currently unused by any tool (there are none yet), but threaded through
-/// from `main.rs` now so later tasks don't need to touch the CLI wiring again.
+/// `workspace`/`reverse_index` are `Arc`-wrapped so `WebMcpServer` stays cheaply
+/// `Clone` (rmcp clones the handler per connection) without deep-copying the whole
+/// indexed codebase. Phase 1 never mutates them after startup; Phase 2's live-update
+/// system is what will need interior mutability (sharded locks), not this wrapper.
 #[derive(Clone)]
 pub struct WebMcpServer {
     #[allow(dead_code)]
-    workspace_root: PathBuf,
+    pub(crate) workspace_root: PathBuf,
+    pub(crate) workspace: Arc<Workspace>,
+    pub(crate) reverse_index: Arc<ReverseSymbolIndex>,
+    pub(crate) tool_router: ToolRouter<Self>,
 }
 
 impl WebMcpServer {
-    pub fn new(workspace_root: PathBuf) -> Self {
-        Self { workspace_root }
+    pub fn new(
+        workspace_root: PathBuf,
+        workspace: Workspace,
+        reverse_index: ReverseSymbolIndex,
+    ) -> Self {
+        Self {
+            workspace_root,
+            workspace: Arc::new(workspace),
+            reverse_index: Arc::new(reverse_index),
+            tool_router: Self::lookup_tool_router(),
+        }
     }
 }
 
+#[tool_handler(router = self.tool_router)]
 impl ServerHandler for WebMcpServer {
     fn get_info(&self) -> ServerInfo {
         // Deliberately not `Implementation::from_build_env()`: that helper expands

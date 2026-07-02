@@ -17,7 +17,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use web_sitter::symbol_id::{build_symbol_table, SymbolId};
+use web_sitter::symbol_id::{SymbolId, build_symbol_table};
 use web_sitter::{Cpg, IrNodeKind, NodeId};
 
 /// Where a symbol is defined: which file, and its (reparse-unstable) `NodeId` in that
@@ -56,13 +56,21 @@ impl ReverseSymbolIndex {
         Self::default()
     }
 
-    /// Build a fresh index from a full set of files. Prefer this for an initial
-    /// workspace index; use `upsert_file`/`remove_file` for incremental maintenance
-    /// afterward so a single-file edit doesn't require rescanning the whole workspace.
+    /// Build a fresh index from a full set of files. Two passes: register every file's
+    /// definitions first, *then* resolve every file's references against the now-complete
+    /// name index. This ordering matters and is not optional — `files` is commonly a
+    /// `HashMap` iterator with no defined order, so a single-pass "define + resolve as
+    /// you go" approach (what `upsert_file` alone does) would silently drop any reference
+    /// whose defining file happens to be visited after the referencing file.
     pub fn build<'a>(files: impl IntoIterator<Item = (&'a Path, &'a Cpg)>) -> Self {
         let mut index = Self::new();
-        for (path, cpg) in files {
-            index.upsert_file(path, cpg);
+        let files: Vec<(&Path, &Cpg)> = files.into_iter().collect();
+        for (path, cpg) in &files {
+            index.remove_file(path);
+            index.register_definitions(path, cpg);
+        }
+        for (path, cpg) in &files {
+            index.resolve_references(path, cpg);
         }
         index
     }
@@ -72,16 +80,24 @@ impl ReverseSymbolIndex {
     /// This is the operation a live watcher calls after a single-file reparse — it never
     /// touches other files' entries, only the reverse-mapped sets that pointed at this
     /// file's old symbols.
+    ///
+    /// Unlike [`build`](Self::build), this only re-resolves `path`'s own outgoing
+    /// references — appropriate for incremental maintenance of an *already-complete*
+    /// index (every other file's definitions are already registered), but not for
+    /// building one from scratch in arbitrary order — use `build` for that.
     pub fn upsert_file(&mut self, path: &Path, cpg: &Cpg) {
         self.remove_file(path);
+        self.register_definitions(path, cpg);
+        self.resolve_references(path, cpg);
+    }
 
+    /// Register `path`'s definitions and their name-index keys. Keys are registered into
+    /// the *global* `name_index` (weak/simple-name keys: first registration wins;
+    /// strong/qualified-name keys: always overwrite) so that call sites in other files,
+    /// which name a callee defined elsewhere, can resolve against it.
+    fn register_definitions(&mut self, path: &Path, cpg: &Cpg) {
         let symbol_table = build_symbol_table(cpg);
 
-        // Definitions + name-index registration: this file defines every addressable
-        // node in its own symbol table. Keys are registered into the *global*
-        // `name_index` (weak/simple-name keys: first registration wins; strong/
-        // qualified-name keys: always overwrite) so that call sites in other files,
-        // which name a callee defined elsewhere, can resolve against it.
         let mut defined_here = Vec::with_capacity(symbol_table.len());
         for (&node_id, symbol_id) in &symbol_table {
             self.definitions.insert(
@@ -93,22 +109,22 @@ impl ReverseSymbolIndex {
             );
             defined_here.push(symbol_id.clone());
 
-            if let Some(node) = cpg.ast.get(&node_id) {
-                if node.kind == IrNodeKind::MethodDef {
-                    if let Some(fn_name) = &node.name {
-                        self.register_keys(symbol_id, name_keys(cpg, node_id, node, fn_name));
-                    }
-                }
+            if let Some(node) = cpg.ast.get(&node_id)
+                && node.kind == IrNodeKind::MethodDef
+                && let Some(fn_name) = &node.name
+            {
+                self.register_keys(symbol_id, name_keys(cpg, node_id, node, fn_name));
             }
         }
         self.defined_by_file
             .insert(path.to_path_buf(), defined_here);
+    }
 
-        // References: resolve every call site in this file against the (now-updated)
-        // global name index. We only re-resolve *this* file's own call sites here (its
-        // outgoing references) — inbound references from other files are re-established
-        // when those files are next upserted, and are unaffected by this file's own
-        // definitions changing.
+    /// Resolve `path`'s outgoing call-site references against the name index as it
+    /// currently stands. Callers building a fresh index from arbitrary-order input must
+    /// call this only after every file's `register_definitions` has already run (see
+    /// `build`) or references to not-yet-registered definitions will be silently missed.
+    fn resolve_references(&mut self, path: &Path, cpg: &Cpg) {
         let mut referenced_here = Vec::new();
         for edge in &cpg.workspace.cross_file_calls {
             let resolved = edge
@@ -134,10 +150,7 @@ impl ReverseSymbolIndex {
     fn register_keys(&mut self, symbol_id: &SymbolId, keys: Vec<(String, bool)>) {
         let mut registered = Vec::with_capacity(keys.len());
         for (key, strong) in keys {
-            if strong {
-                self.name_index.insert(key.clone(), symbol_id.clone());
-                registered.push(key);
-            } else if !self.name_index.contains_key(&key) {
+            if strong || !self.name_index.contains_key(&key) {
                 self.name_index.insert(key.clone(), symbol_id.clone());
                 registered.push(key);
             }
@@ -153,10 +166,12 @@ impl ReverseSymbolIndex {
     pub fn remove_file(&mut self, path: &Path) {
         if let Some(symbols) = self.defined_by_file.remove(path) {
             for symbol_id in symbols {
-                if let Some(def) = self.definitions.get(&symbol_id) {
-                    if def.file == path {
-                        self.definitions.remove(&symbol_id);
-                    }
+                if self
+                    .definitions
+                    .get(&symbol_id)
+                    .is_some_and(|def| def.file == path)
+                {
+                    self.definitions.remove(&symbol_id);
                 }
                 // Retract only the keys this symbol itself registered, and only where
                 // they still point at this symbol (a later file may have legitimately
@@ -209,6 +224,13 @@ impl ReverseSymbolIndex {
     pub fn symbol_count(&self) -> usize {
         self.definitions.len()
     }
+
+    /// Iterate every known (symbol, definition site) pair. Used by callers that need to
+    /// search by name rather than look up an exact `SymbolId` — e.g. an MCP `find_definition`
+    /// tool resolving a human-typed simple/qualified name against the whole workspace.
+    pub fn definitions(&self) -> impl Iterator<Item = (&SymbolId, &SymbolDefinition)> {
+        self.definitions.iter()
+    }
 }
 
 /// The candidate name-index keys for one `MethodDef` node, paired with whether each is
@@ -233,15 +255,19 @@ fn name_keys(
     if let Some(qname) = &node.qualified_name {
         keys.push((qname.clone(), true));
     }
-    if let Some(java_meta) = cpg.java_metadata.get(&node_id) {
-        if let Some(fqc) = &java_meta.fully_qualified_class {
-            keys.push((format!("{fqc}.{fn_name}"), true));
-        }
+    if let Some(fqc) = cpg
+        .java_metadata
+        .get(&node_id)
+        .and_then(|m| m.fully_qualified_class.as_ref())
+    {
+        keys.push((format!("{fqc}.{fn_name}"), true));
     }
-    if let Some(go_meta) = cpg.go_metadata.get(&node_id) {
-        if let Some(qname) = &go_meta.qualified_name {
-            keys.push((qname.clone(), true));
-        }
+    if let Some(qname) = cpg
+        .go_metadata
+        .get(&node_id)
+        .and_then(|m| m.qualified_name.as_ref())
+    {
+        keys.push((qname.clone(), true));
     }
     keys
 }
@@ -308,6 +334,48 @@ mod tests {
         let index = ReverseSymbolIndex::build([
             (callee_path.as_path(), &callee_cpg),
             (caller_path.as_path(), &caller_cpg),
+        ]);
+
+        let sym = symbol(&callee_cpg, "helper");
+        let referencing: Vec<&PathBuf> = index.referencing_files(&sym).collect();
+        assert_eq!(referencing, vec![&caller_path]);
+    }
+
+    /// Regression test: `build`'s input is commonly a `HashMap` iterator with no defined
+    /// order. This is the exact case that was previously broken — a naive "define +
+    /// resolve as you go" single pass (what `build` used to do, delegating straight to
+    /// `upsert_file` per file) drops any reference whose defining file is visited *after*
+    /// the referencing file, because the name index doesn't have that definition's key
+    /// registered yet at resolution time. Feeding the caller before the callee here
+    /// reproduces that exact ordering.
+    #[test]
+    fn cross_file_reference_is_indexed_even_when_caller_is_processed_before_callee() {
+        let callee_cpg = parse(SourceLanguage::Cpp, "int helper(int y) { return y; }");
+
+        let mut caller_cpg = parse(SourceLanguage::Cpp, "int caller() { return helper(1); }");
+        let call_node_id = caller_cpg
+            .ast
+            .iter()
+            .find(|(_, n)| n.kind == IrNodeKind::Call)
+            .map(|(id, _)| *id)
+            .expect("call node");
+        caller_cpg
+            .workspace
+            .cross_file_calls
+            .push(web_sitter::CrossFileCallEdge {
+                call_node: call_node_id,
+                caller_fn: 0,
+                callee_name: "helper".to_string(),
+                qualified_callee: None,
+                arg_positions: vec![],
+            });
+
+        let callee_path = PathBuf::from("callee.cpp");
+        let caller_path = PathBuf::from("caller.cpp");
+        // Caller listed *first* — the ordering that used to silently lose the edge.
+        let index = ReverseSymbolIndex::build([
+            (caller_path.as_path(), &caller_cpg),
+            (callee_path.as_path(), &callee_cpg),
         ]);
 
         let sym = symbol(&callee_cpg, "helper");
@@ -405,6 +473,23 @@ mod tests {
         index.remove_file(&path);
         assert!(index.definition(&sym).is_none());
         assert_eq!(index.symbol_count(), 0);
+    }
+
+    #[test]
+    fn definitions_iterates_every_indexed_symbol() {
+        let a = parse(SourceLanguage::Cpp, "int helper(int y) { return y; }");
+        let b = parse(SourceLanguage::Cpp, "int other(int z) { return z; }");
+        let index = ReverseSymbolIndex::build([
+            (PathBuf::from("a.cpp").as_path(), &a),
+            (PathBuf::from("b.cpp").as_path(), &b),
+        ]);
+
+        let names: std::collections::BTreeSet<&str> =
+            index.definitions().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(
+            names,
+            std::collections::BTreeSet::from(["cpp:helper", "cpp:other"])
+        );
     }
 
     /// Differential test: `ReverseSymbolIndex::referencing_files` (scoped, incremental)

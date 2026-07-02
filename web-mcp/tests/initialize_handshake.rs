@@ -60,7 +60,7 @@ async fn completes_initialize_handshake_over_real_stdio() -> anyhow::Result<()> 
             .get("capabilities")
             .and_then(|c| c.get("tools"))
             .is_some(),
-        "tools capability must be advertised even with an empty tool registry: {result:#}"
+        "tools capability must be advertised: {result:#}"
     );
 
     send_json(
@@ -69,8 +69,10 @@ async fn completes_initialize_handshake_over_real_stdio() -> anyhow::Result<()> 
     )
     .await?;
 
-    // A `tools/list` call against the empty Phase-1 registry must succeed with an empty
-    // list, not error — this is the contract later tool-adding tasks build on.
+    // A `tools/list` call must succeed and enumerate every registered tool. Individual
+    // tool *behavior* is covered by tests/lookup_tools.rs et al.; this only checks that
+    // the combined ToolRouter (assembled across tools/*.rs modules) is wired into
+    // ServerHandler and reachable over the transport.
     send_json(
         &mut writer,
         &json!({
@@ -87,10 +89,16 @@ async fn completes_initialize_handshake_over_real_stdio() -> anyhow::Result<()> 
         .and_then(|r| r.get("tools"))
         .and_then(Value::as_array)
         .expect("tools/list must return a tools array");
-    assert!(
-        tools.is_empty(),
-        "Phase-1 skeleton has no tools yet: {tools:?}"
-    );
+    let names: Vec<&str> = tools
+        .iter()
+        .filter_map(|t| t.get("name").and_then(Value::as_str))
+        .collect();
+    for expected in ["find_definition", "find_references", "symbol_summary"] {
+        assert!(
+            names.contains(&expected),
+            "expected tool '{expected}' in tools/list, got {names:?}"
+        );
+    }
 
     drop(writer);
     let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
