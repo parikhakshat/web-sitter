@@ -134,7 +134,7 @@ impl WebMcpServer {
 /// `(line, column)`. Multiple nodes can share a start position (e.g. an identifier
 /// nested at the start of a larger expression) — the smallest span is the closest
 /// analogue to an LSP "node at cursor" query.
-fn find_node_at(cpg: &Cpg, line: u32, column: u32) -> Option<NodeId> {
+pub(crate) fn find_node_at(cpg: &Cpg, line: u32, column: u32) -> Option<NodeId> {
     cpg.ast
         .iter()
         .filter(|(_, node)| node.line == line && node.column == column)

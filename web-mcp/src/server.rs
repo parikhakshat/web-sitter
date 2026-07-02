@@ -61,7 +61,8 @@ impl WebMcpServer {
             tool_router: Self::lookup_tool_router()
                 + Self::callgraph_tool_router()
                 + Self::dataflow_tool_router()
-                + Self::impact_tool_router(),
+                + Self::impact_tool_router()
+                + Self::verify_tool_router(),
         }
     }
 }
