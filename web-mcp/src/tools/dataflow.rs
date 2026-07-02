@@ -73,7 +73,7 @@ impl WebMcpServer {
             );
         }
         let path = self.resolve_path(&req.from.file);
-        let workspace = self.workspace.load_full();
+        let workspace = self.workspace.read().await;
         let idx = workspace
             .files
             .get(&path)
@@ -111,7 +111,8 @@ impl WebMcpServer {
             .map_err(|e| format!("rule compile error: {e:#}"))?;
         let findings = self
             .workspace
-            .load_full()
+            .read()
+            .await
             .scan(&rule_set)
             .into_iter()
             .map(|f| {

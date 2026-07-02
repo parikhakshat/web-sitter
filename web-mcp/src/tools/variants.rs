@@ -93,7 +93,7 @@ impl WebMcpServer {
         Parameters(req): Parameters<FindVariantsRequest>,
     ) -> Result<Json<FindVariantsResponse>, String> {
         let example_path = self.resolve_path(&req.location.file);
-        let workspace = self.workspace.load_full();
+        let workspace = self.workspace.read().await;
         let example_idx = workspace
             .files
             .get(&example_path)
@@ -183,7 +183,7 @@ impl WebMcpServer {
             .ok_or_else(|| format!("malformed match_id: '{}'", req.match_id))?;
 
         let path = self.resolve_path(&file);
-        let workspace = self.workspace.load_full();
+        let workspace = self.workspace.read().await;
         let idx = workspace
             .files
             .get(&path)

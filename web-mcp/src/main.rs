@@ -1,12 +1,13 @@
 mod callgraph;
 mod index;
+// LiveIndex is built and fully tested (see live_index.rs) but not yet constructed from
+// main() — that's the next task: wiring the file-watcher pipeline to actually drive it at
+// runtime. Until then it, and the store/watcher pieces it depends on, are exercised only
+// by their own unit/integration tests.
+#[allow(dead_code)]
+mod live_index;
 mod security;
 mod server;
-// Not wired into WebMcpServer yet: every tool handler still reads from crate::index's
-// batch-built, all-in-memory Workspace. Swapping tools over to LiveWorkspace (so they see
-// live edits) is follow-up integration work beyond this phase's per-piece tasks — store
-// and watcher are exercised by their own unit/integration tests in the meantime.
-// `store::findings` is the one exception already wired in, via `run_security_scan`.
 #[allow(dead_code)]
 mod store;
 mod symbol_query;

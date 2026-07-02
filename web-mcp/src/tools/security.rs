@@ -118,7 +118,7 @@ impl WebMcpServer {
             None => (*self.security_rules).clone(),
         };
 
-        let workspace = self.workspace.load_full();
+        let workspace = self.workspace.read().await;
         let reverse_index = self.reverse_index.load_full();
         let scope = self.compute_scan_scope(&workspace, &reverse_index, &req)?;
 

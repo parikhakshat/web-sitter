@@ -155,7 +155,7 @@ impl WebMcpServer {
         let from = self.resolve_required(&req.from)?;
         let to = self.resolve_required(&req.to)?;
         let reverse_index = self.reverse_index.load_full();
-        let workspace = self.workspace.load_full();
+        let workspace = self.workspace.read().await;
 
         let max_depth = if req.kind == "calls" {
             1
@@ -203,7 +203,7 @@ impl WebMcpServer {
             );
         }
         let path = self.resolve_path(&req.from.file);
-        let workspace = self.workspace.load_full();
+        let workspace = self.workspace.read().await;
         let idx = workspace
             .files
             .get(&path)

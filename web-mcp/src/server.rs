@@ -15,6 +15,7 @@ use rmcp::ServerHandler;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
 use rmcp::tool_handler;
+use tokio::sync::RwLock;
 use web_ql::RuleSet;
 use web_ql::Workspace;
 use web_ql::symbol_index::ReverseSymbolIndex;
@@ -22,19 +23,24 @@ use web_ql::symbol_index::ReverseSymbolIndex;
 use crate::callgraph::SymbolCallGraph;
 use crate::store::findings::FindingsStore;
 
-/// `workspace`/`reverse_index`/`call_graph` are each `Arc<ArcSwap<T>>`: `WebMcpServer`
-/// stays cheaply `Clone` (rmcp clones the handler per connection) without deep-copying the
-/// whole indexed codebase, *and* a live-update source (`crate::live_index::LiveIndex`,
-/// holding clones of the same `Arc<ArcSwap<T>>`s via `*_handle()` below) can atomically
-/// publish a new snapshot of any of the three independently. A tool method reads via
-/// `self.workspace.load_full()` (etc.) once at the top of its body and uses that owned
-/// `Arc<T>` for the rest of the call — cheap (one refcount bump), and immune to seeing a
-/// torn/inconsistent view even if a publish happens mid-call, since it's holding its own
-/// snapshot rather than re-reading the swap on every field access.
+/// `reverse_index`/`call_graph` are `Arc<ArcSwap<T>>`: a live-update source
+/// (`crate::live_index::LiveIndex`, holding clones of the same handles via `*_handle()`
+/// below) rebuilds each fresh from scratch on every edit and atomically publishes the new
+/// owned value — `ArcSwap` fits perfectly since there's never an existing value to mutate
+/// in place. `workspace` is different: `Workspace` isn't (and can't cheaply be) `Clone` —
+/// it owns a `HashMap` of every indexed file's full `FileIndex` — so a live update
+/// *mutates it in place* (`Workspace::upsert_file`/`build_cross_file_edges`) rather than
+/// swapping in a freshly-constructed replacement, which needs a lock, not `ArcSwap`
+/// (`ArcSwap` only supports atomically replacing the whole value, not mutating through
+/// it). `Arc<RwLock<Workspace>>` gives every tool call concurrent read access (the common
+/// case) while `LiveIndex` takes a write lock only for the duration of applying one edit.
+///
+/// `WebMcpServer` stays cheaply `Clone` (rmcp clones the handler per connection) either
+/// way, since cloning any of the three just bumps a refcount.
 #[derive(Clone)]
 pub struct WebMcpServer {
     pub(crate) workspace_root: PathBuf,
-    pub(crate) workspace: Arc<ArcSwap<Workspace>>,
+    pub(crate) workspace: Arc<RwLock<Workspace>>,
     pub(crate) reverse_index: Arc<ArcSwap<ReverseSymbolIndex>>,
     pub(crate) call_graph: Arc<ArcSwap<SymbolCallGraph>>,
     /// The built-in CWE rule corpus (`web-ql-queries/`), loaded once at startup —
@@ -84,7 +90,7 @@ impl WebMcpServer {
         let call_graph = SymbolCallGraph::build(&workspace, &reverse_index);
         Self {
             workspace_root,
-            workspace: Arc::new(ArcSwap::new(Arc::new(workspace))),
+            workspace: Arc::new(RwLock::new(workspace)),
             reverse_index: Arc::new(ArcSwap::new(Arc::new(reverse_index))),
             call_graph: Arc::new(ArcSwap::new(Arc::new(call_graph))),
             security_rules: Arc::new(security_rules),
@@ -101,12 +107,12 @@ impl WebMcpServer {
         }
     }
 
-    /// A clone of the `Arc<ArcSwap<Workspace>>` handle — for `live_index::LiveIndex` (a
-    /// follow-up task, not yet wired in — hence `#[allow(dead_code)]`, expected to be
-    /// dropped once that lands) to publish new snapshots that every clone of this
-    /// `WebMcpServer` picks up on its next read.
+    /// A clone of the `Arc<RwLock<Workspace>>` handle — for `live_index::LiveIndex` (not
+    /// yet constructed from `main()` — hence `#[allow(dead_code)]`, expected to be dropped
+    /// once the file-watcher pipeline wiring lands) to mutate in place as edits come in,
+    /// visible to every clone of this `WebMcpServer` on its next read.
     #[allow(dead_code)]
-    pub(crate) fn workspace_handle(&self) -> Arc<ArcSwap<Workspace>> {
+    pub(crate) fn workspace_handle(&self) -> Arc<RwLock<Workspace>> {
         Arc::clone(&self.workspace)
     }
 

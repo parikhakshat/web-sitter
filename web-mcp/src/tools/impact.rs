@@ -117,7 +117,7 @@ impl WebMcpServer {
         Parameters(req): Parameters<ImpactOfChangeRequest>,
     ) -> Result<Json<ImpactOfChangeResponse>, String> {
         let path = self.resolve_path(&req.file);
-        let workspace = self.workspace.load_full();
+        let workspace = self.workspace.read().await;
         let idx = workspace
             .files
             .get(&path)

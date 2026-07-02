@@ -97,7 +97,7 @@ impl WebMcpServer {
         &self,
         Parameters(req): Parameters<FindDefinitionRequest>,
     ) -> Json<FindDefinitionResponse> {
-        let workspace = self.workspace.load_full();
+        let workspace = self.workspace.read().await;
         let reverse_index = self.reverse_index.load_full();
         let matches = resolve_symbol(&reverse_index, &req.symbol);
         let definitions = matches
@@ -118,7 +118,7 @@ impl WebMcpServer {
         &self,
         Parameters(req): Parameters<FindReferencesRequest>,
     ) -> Json<FindReferencesResponse> {
-        let workspace = self.workspace.load_full();
+        let workspace = self.workspace.read().await;
         let reverse_index = self.reverse_index.load_full();
         let Some((symbol_id, _def)) = resolve_symbol(&reverse_index, &req.symbol)
             .into_iter()
@@ -154,7 +154,7 @@ impl WebMcpServer {
         &self,
         Parameters(req): Parameters<SymbolSummaryRequest>,
     ) -> Result<Json<SymbolSummaryResponse>, String> {
-        let workspace = self.workspace.load_full();
+        let workspace = self.workspace.read().await;
         let reverse_index = self.reverse_index.load_full();
         let Some((symbol_id, def)) = resolve_symbol(&reverse_index, &req.symbol)
             .into_iter()
