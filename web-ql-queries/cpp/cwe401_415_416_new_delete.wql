@@ -22,9 +22,13 @@ rule "cwe-415-cpp-double-delete" {
         and d2.raw_kind() == "delete_expression"
         and d1.id() != d2.id()
         and d1.cfg_reaches(d2)
+        and d1.line() <= d2.line()
+        // `p1` (the operand identifier at the first delete) has no outgoing
+        // DFG edges of its own to later uses — only the declaration does.
         and let p1 = d1.arg(0) in
+        let decl = p1.refers_to() in
         let p2 = d2.arg(0) in
-        p1.dfg_reaches(p2)
+        decl.dfg_reaches(p2)
 }
 
 // ── CWE-416: Use after delete — CFG-ordered AND correlated by pointer identity ─
@@ -37,15 +41,54 @@ rule "cwe-416-cpp-use-after-delete" {
     find del: Expr, use_node: MemberAccess where
         del.raw_kind() == "delete_expression"
         and del.cfg_reaches(use_node)
+        and del.line() <= use_node.line()
         and let freed = del.arg(0) in
+        let decl = freed.refers_to() in
         let ptr = use_node.receiver() in
-        freed.dfg_reaches(ptr)
+        decl.dfg_reaches(ptr)
     find del: Expr, use_node: Subscript where
         del.raw_kind() == "delete_expression"
         and del.cfg_reaches(use_node)
+        and del.line() <= use_node.line()
         and let freed = del.arg(0) in
+        let decl = freed.refers_to() in
         let ptr = use_node.child(0) in
-        freed.dfg_reaches(ptr)
+        decl.dfg_reaches(ptr)
+}
+
+// ── CWE-416: Use after delete — freed pointer passed as a plain call argument ──
+
+// See the comment on `cwe-416-c-use-after-free-call-arg`: separate `find`
+// blocks per argument position, not `let`-chained candidates under `or`.
+rule "cwe-416-cpp-use-after-delete-call-arg" {
+    severity: critical
+    languages: [cpp]
+    message: "Use after free: deleted pointer passed as a call argument on a reachable path"
+    tags: ["use-after-free", "memory-safety", "cwe-416"]
+    find del: Expr, use_call: Call where
+        del.raw_kind() == "delete_expression"
+        and del.cfg_reaches(use_call)
+        and del.line() <= use_call.line()
+        and let freed = del.arg(0) in
+        let decl = freed.refers_to() in
+        let u0 = use_call.arg(0) in
+        decl.dfg_reaches(u0)
+    find del: Expr, use_call: Call where
+        del.raw_kind() == "delete_expression"
+        and del.cfg_reaches(use_call)
+        and del.line() <= use_call.line()
+        and let freed = del.arg(0) in
+        let decl = freed.refers_to() in
+        let u1 = use_call.arg(1) in
+        decl.dfg_reaches(u1)
+    find del: Expr, use_call: Call where
+        del.raw_kind() == "delete_expression"
+        and del.cfg_reaches(use_call)
+        and del.line() <= use_call.line()
+        and let freed = del.arg(0) in
+        let decl = freed.refers_to() in
+        let u2 = use_call.arg(2) in
+        decl.dfg_reaches(u2)
 }
 
 // ── CWE-401: `new` result discarded — memory leak ─────────────────────────────
@@ -60,7 +103,14 @@ rule "cwe-401-cpp-new-discarded" {
         and not (n.parent() matches Assign { }
                  or n.parent() matches LocalDef { }
                  or n.parent() matches Return { }
-                 or n.parent() matches FieldDef { })
+                 or n.parent() matches FieldDef { }
+                 or n.parent().parent() matches Assign { }
+                 or n.parent().parent() matches LocalDef { }
+                 or n.parent().parent() matches Return { }
+                 or n.parent().parent() matches FieldDef { }
+                 // Constructor initializer list: `S() : field(new T(...)) {}` —
+                 // new_expression -> argument_list -> field_initializer.
+                 or n.parent().parent().raw_kind() == "field_initializer")
 }
 
 // ── CWE-762: Mismatched allocator/deallocator — new'd memory freed with

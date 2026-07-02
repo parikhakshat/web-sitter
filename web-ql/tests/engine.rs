@@ -1102,7 +1102,7 @@ fn node_type_raw_matches_pattern_check() {
     // MatchesPattern with NodeType("methoddef") should type-check correctly
     let (cpg, fn_id) = simple_call_cpg();
     let plan = QueryPlan::MatchesPattern {
-        var: "n".to_owned(),
+        expr: PlanExpr::Var("n".to_owned()),
         ty: TypeExpr::NodeType("methoddef".to_owned()),
         fields: vec![],
     };

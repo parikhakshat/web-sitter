@@ -110,6 +110,14 @@ pub struct TaintClause {
     pub sinks: Vec<NamedRef>,
     pub sanitizers: Vec<NamedRef>,
     pub propagators: Vec<NamedRef>,
+    /// Function names that, when called on the tainted value inside a
+    /// conditional whose branch CFG-dominates the sink (and which textually
+    /// precedes it — see `guard_dominates` in taint.rs), suppress that
+    /// particular source→sink finding. Unlike `sanitizers` (a node the value
+    /// flows *through* and comes out clean), a guard is a control-flow gate:
+    /// the tainted variable's own value is unchanged, but the sink is only
+    /// reachable when the guard call approved it (`if (validate(x)) sink(x);`).
+    pub guards: Vec<String>,
     pub require_interprocedural: Option<bool>,
     pub max_call_depth: Option<u32>,
     pub require_same_function: Option<bool>,

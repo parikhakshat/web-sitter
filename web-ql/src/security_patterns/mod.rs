@@ -113,6 +113,23 @@ fn callee_names_by_node(cpg: &web_sitter::Cpg) -> HashMap<web_sitter::NodeId, St
     names
 }
 
+/// Resolve the `idx`-th argument node of a `Call`, descending into the
+/// `argument_list`/`arguments` container child most languages wrap arguments
+/// in (falling back to the call node's direct children for shapes that
+/// don't). Mirrors the `arg()` node method in `engine.rs`.
+fn call_arg_node(cpg: &web_sitter::Cpg, call_id: web_sitter::NodeId, idx: usize) -> Option<web_sitter::NodeId> {
+    let node = cpg.ast.get(&call_id)?;
+    let arg_id = node.children.iter().find_map(|&cid| {
+        let child = cpg.ast.get(&cid)?;
+        if matches!(child.node_type.as_str(), "argument_list" | "arguments") {
+            child.children.get(idx).copied()
+        } else {
+            None
+        }
+    });
+    arg_id.or_else(|| node.children.get(idx).copied())
+}
+
 // =============================================================================
 // Combined static lookup maps (all languages)
 // =============================================================================
@@ -481,11 +498,49 @@ pub fn builtin_endpoint_registry() -> crate::taint::EndpointRegistry {
         }};
     }
 
-    // ── Helper macro: same but for sinks
+    // ── Helper macro: register a builtin set as a sink.
+    //
+    // Unlike sources (whose seed is the call's *return value*, so the whole
+    // Call node is the right taint-graph anchor), a sink's danger lives in a
+    // specific *argument* — DFG edges never target the enclosing Call node
+    // itself unless that function also happens to be a registered taint
+    // propagator (see `add_taint_propagator_edges` in web-sitter/src/dfg.rs,
+    // which adds a `src_arg -> call_id` edge only for the propagator table).
+    // Registering the Call node as the sink for a pure sink (e.g. `system`,
+    // `fopen`, non-propagating `exec`/file-open calls) meant taint could
+    // never reach it: there is simply no edge ending there. Resolve each
+    // matched call's actual dangerous argument(s) via its `SinkSpec` instead,
+    // so the sink anchor is a node the DFG can actually flow taint into.
+    // Falls back to the call node itself when no `SinkSpec` is registered
+    // for that name (better than never matching at all).
     macro_rules! reg_sink {
-        ($registry:expr, $name:expr, $set:expr) => {
-            reg_source!($registry, $name, $set)
-        };
+        ($registry:expr, $name:expr, $set:expr) => {{
+            let set: &'static [&'static str] = $set;
+            $registry.register($name, move |cpg| {
+                let call_names = callee_names_by_node(cpg);
+                let mut out = Vec::new();
+                for (id, n) in cpg.ast.iter() {
+                    if n.kind != IrNodeKind::Call {
+                        continue;
+                    }
+                    let Some(callee) = call_names.get(id) else { continue };
+                    if !set.contains(&callee.as_str()) {
+                        continue;
+                    }
+                    match get_sink_spec(callee.as_str()) {
+                        Some(spec) if !spec.sink_args.is_empty() => {
+                            for &arg_idx in spec.sink_args {
+                                if let Some(arg_id) = call_arg_node(cpg, *id, arg_idx as usize) {
+                                    out.push(arg_id);
+                                }
+                            }
+                        }
+                        _ => out.push(*id),
+                    }
+                }
+                out
+            });
+        }};
     }
 
     // ── Helper macro: register a PropagatorSpec table as a named propagator.

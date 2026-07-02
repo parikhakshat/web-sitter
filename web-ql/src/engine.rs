@@ -95,7 +95,9 @@ impl<'a> RuleRunner<'a> {
                                 self.ctx.cpg,
                                 self.ctx.current_file,
                                 self.ctx.summaries,
-                            );
+                            )
+                            .with_cfg_cache(self.ctx.cfg_cache)
+                            .with_sizes(self.ctx.sizes);
                             if let Some(cf) = self.ctx.cross_file {
                                 engine = engine.with_cross_file(cf);
                             }
@@ -313,15 +315,17 @@ impl<'a> RuleRunner<'a> {
                     self.ctx.cpg,
                     self.ctx.current_file,
                     self.ctx.summaries,
-                );
+                )
+                .with_cfg_cache(self.ctx.cfg_cache)
+                .with_sizes(self.ctx.sizes);
                 if let Some(cf) = self.ctx.cross_file {
                     engine = engine.with_cross_file(cf);
                 }
                 !engine.run(spec).is_empty()
             }
 
-            QueryPlan::MatchesPattern { var, ty, fields } => {
-                self.eval_matches_pattern(var, ty, fields, env)
+            QueryPlan::MatchesPattern { expr, ty, fields } => {
+                self.eval_matches_pattern(expr, ty, fields, env)
             }
 
             QueryPlan::PredicateCall { name, args } => {
@@ -340,7 +344,7 @@ impl<'a> RuleRunner<'a> {
                             EvalValue::Str(s) => BindingValue::Str(s),
                             EvalValue::Int(n) => BindingValue::Int(n),
                             EvalValue::Bool(b) => BindingValue::Bool(b),
-                            EvalValue::Null | EvalValue::MetaNode(..) | EvalValue::List(..) => BindingValue::Null,
+                            EvalValue::Null | EvalValue::MetaNode(..) | EvalValue::List(..) | EvalValue::Regex(..) => BindingValue::Null,
                         };
                         child.insert(param_name.to_owned(), binding);
                     }
@@ -555,12 +559,15 @@ impl<'a> RuleRunner<'a> {
 
     fn eval_matches_pattern(
         &self,
-        var: &str,
+        expr: &PlanExpr,
         ty: &TypeExpr,
         fields: &[FieldConstraint],
         env: &BindingEnv,
     ) -> bool {
-        let Some(node_id) = env.get_node(var) else { return false };
+        let node_id = match self.eval_plan_expr(expr, env) {
+            EvalValue::Node(id) => id,
+            _ => return false,
+        };
         let Some(node) = self.ctx.cpg.ast.get(&node_id) else { return false };
 
         // Check type matches — NodeType uses raw string comparison against node_type field
@@ -676,6 +683,11 @@ impl<'a> RuleRunner<'a> {
             "namespace" => node.namespace.as_deref().map(|s| EvalValue::Str(s.to_owned())).unwrap_or(EvalValue::Null),
             "class_context" => node.class_context.as_deref().map(|s| EvalValue::Str(s.to_owned())).unwrap_or(EvalValue::Null),
             "visibility" => node.visibility.as_deref().map(|s| EvalValue::Str(s.to_owned())).unwrap_or(EvalValue::Null),
+            // The literal operator token for BinaryOp/UnaryOp nodes (e.g. "/", "%", "+"),
+            // so rules can match on the actual operator instead of regexing the node's
+            // full source text (which also matches unrelated substrings, e.g. a "/"
+            // inside a string-literal operand).
+            "operator" => node.operator.as_deref().map(|s| EvalValue::Str(s.to_owned())).unwrap_or(EvalValue::Null),
             "line" => EvalValue::Int(node.line as i64),
             "end_line" => EvalValue::Int(node.end_line as i64),
             "file" => self.ctx.cpg.source_file.as_deref().map(|s| EvalValue::Str(s.to_owned())).unwrap_or(EvalValue::Null),
@@ -936,11 +948,13 @@ impl<'a> RuleRunner<'a> {
 
             // ── Identifier node methods ───────────────────────────────────────
             "refers_to" => {
-                // Returns the resolved declaration node for this Call or identifier node.
-                // Uses the already-resolved callee_id from the call graph, which avoids
-                // a linear scan and correctly handles qualified names.
+                // For a Call, use the already-resolved callee_id from the call
+                // graph. For any other node (typically an Identifier used as
+                // a variable reference), fall back to name-based resolution
+                // against LocalDef/ParamDef/FieldDef declarations.
                 self.ctx.kind_index.call_site_for_node(node_id)
                     .and_then(|cs| cs.callee_id)
+                    .or_else(|| resolve_var_declaration(self.ctx.cpg, node_id, node))
                     .map(EvalValue::Node)
                     .unwrap_or(EvalValue::Null)
             }
@@ -1014,6 +1028,70 @@ impl<'a> RuleRunner<'a> {
             "is_const_expr" => {
                 let mut se = SymbolicEval::new(self.ctx.cpg);
                 EvalValue::Bool(se.is_const(node_id))
+            }
+
+            // ── Symbolic guard verification ───────────────────────────────────
+            // Shared primitives (see guard.rs) behind the coarse WQL-level
+            // "some dominating conditional mentions the value" predicates:
+            // `null_checked`, `div_guarded`, `index_guarded`, and
+            // `call_size_guarded` all reduce to one of these two calls,
+            // receiver-bound to the candidate `Conditional`/`Call` guard node.
+            //
+            // `nc.excludes_zero(value, target)` — true when `nc`'s condition
+            // establishes, on the branch reaching `target`, that `value` is
+            // nonzero (covers null-pointer checks and zero-divisor checks —
+            // the same underlying fact).
+            "excludes_zero" => {
+                let value = step.args.first().map(|a| self.eval_plan_expr(a, env));
+                let target = step.args.get(1).map(|a| self.eval_plan_expr(a, env));
+                match (value, target) {
+                    (Some(EvalValue::Node(v)), Some(EvalValue::Node(t))) => EvalValue::Bool(
+                        crate::guard::excludes_zero(self.ctx.cpg, self.ctx.dfg, v, node_id, t),
+                    ),
+                    _ => EvalValue::Bool(false),
+                }
+            }
+
+            // `nc.bounds_value(value, target, capacity)` — true when `nc`'s
+            // condition establishes, on the branch reaching `target`, that
+            // `value` (optionally wrapped in a `strlen`-family call) is
+            // bounded above by `capacity`. `capacity` may be an already-
+            // resolved integer (`decl.alloc_size()`) or a raw node whose
+            // concrete size is looked up directly.
+            "bounds_value" => {
+                let value = step.args.first().map(|a| self.eval_plan_expr(a, env));
+                let target = step.args.get(1).map(|a| self.eval_plan_expr(a, env));
+                let capacity = step.args.get(2).map(|a| self.eval_plan_expr(a, env));
+                let capacity_int = match capacity {
+                    Some(EvalValue::Int(n)) => Some(n),
+                    // Accept either an already-resolved declaration (as other
+                    // rules pass via `.refers_to()`) or a raw expression node
+                    // — resolve to its declaration here so callers don't need
+                    // a `let` (whose failure would short-circuit the whole
+                    // surrounding predicate rather than just falling back to
+                    // the direction-only capacity=None verification).
+                    Some(EvalValue::Node(cap_id)) => {
+                        self.ctx.sizes.concrete_size(cap_id).or_else(|| {
+                            let cap_node = self.ctx.cpg.ast.get(&cap_id)?;
+                            let decl = resolve_var_declaration(self.ctx.cpg, cap_id, cap_node)?;
+                            self.ctx.sizes.concrete_size(decl)
+                        })
+                    }
+                    _ => None,
+                };
+                match (value, target) {
+                    (Some(EvalValue::Node(v)), Some(EvalValue::Node(t))) => {
+                        EvalValue::Bool(crate::guard::upper_bounds(
+                            self.ctx.cpg,
+                            self.ctx.dfg,
+                            v,
+                            node_id,
+                            t,
+                            capacity_int,
+                        ))
+                    }
+                    _ => EvalValue::Bool(false),
+                }
             }
 
             // ── Language metadata side-table accessors ────────────────────────
@@ -1348,13 +1426,46 @@ pub enum EvalValue {
     Bool(bool),
     Null,
     List(Vec<EvalValue>),
+    /// A compiled `/pattern/flags` regex literal, for `expr in /pattern/`.
+    Regex(regex::Regex),
+}
+
+/// Compile a WQL regex literal's raw source (`/pattern/flags`, as captured by
+/// the lexer including the delimiting slashes) into a `regex::Regex`.
+/// `\/` is unescaped to `/` (only needed to escape the WQL delimiter inside
+/// the pattern); every other backslash escape is passed through unchanged so
+/// normal regex syntax (`\*`, `\d`, `\.`, character classes, etc.) works.
+fn compile_wql_regex(raw: &str) -> Option<regex::Regex> {
+    let body = raw.strip_prefix('/')?;
+    let slash_pos = body.rfind('/')?;
+    let (pattern, rest) = body.split_at(slash_pos);
+    let flags = &rest[1..];
+    let pattern = pattern.replace("\\/", "/");
+    let mut builder = regex::RegexBuilder::new(&pattern);
+    if flags.contains('i') {
+        builder.case_insensitive(true);
+    }
+    if flags.contains('s') {
+        builder.dot_matches_new_line(true);
+    }
+    if flags.contains('m') {
+        builder.multi_line(true);
+    }
+    builder.build().ok()
 }
 
 /// Return the set of all node IDs in the AST subtree rooted at `root` (inclusive).
 /// Used by DFG predicate subtree extensions so that `LocalDef.dfg_reaches(Call)`
 /// checks flow between descendant identifier/expression nodes, not just the
 /// structural container nodes (which have no DFG edges themselves).
-fn ast_subtree(cpg: &Cpg, root: NodeId) -> HashSet<NodeId> {
+/// All descendant node ids of `root`, including `root` itself. `pub(crate)`
+/// so `guard.rs` can mirror the same "subtree extension" semantics that
+/// `DfgPredicate::ReachesFlow` uses below: a DFG edge for a compound
+/// expression's *value* (e.g. a `Call`) often originates on one of its
+/// descendant identifier/argument nodes rather than the compound node's own
+/// id, so reachability checks need to consider the whole subtree, not just
+/// the literal node.
+pub(crate) fn ast_subtree(cpg: &Cpg, root: NodeId) -> HashSet<NodeId> {
     use std::collections::VecDeque;
     let mut visited: HashSet<NodeId> = HashSet::new();
     let mut queue: VecDeque<NodeId> = VecDeque::new();
@@ -1379,6 +1490,7 @@ fn eval_value_of_literal(lit: &Literal) -> EvalValue {
         Literal::Str(s) => EvalValue::Str(s.clone()),
         Literal::Null => EvalValue::Null,
         Literal::List(items) => EvalValue::List(items.iter().map(eval_value_of_literal).collect()),
+        Literal::Regex(raw) => compile_wql_regex(raw).map(EvalValue::Regex).unwrap_or(EvalValue::Null),
         _ => EvalValue::Null,
     }
 }
@@ -1393,6 +1505,8 @@ fn compare_values(lhs: &EvalValue, op: CmpOp, rhs: &EvalValue) -> bool {
         CmpOp::Ge => numeric_cmp(lhs, rhs).map_or(false, |o| o >= 0),
         CmpOp::In => match rhs {
             EvalValue::List(items) => items.iter().any(|item| values_equal(lhs, item)),
+            // `expr in /pattern/` — regex search against the LHS string.
+            EvalValue::Regex(re) => matches!(lhs, EvalValue::Str(s) if re.is_match(s)),
             // Fall back to substring containment when the RHS is a plain string
             // (e.g. `text() in /pattern/`-style checks against a scalar), so
             // `in` still behaves sensibly outside of list-literal membership.
@@ -1493,6 +1607,45 @@ fn guard_const_eval(cpg: &Cpg, node_id: NodeId) -> Option<bool> {
         crate::symbolic::SymbolicValue::Int(_) => Some(true),
         _ => None,
     }
+}
+
+/// Resolve a variable reference (an `Identifier` used as a value, e.g. an
+/// argument to a call) back to the `LocalDef`/`ParamDef`/`FieldDef` node that
+/// declared it, by name. Prefers a declaration in the same function; falls
+/// back to any matching declaration (e.g. a global) otherwise. Name-based
+/// resolution is a simplification — it does not model block-level shadowing —
+/// but is sufficient for the common case of one declaration per name.
+pub(crate) fn resolve_var_declaration(cpg: &Cpg, node_id: NodeId, node: &IrNode) -> Option<NodeId> {
+    if node.kind != IrNodeKind::Identifier {
+        return None;
+    }
+    let name = node.text.as_deref()?;
+    let scope_fn = node.function_id;
+    let mut fallback: Option<NodeId> = None;
+    for (&id, n) in &cpg.ast {
+        if id == node_id {
+            continue;
+        }
+        if !matches!(n.kind, IrNodeKind::LocalDef | IrNodeKind::ParamDef | IrNodeKind::FieldDef) {
+            continue;
+        }
+        // `.name` isn't reliably populated for every LocalDef shape (e.g. a
+        // pointer declaration with an initializer, `char *p = malloc(n)`,
+        // leaves it `None`) — fall back to `.text`, which several LocalDef
+        // shapes (`init_declarator` in particular) populate with just the
+        // declared identifier rather than the full source span.
+        let decl_name = n.name.as_deref().or(n.text.as_deref());
+        if decl_name != Some(name) {
+            continue;
+        }
+        if scope_fn.is_some() && n.function_id == scope_fn {
+            return Some(id);
+        }
+        if fallback.is_none() {
+            fallback = Some(id);
+        }
+    }
+    fallback
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

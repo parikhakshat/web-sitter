@@ -108,9 +108,11 @@ pub enum QueryPlan {
         bodies: Vec<QueryPlan>,
     },
 
-    /// Inline structural `matches` pattern
+    /// Inline structural `matches` pattern. `expr` is evaluated to a node
+    /// (either a plain variable or an arbitrary method chain, e.g.
+    /// `n.parent()` or `n.arg(0)`) and checked against `ty`/`fields`.
     MatchesPattern {
-        var: String,
+        expr: PlanExpr,
         ty: TypeExpr,
         fields: Vec<FieldConstraint>,
     },
@@ -243,6 +245,10 @@ pub struct TaintSpec {
     pub sinks: Vec<TaintEndpointRef>,
     pub sanitizers: Vec<TaintEndpointRef>,
     pub propagators: Vec<TaintEndpointRef>,
+    /// Function names that, when called on the tainted value inside a
+    /// dominating, textually-preceding conditional, suppress that particular
+    /// source→sink finding (see `TaintClause::guards` in ast.rs).
+    pub guards: Vec<String>,
     pub require_interprocedural: bool,
     pub max_call_depth: u32,
     pub require_same_function: bool,
@@ -255,6 +261,7 @@ impl Default for TaintSpec {
             sinks: Vec::new(),
             sanitizers: Vec::new(),
             propagators: Vec::new(),
+            guards: Vec::new(),
             require_interprocedural: true,
             max_call_depth: 10,
             require_same_function: false,

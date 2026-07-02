@@ -52,17 +52,17 @@ impl AllocSizeIndex {
             // 1. Static array size from IrNode fields
             if let Some(sz) = node.array_size {
                 sizes.insert(*node_id, SizeValue::Concrete(sz));
+                propagate_size_to_declaration(cpg, *node_id, SizeValue::Concrete(sz), &mut sizes);
                 continue;
             }
             if let Some(ref expr) = node.array_size_expr {
                 let stripped = expr.trim();
-                sizes.insert(
-                    *node_id,
-                    stripped
-                        .parse::<i64>()
-                        .map(SizeValue::Concrete)
-                        .unwrap_or_else(|_| SizeValue::Symbolic(stripped.to_owned())),
-                );
+                let sv = stripped
+                    .parse::<i64>()
+                    .map(SizeValue::Concrete)
+                    .unwrap_or_else(|_| SizeValue::Symbolic(stripped.to_owned()));
+                sizes.insert(*node_id, sv.clone());
+                propagate_size_to_declaration(cpg, *node_id, sv, &mut sizes);
                 continue;
             }
 
@@ -135,6 +135,33 @@ impl AllocSizeIndex {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Array declarators (`char buf[10]`) carry the size, but rules resolve a
+/// variable reference to its enclosing `LocalDef`/`ParamDef`/`FieldDef` (via
+/// `refers_to()`), which sits one or two levels up in the AST and has no
+/// `array_size` of its own. Mirror the size onto that declaration node too,
+/// so `decl.has_known_size()` / `decl.alloc_size()` work from either node.
+fn propagate_size_to_declaration(
+    cpg: &Cpg,
+    declarator_id: NodeId,
+    size: SizeValue,
+    sizes: &mut HashMap<NodeId, SizeValue>,
+) {
+    let mut cur = declarator_id;
+    for _ in 0..4 {
+        let Some(node) = cpg.ast.get(&cur) else { return };
+        let Some(parent_id) = node.parent_id else { return };
+        if parent_id == cur {
+            return;
+        }
+        cur = parent_id;
+        let Some(parent) = cpg.ast.get(&cur) else { return };
+        if matches!(parent.kind, IrNodeKind::LocalDef | IrNodeKind::ParamDef | IrNodeKind::FieldDef) {
+            sizes.entry(cur).or_insert(size);
+            return;
+        }
+    }
+}
 
 /// Approximate the content length of a string/byte-string literal from its
 /// raw source text: strip a leading language prefix (`b`, `r`, `f`, `u`, or

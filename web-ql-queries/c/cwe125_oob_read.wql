@@ -47,10 +47,18 @@ pred is_external_value_source(n: Call) =
         "atoi", "atol", "atoll", "strtol", "strtoul", "strtoll", "strtoull"
     ]
 
+// `bounds_value()` (web-ql/src/guard.rs) verifies the conditional's
+// comparison direction/polarity actually bounds `idx` above by `site`'s
+// array's known capacity (e.g. `if (i < len) a[i]`), not just that some
+// dominating conditional happens to mention the index at all — it still
+// falls back to a direction-only check when the array's size isn't
+// statically resolvable, so `if (i < n)` for a runtime-sized array is still
+// recognized as a guard, just without the numeric cross-check.
 pred index_guarded(idx: Node, site: Node) =
     exists(guard: Conditional |
         idx.dfg_reaches(guard)
-        and guard.dominates(site))
+        and guard.dominates(site)
+        and guard.bounds_value(idx, site, site.child(0)))
 
 // ── 1. Statically provable OOB subscript — no taint required ─────────────────
 // `array[literal_index]` against a statically known allocation/declaration
@@ -104,5 +112,8 @@ rule "cwe-125-c-tainted-read-size" {
     taint {
         sources: ["c.io_sources"]
         sinks:   ["c.bounded_copy_ops"]
+        // A dominating, preceding `if (strlen(tainted) < N)`-style length
+        // check gates the read (see cwe-787-c-tainted-copy-size).
+        guards: ["strlen", "strnlen", "wcslen"]
     }
 }

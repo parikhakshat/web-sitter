@@ -15,6 +15,7 @@ pub mod kind_index;
 pub mod size_tracking;
 pub mod symbolic;
 pub mod nullability;
+pub mod guard;
 pub mod taint;
 pub mod engine;
 pub mod finding;

@@ -19,5 +19,11 @@ rule "cwe-22-c-path-traversal" {
         sources: ["c.io_sources"]
         sinks:   ["c.file_ops", "c_win_file_sinks"]
         sanitizers: ["c_path_san", "c.path_sanitizers"]
+        // A dominating, preceding `if (strstr(path, "../")) return;`-style
+        // traversal-sequence check gates the file op — the path itself isn't
+        // transformed (so it can't be a `sanitizers` entry, which requires a
+        // node the value flows *through*), but the sink is only reachable
+        // once the guard has rejected traversal sequences.
+        guards: ["strstr", "strchr"]
     }
 }

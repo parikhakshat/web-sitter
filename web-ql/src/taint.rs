@@ -5,8 +5,11 @@ use std::sync::Arc;
 use web_profiler as prof;
 use web_sitter::{Cpg, FunctionSummary, IrNode, IrNodeKind, NodeId};
 use crate::dfg::{DfgIndex, TaintConfig};
+use crate::engine::resolve_var_declaration;
+use crate::guard;
 use crate::ir::{TaintEndpointRef, TaintSpec};
 use crate::node_ref::NodeRef;
+use crate::size_tracking::AllocSizeIndex;
 
 // ── Taint endpoint resolution ─────────────────────────────────────────────────
 
@@ -149,6 +152,17 @@ pub struct TaintEngine<'a> {
     pub summaries: &'a HashMap<String, FunctionSummary>,
     /// Optional cross-file DFG context for cross-file taint propagation.
     pub cross_file: Option<&'a CrossFileTaintCtx<'a>>,
+    /// Per-function CFGs (keyed by function-def node id), needed to evaluate
+    /// `TaintSpec::guards`. `None` disables guard filtering (guarded findings
+    /// are reported like any other, rather than risk silently dropping real
+    /// findings when CFG data isn't available).
+    pub cfg_cache: Option<&'a HashMap<NodeId, crate::cfg::FunctionCfg>>,
+    /// Buffer/allocation size index, needed to verify a length-comparison
+    /// guard's bound against the sink's actual destination capacity (see
+    /// `verify_length_guard`). `None` falls back to direction-only
+    /// verification (still real symbolic checking, just without the
+    /// numeric-magnitude cross-check).
+    pub sizes: Option<&'a AllocSizeIndex>,
 }
 
 impl<'a> TaintEngine<'a> {
@@ -159,11 +173,24 @@ impl<'a> TaintEngine<'a> {
         current_file: &'a Path,
         summaries: &'a HashMap<String, FunctionSummary>,
     ) -> Self {
-        Self { registry, dfg, cpg, current_file, summaries, cross_file: None }
+        Self {
+            registry, dfg, cpg, current_file, summaries,
+            cross_file: None, cfg_cache: None, sizes: None,
+        }
     }
 
     pub fn with_cross_file(mut self, ctx: &'a CrossFileTaintCtx<'a>) -> Self {
         self.cross_file = Some(ctx);
+        self
+    }
+
+    pub fn with_cfg_cache(mut self, cache: &'a HashMap<NodeId, crate::cfg::FunctionCfg>) -> Self {
+        self.cfg_cache = Some(cache);
+        self
+    }
+
+    pub fn with_sizes(mut self, sizes: &'a AllocSizeIndex) -> Self {
+        self.sizes = Some(sizes);
         self
     }
 
@@ -288,7 +315,115 @@ impl<'a> TaintEngine<'a> {
             }
         }
 
+        if !spec.guards.is_empty() {
+            findings.retain(|f| !self.is_guarded(f, &spec.guards));
+        }
+
         findings
+    }
+
+    /// True if a dominating, textually-preceding conditional calls one of
+    /// `guard_names` in a way that actually establishes the tainted value is
+    /// safe at the sink — i.e. `if (validate(tainted)) { sink(tainted); }`
+    /// or `if (strlen(tainted) < sizeof(dst)) { strcpy(dst, tainted); }`.
+    /// Unlike a sanitizer (a node the tainted value flows *through* and
+    /// comes out clean), this models a control-flow gate: the value itself
+    /// is never transformed, but the sink is only reachable once the guard
+    /// has approved it.
+    ///
+    /// `dominates()` is block-granular (see cwe476_null_deref.wql's
+    /// `null_checked` for the WQL-level version of this caveat) — a guard
+    /// sharing a straight-line block with the sink would "dominate" it
+    /// regardless of order, so the guard's line must also precede the sink's.
+    fn is_guarded(&self, finding: &TaintFinding, guard_names: &[String]) -> bool {
+        let Some(cfg_cache) = self.cfg_cache else { return false };
+        let Some(sink_fn) = self.cpg.ast.get(&finding.sink_node).and_then(|n| n.function_id) else {
+            return false;
+        };
+        let Some(fn_cfg) = cfg_cache.get(&sink_fn) else { return false };
+        let Some(sink_line) = self.cpg.ast.get(&finding.sink_node).map(|n| n.line) else {
+            return false;
+        };
+
+        for (&nid, node) in &self.cpg.ast {
+            if node.kind != IrNodeKind::Conditional || node.function_id != Some(sink_fn) {
+                continue;
+            }
+            if node.line > sink_line || !fn_cfg.node_dominates(nid, finding.sink_node) {
+                continue;
+            }
+            if self.condition_calls_guard(nid, guard_names, finding) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// True if the subtree rooted at `cond_node` (a Conditional's condition)
+    /// contains a call to one of `guard_names` whose argument is reachable
+    /// from `finding.source_node` — i.e. the guard is actually checking
+    /// *this* tainted value, not an unrelated variable. For a known length
+    /// function, additionally verify the comparison it sits in actually
+    /// bounds the value (see `verify_length_guard`) rather than just
+    /// accepting that the function was called somewhere in the condition.
+    fn condition_calls_guard(&self, cond_node: NodeId, guard_names: &[String], finding: &TaintFinding) -> bool {
+        let mut stack = vec![cond_node];
+        let mut seen = HashSet::new();
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            let Some(node) = self.cpg.ast.get(&id) else { continue };
+            if node.kind == IrNodeKind::Call {
+                let callee = self
+                    .cpg
+                    .call_graph
+                    .values()
+                    .flat_map(|e| &e.calls)
+                    .find(|cs| cs.call_site == Some(id))
+                    .map(|cs| cs.callee.as_str())
+                    .or(node.name.as_deref());
+                if let Some(name) = callee {
+                    if guard_names.iter().any(|g| g == name) {
+                        let args = call_argument_nodes(self.cpg, id);
+                        let reaches = args
+                            .iter()
+                            .any(|&a| self.dfg.reaches(finding.source_node, a) || finding.source_node == a);
+                        if reaches {
+                            if guard::KNOWN_LENGTH_FUNCTIONS.contains(&name) {
+                                if self.verify_length_guard(cond_node, finding) {
+                                    return true;
+                                }
+                                // Wrong direction/magnitude, or no enclosing
+                                // comparison at all (`if (strlen(x))` as a
+                                // bare truthiness check) — this particular
+                                // call doesn't establish safety; keep
+                                // looking for another guard in the same
+                                // condition (e.g. `a || b`).
+                            } else {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+            stack.extend(node.children.iter().copied());
+        }
+        false
+    }
+
+    /// Verify that the condition actually bounds `finding.source_node`
+    /// (directly, or wrapped in a `strlen`-family call) against the sink's
+    /// destination capacity. Delegates the comparison-direction/polarity/
+    /// magnitude verification to `guard::upper_bounds` — the same primitive
+    /// the WQL-level `bounds_value()` predicate uses — and only resolves the
+    /// taint-guard-specific piece: the sink call's destination-argument
+    /// capacity convention.
+    fn verify_length_guard(&self, cond_node: NodeId, finding: &TaintFinding) -> bool {
+        let capacity = self
+            .sizes
+            .and_then(|sizes| sink_destination_capacity(self.cpg, sizes, finding.sink_node));
+        guard::upper_bounds(self.cpg, self.dfg, finding.source_node, cond_node, finding.sink_node, capacity)
     }
 
     fn resolve_propagator_edges(&self, propagators: &[TaintEndpointRef]) -> Vec<(NodeId, NodeId)> {
@@ -577,19 +712,7 @@ fn index_call_arguments(
         if node.kind != IrNodeKind::Call {
             continue;
         }
-        let arg_ids: Vec<NodeId> = node
-            .children
-            .iter()
-            .find_map(|&cid| {
-                let child = cpg.ast.get(&cid)?;
-                if matches!(child.node_type.as_str(), "argument_list" | "arguments") {
-                    Some(child.children.iter().copied().collect::<Vec<_>>())
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_else(|| node.children.iter().copied().collect());
-
+        let arg_ids = call_argument_nodes(cpg, node_id);
         for &arg_id in &arg_ids {
             arg_to_calls.entry(arg_id).or_default().push(node_id);
         }
@@ -597,6 +720,53 @@ fn index_call_arguments(
     }
 
     (call_args, arg_to_calls)
+}
+
+/// Argument nodes of a single `Call`, descending into the `argument_list`/
+/// `arguments` container child most languages wrap arguments in (falling
+/// back to the call's direct children for shapes that don't).
+fn call_argument_nodes(cpg: &Cpg, call_id: NodeId) -> Vec<NodeId> {
+    let Some(node) = cpg.ast.get(&call_id) else { return Vec::new() };
+    node.children
+        .iter()
+        .find_map(|&cid| {
+            let child = cpg.ast.get(&cid)?;
+            if matches!(child.node_type.as_str(), "argument_list" | "arguments") {
+                Some(child.children.iter().copied().collect::<Vec<_>>())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| node.children.iter().copied().collect())
+}
+
+// ── Length-guard symbolic verification helpers ─────────────────────────────────
+// The actual comparison-direction/polarity/magnitude verification now lives
+// in `guard.rs`, shared with the WQL-exposed `bounds_value()`/`excludes_zero()`
+// predicates — this module only resolves the taint-guard-specific piece: the
+// sink call's destination-argument capacity convention.
+
+/// The statically-known capacity of the sink's actual destination buffer:
+/// walk up from `sink_node` to its enclosing `Call` (the copy/read
+/// operation), take that call's first argument (the destination, by
+/// convention for the C stdlib functions these rules target), resolve it to
+/// its declaration, and look up the declared size.
+fn sink_destination_capacity(cpg: &Cpg, sizes: &AllocSizeIndex, sink_node: NodeId) -> Option<i64> {
+    let mut cur = sink_node;
+    let call_id = loop {
+        let node = cpg.ast.get(&cur)?;
+        if node.kind == IrNodeKind::Call {
+            break cur;
+        }
+        match node.parent_id {
+            Some(p) if p != cur => cur = p,
+            _ => return None,
+        }
+    };
+    let dest = *call_argument_nodes(cpg, call_id).first()?;
+    let dest_node = cpg.ast.get(&dest)?;
+    let decl = resolve_var_declaration(cpg, dest, dest_node).unwrap_or(dest);
+    sizes.concrete_size(decl)
 }
 
 // ── Interprocedural expansion ─────────────────────────────────────────────────

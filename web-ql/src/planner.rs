@@ -276,6 +276,7 @@ impl Planner {
         for nr in &tc.propagators {
             spec.propagators.push(self.compile_named_ref(nr, &scope)?);
         }
+        spec.guards = tc.guards.clone();
 
         Ok(spec)
     }
@@ -526,31 +527,20 @@ impl Planner {
         pattern: &NodePattern,
         scope: &Scope,
     ) -> PlanResult<QueryPlan> {
-        // The expr should be a variable reference
-        let var = match &expr.kind {
-            ExprKind::Ident(n) => n.clone(),
-            ExprKind::MethodCall { receiver, method, args } => {
-                // Allow method chains too — wrap as plan expr comparison
-                let lhs = self.compile_plan_expr(expr, scope)?;
-                let mut fields = Vec::new();
-                for (field, constraint) in &pattern.fields {
-                    fields.push(FieldConstraint {
-                        field: field.clone(),
-                        constraint: self.compile_plan_expr(constraint, scope)?,
-                    });
-                }
-                // Synthesize a var name to hold the intermediate
-                let _ = (receiver, method, args);
-                return Ok(QueryPlan::MatchesPattern {
-                    var: format!("__matches_{}", lhs_repr(&lhs)),
-                    ty: pattern.ty.clone(),
-                    fields,
-                });
+        // The LHS may be a plain variable or an arbitrary method chain
+        // (e.g. `n.parent()`, `n.arg(0)`) — both compile to a `PlanExpr`
+        // that is evaluated fresh against the runtime bindings, so no
+        // separate variable needs to be bound for the intermediate value.
+        match &expr.kind {
+            ExprKind::Ident(_) | ExprKind::MethodCall { .. } => {}
+            _ => {
+                return Err(PlanError::Unsupported(
+                    "`matches` LHS must be a variable or method chain".into(),
+                ))
             }
-            _ => return Err(PlanError::Unsupported(
-                "`matches` LHS must be a variable or method chain".into(),
-            )),
-        };
+        }
+
+        let value_expr = self.compile_plan_expr(expr, scope)?;
 
         let mut fields = Vec::new();
         for (field, constraint) in &pattern.fields {
@@ -561,7 +551,7 @@ impl Planner {
         }
 
         Ok(QueryPlan::MatchesPattern {
-            var,
+            expr: value_expr,
             ty: pattern.ty.clone(),
             fields,
         })
@@ -671,23 +661,13 @@ fn lit_is_truthy(lit: &Literal) -> bool {
     }
 }
 
-fn lhs_repr(pe: &PlanExpr) -> String {
-    match pe {
-        PlanExpr::Var(n) => n.clone(),
-        PlanExpr::MethodChain { steps, .. } => {
-            steps.last().map(|s| s.method.clone()).unwrap_or_default()
-        }
-        _ => "expr".into(),
-    }
-}
-
 /// Very simplified return type inference for method chains.
 fn return_type_of_method(method: &str, recv_ty: &TypeExpr) -> TypeExpr {
     match method {
         "parent" | "ancestor" | "child" | "descendant" | "receiver" | "return_value" => {
             TypeExpr::Node
         }
-        "callee_name" | "qualified_callee" | "name" | "text" | "raw_kind"
+        "callee_name" | "qualified_callee" | "name" | "text" | "raw_kind" | "operator"
         | "string_value" | "namespace" | "file" | "return_type" | "visibility" => {
             TypeExpr::Named("String".into())
         }

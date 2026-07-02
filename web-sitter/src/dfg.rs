@@ -2229,6 +2229,17 @@ fn build_dataflow_impl(
         include_globals,
         macro_aliases,
     );
+    add_taint_source_output_edges(
+        graph,
+        &mut edges,
+        &type_index,
+        &parent_map,
+        &function_map,
+        &bb_reachability,
+        affected_function_ids,
+        include_globals,
+        macro_aliases,
+    );
     if include_interprocedural {
         add_interprocedural_edges(
             graph,
@@ -3986,6 +3997,125 @@ fn add_taint_propagator_edges(
         // The CALL_RETURN edge from the call site to the LHS variable (if any)
         // is already emitted by add_call_return_edges; no need to duplicate it.
         let _ = call_node;
+    }
+}
+
+/// For known taint-source functions with an output-parameter effect
+/// (`SourceSpec::tainted_params`, e.g. `fgets(buf, n, stream)` taints `buf`,
+/// `scanf("%s", buf)` taints `buf`), the call itself is the only DFG-visible
+/// "definition" event for that argument — unlike an assignment, tree-sitter
+/// gives no separate lvalue node to hang a definition on. Without this pass,
+/// these calls only taint their *return value* (via the normal source
+/// registration in `add_taint_propagator_edges`'s sibling machinery), so the
+/// overwhelmingly common style of calling them as a bare statement
+/// (`fgets(buf, n, stdin);`, ignoring the return value) leaves every later
+/// use of `buf` invisible to taint propagation.
+///
+/// Mirrors the main per-variable reaching-def fixpoint earlier in
+/// `build_dataflow_impl`, but runs as an independent trailing pass (like
+/// `add_taint_propagator_edges` above) instead of hooking into that
+/// fixpoint's bookkeeping directly.
+fn add_taint_source_output_edges(
+    graph: &BTreeMap<NodeId, AstNode>,
+    edges: &mut Vec<DataflowEdge>,
+    type_index: &BTreeMap<String, Vec<NodeId>>,
+    parent_map: &BTreeMap<NodeId, NodeId>,
+    function_map: &BTreeMap<NodeId, NodeId>,
+    bb_reachability: &FxHashMap<String, FxHashSet<String>>,
+    affected_function_ids: Option<&BTreeSet<NodeId>>,
+    include_globals: bool,
+    macro_aliases: Option<&BTreeMap<String, String>>,
+) {
+    // Index every (non-callee) identifier occurrence by (function, name) so
+    // candidate later-uses can be looked up per call instead of rescanning
+    // the whole graph for each tainted-output argument.
+    let mut uses_by_var: BTreeMap<(Option<NodeId>, String), Vec<NodeId>> = BTreeMap::new();
+    // Index the declaring LocalDef/ParamDef/FieldDef for each (function, name),
+    // matched by `.name` (populated for most declaration shapes) falling back
+    // to `.text` (populated on shapes like `init_declarator` that leave
+    // `.name` unset — e.g. `char *p = malloc(n)`).
+    let mut decl_by_var: BTreeMap<(Option<NodeId>, String), NodeId> = BTreeMap::new();
+    for (&id, node) in graph.iter() {
+        if node.is_identifier() {
+            if !is_call_callee_identifier(graph, id) {
+                if let Some(name) = node.text.clone() {
+                    let fid = function_map.get(&id).copied();
+                    uses_by_var.entry((fid, name)).or_default().push(id);
+                }
+            }
+            continue;
+        }
+        if matches!(
+            node.kind,
+            IrNodeKind::LocalDef | IrNodeKind::ParamDef | IrNodeKind::FieldDef
+        ) {
+            if let Some(name) = node.name.clone().or_else(|| node.text.clone()) {
+                let fid = function_map.get(&id).copied();
+                decl_by_var.entry((fid, name)).or_insert(id);
+            }
+        }
+    }
+
+    for call_id in type_index
+        .get("call_expression")
+        .into_iter()
+        .flatten()
+        .copied()
+    {
+        if !node_in_scope(
+            call_id,
+            function_map,
+            affected_function_ids,
+            include_globals,
+        ) {
+            continue;
+        }
+        let Some(func_name) = extract_called_function_name(graph, call_id, macro_aliases) else {
+            continue;
+        };
+        let Some(spec) = crate::security_patterns::get_source_spec(&func_name) else {
+            continue;
+        };
+        if spec.tainted_params.is_empty() {
+            continue;
+        }
+        let arg_nodes = extract_call_argument_nodes(graph, call_id);
+        let call_fn = function_map.get(&call_id).copied();
+        for &idx in spec.tainted_params {
+            if idx < 0 {
+                continue;
+            }
+            let Some(&arg_id) = arg_nodes.get(idx as usize) else {
+                continue;
+            };
+            for var in collect_identifiers_in_expr(graph, arg_id, Some(parent_map)) {
+                // Also link the original declaration to this call, so that
+                // rules resolving a variable to its declaration (e.g. WQL's
+                // `refers_to()`) and checking `decl.dfg_reaches(x)` still see
+                // the redefinition: declaration → call → later use.
+                if let Some(&decl_id) = decl_by_var.get(&(call_fn, var.name.clone())) {
+                    if decl_id != call_id {
+                        push_edge(edges, decl_id, call_id, var.name.clone(), "REACHING_DEF");
+                    }
+                }
+                let Some(candidates) = uses_by_var.get(&(call_fn, var.name.clone())) else {
+                    continue;
+                };
+                for &use_id in candidates {
+                    if use_id == var.node_id {
+                        continue;
+                    }
+                    let reaches = if bb_reachability.is_empty() {
+                        def_precedes_use(graph, call_id, use_id)
+                    } else {
+                        def_reaches_use(graph, bb_reachability, call_id, use_id)
+                    };
+                    if reaches {
+                        push_edge(edges, call_id, use_id, var.name.clone(), "REACHING_DEF");
+                    }
+                }
+            }
+        }
     }
 }
 
