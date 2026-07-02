@@ -1,28 +1,32 @@
 mod callgraph;
 mod index;
-// LiveIndex is built and fully tested (see live_index.rs) but not yet constructed from
-// main() — that's the next task: wiring the file-watcher pipeline to actually drive it at
-// runtime. Until then it, and the store/watcher pieces it depends on, are exercised only
-// by their own unit/integration tests.
-#[allow(dead_code)]
 mod live_index;
 mod security;
 mod server;
+// Several pieces of the storage layer (per-shard revision/lock accessors, snapshot
+// save/load, WorkspaceStore's own hot/persisted-length introspection) are reserved public
+// API not yet consumed by the live wiring above — e.g. per-tool revision-stamping
+// (the original design's "every response carries the revision it was computed against")
+// and per-shard-scoped reads are real, deliberate future steps, not oversights. Each
+// piece has its own unit/integration test coverage already.
 #[allow(dead_code)]
 mod store;
 mod symbol_query;
 mod tools;
-#[allow(dead_code)]
 mod watcher;
 
 use std::hash::{Hash, Hasher};
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use live_index::LiveIndex;
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;
 use server::WebMcpServer;
+use store::live_workspace::LiveWorkspace;
 
 /// Default location of the built-in CWE rule corpus, resolved relative to this crate's
 /// own manifest directory at compile time (`web-mcp/` and `web-ql-queries/` are sibling
@@ -53,7 +57,10 @@ struct Cli {
     #[arg(long, default_value = ".")]
     root: PathBuf,
 
-    /// Directory for the on-disk fact store / cache (Phase 2+; unused until then).
+    /// Directory for on-disk state: the findings store and the live-update fact store
+    /// (per-file `Cpg` cache + incremental-parse snapshots). Defaults to a stable
+    /// per-root location under the OS temp directory (see `default_cache_dir`) when
+    /// omitted.
     #[arg(long)]
     cache_dir: Option<PathBuf>,
 
@@ -105,15 +112,75 @@ async fn main() -> Result<()> {
     tracing::info!(cache_dir = %cache_dir.display(), "findings store opened");
 
     let server = WebMcpServer::new(
-        root,
+        root.clone(),
         workspace,
         reverse_index,
         security_rules,
         findings_store,
-    )
-    .serve(stdio())
-    .await
-    .inspect_err(|e| tracing::error!("serving error: {e:?}"))?;
+    );
+
+    // Grab handles to the live-swappable query state *before* handing `server` to
+    // `.serve()` — `LiveIndex` publishes new snapshots through these; every clone of
+    // `server` (rmcp clones the handler per connection) sees them on its next read.
+    let workspace_handle = server.workspace_handle();
+    let reverse_index_handle = server.reverse_index_handle();
+    let call_graph_handle = server.call_graph_handle();
+
+    let live_workspace = Arc::new(
+        LiveWorkspace::open(
+            cache_dir.join("live.redb"),
+            root.clone(),
+            NonZeroUsize::new(store::DEFAULT_HOT_CAPACITY)
+                .expect("DEFAULT_HOT_CAPACITY is a nonzero constant"),
+            cache_dir.join("snapshots"),
+        )
+        .context("opening live workspace")?,
+    );
+
+    // Warm-restart every file the initial batch build already indexed, so the first edit
+    // to any of them can use LiveWorkspace's incremental path instead of a cold full
+    // parse (see store::live_workspace's content-hash-equivalent validity check).
+    let initial_files: Vec<PathBuf> = workspace_handle
+        .read()
+        .await
+        .files
+        .keys()
+        .cloned()
+        .collect();
+    let mut warm_hits = 0usize;
+    for file in &initial_files {
+        match live_workspace.warm_restart_file(file) {
+            Ok(true) => warm_hits += 1,
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(file = %file.display(), error = %e, "warm restart failed for a file already in the batch index");
+            }
+        }
+    }
+    tracing::info!(
+        files = initial_files.len(),
+        warm_hits,
+        "live workspace warm-restarted"
+    );
+
+    let live_index = Arc::new(LiveIndex::new(
+        live_workspace,
+        workspace_handle,
+        reverse_index_handle,
+        call_graph_handle,
+    ));
+
+    // Kept alive for the rest of `main` (never dropped early) — dropping the `Debouncer`
+    // stops watching. `rx` is moved into the spawned pipeline task below.
+    let (_watcher_guard, rx) =
+        watcher::watch(&root, watcher::DEFAULT_DEBOUNCE).context("starting file watcher")?;
+    tokio::spawn(watcher::run_pipeline(Arc::clone(&live_index), rx));
+    tracing::info!(root = %root.display(), "file watcher started; live updates active");
+
+    let server = server
+        .serve(stdio())
+        .await
+        .inspect_err(|e| tracing::error!("serving error: {e:?}"))?;
 
     server.waiting().await?;
     Ok(())

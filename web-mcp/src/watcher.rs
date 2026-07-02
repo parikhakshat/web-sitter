@@ -1,16 +1,16 @@
 //! File-watcher + debounced edit pipeline: the last piece connecting a real filesystem
-//! change to `LiveWorkspace::apply_file_change`/`apply_file_removal`. Wraps
-//! `notify-debouncer-mini` (debounce window per the design's 50-150ms target) so a burst
-//! of writes to the same file — a save that touches the file twice, an editor's
-//! atomic-rename-based save — collapses into one re-index instead of several.
+//! change to `LiveWorkspace::apply_file_change`/`apply_file_removal` (or, in the live
+//! server's case, `LiveIndex`'s versions of the same two methods — see `LiveApplier`
+//! below). Wraps `notify-debouncer-mini` (debounce window per the design's 50-150ms
+//! target) so a burst of writes to the same file — a save that touches the file twice, an
+//! editor's atomic-rename-based save — collapses into one re-index instead of several.
 //!
 //! "Fall back to full-file reparse when a byte-diff isn't available" (the design's other
 //! requirement for this task) needs no special-casing here: every event, however it was
 //! produced (edit, external rewrite, rename-over), is handled identically — read the
-//! file's current full contents and hand them to `LiveWorkspace::apply_file_change`,
-//! which diffs against whatever it last saw via `compute_edit`. An external full-file
-//! rewrite is simply a `TextEdit` with an unusually large span; there is no separate path
-//! to fall back *to*.
+//! file's current full contents and hand them to `apply_file_change`, which diffs against
+//! whatever it last saw via `compute_edit`. An external full-file rewrite is simply a
+//! `TextEdit` with an unusually large span; there is no separate path to fall back *to*.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -20,10 +20,42 @@ use notify_debouncer_mini::notify::RecursiveMode;
 use notify_debouncer_mini::{DebounceEventResult, Debouncer, new_debouncer};
 use tokio::sync::mpsc;
 
+use crate::live_index::LiveIndex;
 use crate::store::live_workspace::{AppliedChange, LiveWorkspace};
 
 /// Default debounce window — within the design's stated 50-150ms target.
 pub const DEFAULT_DEBOUNCE: Duration = Duration::from_millis(100);
+
+/// Whatever `run_pipeline` drives events into — `LiveWorkspace` on its own (used directly
+/// by this module's own tests, and by any caller that only needs per-file incremental
+/// state, no cross-file facts) or `LiveIndex` (what the live server actually runs,
+/// folding `LiveWorkspace`'s result into the query-serving `Workspace`/
+/// `ReverseSymbolIndex`/`SymbolCallGraph`). One trait so the pipeline itself doesn't need
+/// to know or care which.
+pub(crate) trait LiveApplier: Send + Sync {
+    async fn apply_file_change(&self, file: &Path, new_source: &[u8]) -> Result<AppliedChange>;
+    async fn apply_file_removal(&self, file: &Path) -> Result<AppliedChange>;
+}
+
+impl LiveApplier for LiveWorkspace {
+    async fn apply_file_change(&self, file: &Path, new_source: &[u8]) -> Result<AppliedChange> {
+        LiveWorkspace::apply_file_change(self, file, new_source).await
+    }
+
+    async fn apply_file_removal(&self, file: &Path) -> Result<AppliedChange> {
+        LiveWorkspace::apply_file_removal(self, file).await
+    }
+}
+
+impl LiveApplier for LiveIndex {
+    async fn apply_file_change(&self, file: &Path, new_source: &[u8]) -> Result<AppliedChange> {
+        LiveIndex::apply_file_change(self, file, new_source).await
+    }
+
+    async fn apply_file_removal(&self, file: &Path) -> Result<AppliedChange> {
+        LiveIndex::apply_file_removal(self, file).await
+    }
+}
 
 /// One coalesced filesystem change, ready to hand to `LiveWorkspace`.
 #[derive(Debug, Clone)]
@@ -76,30 +108,35 @@ pub fn watch(
     Ok((debouncer, rx))
 }
 
-/// Drive `workspace` from a stream of watcher events until the channel closes (the
+/// Drive `applier` from a stream of watcher events until the channel closes (the
 /// `Debouncer` was dropped). Returns once `rx` is exhausted — callers typically
 /// `tokio::spawn` this alongside keeping the `Debouncer` guard alive elsewhere. Takes an
 /// `Arc` (rather than a bare reference) because this is meant to be spawned as a `'static`
 /// background task, exactly like `WebMcpServer` already `Arc`-wraps its other shared state.
-pub async fn run_pipeline(
-    workspace: std::sync::Arc<LiveWorkspace>,
+pub async fn run_pipeline<A>(
+    applier: std::sync::Arc<A>,
     mut rx: mpsc::UnboundedReceiver<FileChangeEvent>,
-) {
+) where
+    A: LiveApplier + 'static,
+{
     while let Some(event) = rx.recv().await {
-        if let Err(err) = apply_one(&workspace, &event).await {
+        if let Err(err) = apply_one(applier.as_ref(), &event).await {
             tracing::warn!(path = %event.path.display(), ?err, "failed to apply file change");
         }
     }
 }
 
-async fn apply_one(workspace: &LiveWorkspace, event: &FileChangeEvent) -> Result<AppliedChange> {
+async fn apply_one<A: LiveApplier + ?Sized>(
+    applier: &A,
+    event: &FileChangeEvent,
+) -> Result<AppliedChange> {
     if event.removed {
-        return workspace.apply_file_removal(&event.path).await;
+        return applier.apply_file_removal(&event.path).await;
     }
     let contents = tokio::fs::read(&event.path)
         .await
         .with_context(|| format!("reading changed file {}", event.path.display()))?;
-    workspace.apply_file_change(&event.path, &contents).await
+    applier.apply_file_change(&event.path, &contents).await
 }
 
 #[cfg(test)]
