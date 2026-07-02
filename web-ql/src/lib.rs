@@ -23,6 +23,7 @@ pub mod workspace;
 pub mod loader;
 pub mod security_patterns;
 pub mod node_ref;
+pub mod symbol_index;
 
 // Re-export the primary public API surface.
 pub use parser::parse_rule_file;
