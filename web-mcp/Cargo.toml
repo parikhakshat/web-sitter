@@ -17,6 +17,10 @@ clap = { version = "4.5", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rayon = { workspace = true }
+redb = "2.2"
+bincode = { workspace = true }
+lz4_flex = { version = "0.11", default-features = false, features = ["frame"] }
+lru = "0.12"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["process", "io-util", "time"] }

@@ -1,6 +1,12 @@
 mod callgraph;
 mod index;
 mod server;
+// Not wired into WebMcpServer yet — sharded locking (#12), the incremental-system
+// unification (#13), and the file watcher (#14) all need to land first before the live
+// server can use this instead of crate::index's all-in-memory batch Workspace. Exercised
+// by its own unit tests in the meantime.
+#[allow(dead_code)]
+mod store;
 mod symbol_query;
 mod tools;
 

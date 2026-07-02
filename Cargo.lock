@@ -1197,6 +1197,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "redb"
+version = "2.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8eca1e9d98d5a7e9002d0013e18d5a9b000aee942eb134883a82f06ebffb6c01"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "ref-cast"
 version = "1.0.25"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2273,8 +2282,12 @@ name = "web-mcp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bincode",
  "clap",
+ "lru",
+ "lz4_flex",
  "rayon",
+ "redb",
  "rmcp",
  "schemars",
  "serde",
