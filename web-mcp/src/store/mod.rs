@@ -12,7 +12,9 @@
 //! server-shaped costume.
 
 pub mod persistence;
+pub mod revision;
 pub mod shard;
+pub mod sharded_lock;
 
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
