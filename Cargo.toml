@@ -4,6 +4,7 @@ members = [
     "web-ql",
     "web-profiler",
     "web-scan",
+    "web-mcp",
 ]
 resolver = "2"
 
