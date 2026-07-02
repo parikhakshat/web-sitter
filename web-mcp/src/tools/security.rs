@@ -19,17 +19,20 @@
 //! `cross_file_dfgs`/`cross_file_callee_params` (see `Workspace::scan_scoped`) — only
 //! which files get their own reported findings is restricted.
 
-use std::collections::HashSet;
-use std::path::PathBuf;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use rmcp::Json;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{tool, tool_router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use web_sitter::{CpgGenerator, GraphBuildOptions};
+use web_ql::Finding;
+use web_sitter::symbol_id::{SymbolId, build_symbol_table};
+use web_sitter::{CpgGenerator, GraphBuildOptions, NodeId};
 
 use crate::server::WebMcpServer;
+use crate::store::findings::fingerprint;
 use crate::tools::impact::diff_changed_symbols;
 
 const SUPPORTED_SCOPES: &[&str] = &["workspace", "file", "directory", "diff"];
@@ -63,6 +66,13 @@ pub struct RunSecurityScanRequest {
 
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct SecurityFinding {
+    /// Stable fingerprint (rule id + enclosing symbol or file) — pass this to
+    /// `verify_finding_status`/`record_finding_status` to track this finding across scans.
+    pub finding_id: String,
+    /// "open" | "fixed" | "suppressed" — this scan's effect on the finding's durable
+    /// status (a `Suppressed` finding is still returned here, so a caller can see it was
+    /// found again, but stays `Suppressed` in the findings store).
+    pub status: String,
     pub rule_id: String,
     pub severity: String,
     pub message: String,
@@ -110,10 +120,50 @@ impl WebMcpServer {
 
         let scope = self.compute_scan_scope(&req)?;
 
-        let findings = match &scope {
+        let raw_findings = match &scope {
             Some(files) => self.workspace.scan_scoped(&rule_set, files),
             None => self.workspace.scan(&rule_set),
         };
+
+        let scanned_files: HashSet<String> = match &scope {
+            Some(files) => files.iter().map(|f| f.display().to_string()).collect(),
+            None => self
+                .workspace
+                .files
+                .keys()
+                .map(|f| f.display().to_string())
+                .collect(),
+        };
+        let files_scanned = scanned_files.len();
+
+        let revision = self.next_scan_revision();
+        let mut symbol_cache: HashMap<PathBuf, BTreeMap<NodeId, SymbolId>> = HashMap::new();
+        let mut seen_ids: HashSet<String> = HashSet::new();
+        let mut enriched = Vec::with_capacity(raw_findings.len());
+        for f in raw_findings {
+            let symbol_id = self.resolve_finding_symbol(&f, &mut symbol_cache);
+            let finding_id = fingerprint(
+                &f.rule_id,
+                symbol_id.as_ref().map(SymbolId::as_str),
+                &f.location.file,
+            );
+            let record = self
+                .findings_store
+                .record_seen(
+                    &finding_id,
+                    revision,
+                    &f.rule_id,
+                    &f.message,
+                    &f.location.file,
+                    f.location.line,
+                )
+                .map_err(|e| format!("recording finding status: {e:#}"))?;
+            seen_ids.insert(finding_id.clone());
+            enriched.push((f, finding_id, record.status));
+        }
+        self.findings_store
+            .sweep_fixed(&scanned_files, &seen_ids, revision)
+            .map_err(|e| format!("sweeping fixed findings: {e:#}"))?;
 
         let threshold_rank = severity_rank(
             req.severity_threshold
@@ -123,11 +173,13 @@ impl WebMcpServer {
                 .as_str(),
         );
 
-        let findings = findings
+        let findings = enriched
             .into_iter()
-            .map(|f| {
+            .map(|(f, finding_id, status)| {
                 let severity = f.severity_str().to_string();
                 SecurityFinding {
+                    finding_id,
+                    status: status.as_str().to_string(),
                     rule_id: f.rule_id,
                     severity,
                     message: f.message,
@@ -139,10 +191,6 @@ impl WebMcpServer {
             })
             .filter(|f| severity_rank(&f.severity) <= threshold_rank)
             .collect();
-
-        let files_scanned = scope
-            .map(|files| files.len())
-            .unwrap_or(self.workspace.files.len());
 
         Ok(Json(RunSecurityScanResponse {
             findings,
@@ -225,6 +273,27 @@ impl WebMcpServer {
         req.path
             .clone()
             .ok_or_else(|| format!("scope={} requires path", req.scope))
+    }
+
+    /// Resolve a finding's enclosing symbol (its primary matched node's `function_id`) to
+    /// a `SymbolId`, for fingerprinting — `None` for findings with no resolvable enclosing
+    /// function (e.g. file-level/global-scope matches), not an error. `symbol_cache` avoids
+    /// rebuilding a file's whole symbol table once per finding when several findings land
+    /// in the same file.
+    fn resolve_finding_symbol(
+        &self,
+        finding: &Finding,
+        symbol_cache: &mut HashMap<PathBuf, BTreeMap<NodeId, SymbolId>>,
+    ) -> Option<SymbolId> {
+        let file = Path::new(&finding.location.file);
+        let idx = self.workspace.files.get(file)?;
+        let node_id = *finding.matched_nodes.first()?;
+        let function_id = idx.cpg.ast.get(&node_id)?.function_id?;
+
+        let table = symbol_cache
+            .entry(file.to_path_buf())
+            .or_insert_with(|| build_symbol_table(&idx.cpg));
+        table.get(&function_id).cloned()
     }
 }
 

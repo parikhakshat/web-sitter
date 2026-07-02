@@ -11,6 +11,7 @@
 //! bolting it on now, before those pieces exist, would just be dead code wearing a
 //! server-shaped costume.
 
+pub mod findings;
 pub mod incremental_file;
 pub mod live_workspace;
 pub mod persistence;

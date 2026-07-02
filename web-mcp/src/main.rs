@@ -5,6 +5,7 @@ mod server;
 // batch-built, all-in-memory Workspace. Swapping tools over to LiveWorkspace (so they see
 // live edits) is follow-up integration work beyond this phase's per-piece tasks — store
 // and watcher are exercised by their own unit/integration tests in the meantime.
+// `store::findings` is the one exception already wired in, via `run_security_scan`.
 #[allow(dead_code)]
 mod store;
 mod symbol_query;
@@ -12,9 +13,10 @@ mod tools;
 #[allow(dead_code)]
 mod watcher;
 
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;
@@ -25,6 +27,19 @@ use server::WebMcpServer;
 /// workspace members) — works regardless of the caller's current directory without
 /// requiring `--rules-dir` for the common case of running against this repo's own rules.
 const DEFAULT_RULES_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../web-ql-queries");
+
+/// When `--cache-dir` isn't given, derive a stable per-root location under the OS temp
+/// directory instead of writing into the scanned repo — same root canonicalizes to the
+/// same path every time, so the findings store (and, later, the on-disk fact store)
+/// actually persists across restarts as the design requires, without needing the caller
+/// to remember to pass a flag.
+fn default_cache_dir(root: &std::path::Path) -> PathBuf {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    root.hash(&mut hasher);
+    std::env::temp_dir()
+        .join("web-mcp")
+        .join(format!("{:x}", hasher.finish()))
+}
 
 /// web-mcp: a deterministic memory and verification layer for coding agents, exposed
 /// over the Model Context Protocol via stdio. See `docs/mcp-server-design.md` in the
@@ -77,10 +92,26 @@ async fn main() -> Result<()> {
         "built-in rule corpus loaded"
     );
 
-    let server = WebMcpServer::new(root, workspace, reverse_index, security_rules)
-        .serve(stdio())
-        .await
-        .inspect_err(|e| tracing::error!("serving error: {e:?}"))?;
+    let cache_dir = cli
+        .cache_dir
+        .clone()
+        .unwrap_or_else(|| default_cache_dir(&root));
+    std::fs::create_dir_all(&cache_dir)
+        .with_context(|| format!("creating cache directory {}", cache_dir.display()))?;
+    let findings_store = store::findings::FindingsStore::open(cache_dir.join("findings.redb"))
+        .context("opening findings store")?;
+    tracing::info!(cache_dir = %cache_dir.display(), "findings store opened");
+
+    let server = WebMcpServer::new(
+        root,
+        workspace,
+        reverse_index,
+        security_rules,
+        findings_store,
+    )
+    .serve(stdio())
+    .await
+    .inspect_err(|e| tracing::error!("serving error: {e:?}"))?;
 
     server.waiting().await?;
     Ok(())
