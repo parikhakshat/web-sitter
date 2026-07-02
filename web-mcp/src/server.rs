@@ -15,16 +15,20 @@ use rmcp::tool_handler;
 use web_ql::Workspace;
 use web_ql::symbol_index::ReverseSymbolIndex;
 
-/// `workspace`/`reverse_index` are `Arc`-wrapped so `WebMcpServer` stays cheaply
-/// `Clone` (rmcp clones the handler per connection) without deep-copying the whole
-/// indexed codebase. Phase 1 never mutates them after startup; Phase 2's live-update
-/// system is what will need interior mutability (sharded locks), not this wrapper.
+use crate::callgraph::SymbolCallGraph;
+
+/// `workspace`/`reverse_index`/`call_graph` are `Arc`-wrapped so `WebMcpServer` stays
+/// cheaply `Clone` (rmcp clones the handler per connection) without deep-copying the
+/// whole indexed codebase. Phase 1 never mutates them after startup; Phase 2's
+/// live-update system is what will need interior mutability (sharded locks), not this
+/// wrapper.
 #[derive(Clone)]
 pub struct WebMcpServer {
     #[allow(dead_code)]
     pub(crate) workspace_root: PathBuf,
     pub(crate) workspace: Arc<Workspace>,
     pub(crate) reverse_index: Arc<ReverseSymbolIndex>,
+    pub(crate) call_graph: Arc<SymbolCallGraph>,
     pub(crate) tool_router: ToolRouter<Self>,
 }
 
@@ -34,11 +38,13 @@ impl WebMcpServer {
         workspace: Workspace,
         reverse_index: ReverseSymbolIndex,
     ) -> Self {
+        let call_graph = SymbolCallGraph::build(&workspace, &reverse_index);
         Self {
             workspace_root,
             workspace: Arc::new(workspace),
             reverse_index: Arc::new(reverse_index),
-            tool_router: Self::lookup_tool_router(),
+            call_graph: Arc::new(call_graph),
+            tool_router: Self::lookup_tool_router() + Self::callgraph_tool_router(),
         }
     }
 }

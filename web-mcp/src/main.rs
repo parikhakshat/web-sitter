@@ -1,5 +1,7 @@
+mod callgraph;
 mod index;
 mod server;
+mod symbol_query;
 mod tools;
 
 use std::path::PathBuf;

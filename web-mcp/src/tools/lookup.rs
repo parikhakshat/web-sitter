@@ -3,18 +3,20 @@
 //! All three resolve a human-typed query (simple name, `Class::method`, or a full
 //! `SymbolId` string like `"cpp:Foo::run"`) against the workspace's
 //! [`ReverseSymbolIndex`] built at startup (see `crate::index`), then answer from real
-//! CPG data — never from re-deriving structure via text search.
+//! CPG data — never from re-deriving structure via text search. Resolution logic itself
+//! lives in `crate::symbol_query`, shared with `tools/callgraph.rs`.
 
 use rmcp::Json;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{tool, tool_router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use web_ql::symbol_index::{ReverseSymbolIndex, SymbolDefinition};
+use web_ql::symbol_index::SymbolDefinition;
 use web_sitter::IrNode;
 use web_sitter::symbol_id::SymbolId;
 
 use crate::server::WebMcpServer;
+use crate::symbol_query::{call_sites_for, resolve_symbol};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct FindDefinitionRequest {
@@ -124,7 +126,14 @@ impl WebMcpServer {
             });
         };
 
-        let references = find_references_for(&self.workspace, &self.reverse_index, symbol_id);
+        let references = call_sites_for(&self.workspace, &self.reverse_index, symbol_id)
+            .into_iter()
+            .map(|(file, node)| ReferenceLocation {
+                file: file.display().to_string(),
+                line: node.line,
+                column: node.column,
+            })
+            .collect();
         Json(FindReferencesResponse {
             symbol_id: symbol_id.as_str().to_string(),
             references,
@@ -154,60 +163,6 @@ impl WebMcpServer {
     }
 }
 
-/// Resolve a human-typed query against every known definition. Matches, in order of
-/// preference: exact full `SymbolId` string, exact qualified path (SymbolId minus its
-/// `<lang>:` prefix and `#<n>` disambiguator), or exact simple name (the qualified
-/// path's last `::`/`.`-separated segment). Returns every match, not just the first —
-/// callers decide how to handle ambiguity.
-fn resolve_symbol<'a>(
-    reverse_index: &'a ReverseSymbolIndex,
-    query: &str,
-) -> Vec<(&'a SymbolId, &'a SymbolDefinition)> {
-    let exact: Vec<_> = reverse_index
-        .definitions()
-        .filter(|(id, _)| id.as_str() == query)
-        .collect();
-    if !exact.is_empty() {
-        return exact;
-    }
-
-    let qualified: Vec<_> = reverse_index
-        .definitions()
-        .filter(|(id, _)| qualified_path(id) == query)
-        .collect();
-    if !qualified.is_empty() {
-        return qualified;
-    }
-
-    reverse_index
-        .definitions()
-        .filter(|(id, _)| simple_name(id) == query)
-        .collect()
-}
-
-/// Strip the `<lang>:` prefix and any `#<n>` disambiguator suffix from a `SymbolId`,
-/// e.g. `"cpp:Foo::run#2"` -> `"Foo::run"`.
-fn qualified_path(id: &SymbolId) -> &str {
-    let without_lang = id
-        .as_str()
-        .split_once(':')
-        .map(|(_, rest)| rest)
-        .unwrap_or(id.as_str());
-    without_lang.split('#').next().unwrap_or(without_lang)
-}
-
-/// The last `::`/`.`-separated segment of a `SymbolId`'s qualified path, e.g.
-/// `"cpp:Foo::run#2"` -> `"run"`.
-fn simple_name(id: &SymbolId) -> &str {
-    let path = qualified_path(id);
-    path.rsplit("::")
-        .next()
-        .unwrap_or(path)
-        .rsplit('.')
-        .next()
-        .unwrap_or(path)
-}
-
 fn definition_location(
     workspace: &web_ql::Workspace,
     id: &SymbolId,
@@ -220,57 +175,6 @@ fn definition_location(
         line: node.line,
         column: node.column,
     })
-}
-
-/// Concrete call-site locations resolving to `symbol_id`: scans `cpg.call_graph`'s
-/// `CallSite`s (which carry qualified/simple callee names, not just a boolean edge) in
-/// every candidate file — the symbol's own defining file (for recursive/self-calls) plus
-/// every file `ReverseSymbolIndex` already knows references it.
-fn find_references_for(
-    workspace: &web_ql::Workspace,
-    reverse_index: &ReverseSymbolIndex,
-    symbol_id: &SymbolId,
-) -> Vec<ReferenceLocation> {
-    let Some(def) = reverse_index.definition(symbol_id) else {
-        return Vec::new();
-    };
-    let qualified = qualified_path(symbol_id);
-    let simple = simple_name(symbol_id);
-
-    let mut candidate_files: Vec<_> = reverse_index
-        .referencing_files(symbol_id)
-        .cloned()
-        .collect();
-    candidate_files.push(def.file.clone());
-    candidate_files.sort();
-    candidate_files.dedup();
-
-    let mut references = Vec::new();
-    for file in candidate_files {
-        let Some(idx) = workspace.files.get(&file) else {
-            continue;
-        };
-        for entry in idx.cpg.call_graph.values() {
-            for call_site in &entry.calls {
-                let matches = call_site.qualified_callee.as_deref() == Some(qualified)
-                    || call_site.callee == simple
-                    || call_site.callee == qualified;
-                if !matches {
-                    continue;
-                }
-                if let Some(call_node_id) = call_site.call_site
-                    && let Some(node) = idx.cpg.ast.get(&call_node_id)
-                {
-                    references.push(ReferenceLocation {
-                        file: file.display().to_string(),
-                        line: node.line,
-                        column: node.column,
-                    });
-                }
-            }
-        }
-    }
-    references
 }
 
 fn build_symbol_summary(
