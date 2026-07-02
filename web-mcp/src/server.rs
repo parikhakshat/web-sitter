@@ -24,7 +24,6 @@ use crate::callgraph::SymbolCallGraph;
 /// wrapper.
 #[derive(Clone)]
 pub struct WebMcpServer {
-    #[allow(dead_code)]
     pub(crate) workspace_root: PathBuf,
     pub(crate) workspace: Arc<Workspace>,
     pub(crate) reverse_index: Arc<ReverseSymbolIndex>,
@@ -33,6 +32,21 @@ pub struct WebMcpServer {
 }
 
 impl WebMcpServer {
+    /// Resolve a user-supplied file path (as typed into a tool argument) against
+    /// `workspace_root`. `Workspace::files` is keyed by the absolute paths produced
+    /// during indexing (`crate::index::build_workspace` walks from a canonicalized
+    /// root), so a relative path an agent types — the common case — must be joined
+    /// against the same root before it can look anything up. Already-absolute paths
+    /// pass through unchanged.
+    pub(crate) fn resolve_path(&self, file: &str) -> PathBuf {
+        let path = PathBuf::from(file);
+        if path.is_absolute() {
+            path
+        } else {
+            self.workspace_root.join(path)
+        }
+    }
+
     pub fn new(
         workspace_root: PathBuf,
         workspace: Workspace,
@@ -44,7 +58,9 @@ impl WebMcpServer {
             workspace: Arc::new(workspace),
             reverse_index: Arc::new(reverse_index),
             call_graph: Arc::new(call_graph),
-            tool_router: Self::lookup_tool_router() + Self::callgraph_tool_router(),
+            tool_router: Self::lookup_tool_router()
+                + Self::callgraph_tool_router()
+                + Self::dataflow_tool_router(),
         }
     }
 }
