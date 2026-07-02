@@ -120,7 +120,10 @@ impl WebMcpServer {
         } else {
             default_reaches_depth() as usize
         };
-        let witness = self.call_graph.shortest_path(from, to, max_depth);
+        let witness = self
+            .call_graph
+            .load_full()
+            .shortest_path(&from, &to, max_depth);
 
         Ok(Json(VerifyEdgeResponse {
             exists: witness.is_some(),
@@ -151,6 +154,8 @@ impl WebMcpServer {
         }
         let from = self.resolve_required(&req.from)?;
         let to = self.resolve_required(&req.to)?;
+        let reverse_index = self.reverse_index.load_full();
+        let workspace = self.workspace.load_full();
 
         let max_depth = if req.kind == "calls" {
             1
@@ -159,20 +164,15 @@ impl WebMcpServer {
         };
         let path = self
             .call_graph
-            .shortest_path(from, to, max_depth)
+            .load_full()
+            .shortest_path(&from, &to, max_depth)
             .ok_or_else(|| format!("no {} path from '{}' to '{}'", req.kind, req.from, req.to))?;
 
         let hops = path
             .into_iter()
             .filter_map(|symbol_id| {
-                let def = self.reverse_index.definition(&symbol_id)?;
-                let node = self
-                    .workspace
-                    .files
-                    .get(&def.file)?
-                    .cpg
-                    .ast
-                    .get(&def.node_id)?;
+                let def = reverse_index.definition(&symbol_id)?;
+                let node = workspace.files.get(&def.file)?.cpg.ast.get(&def.node_id)?;
                 Some(PathHop {
                     symbol_id: symbol_id.as_str().to_string(),
                     file: def.file.display().to_string(),
@@ -203,8 +203,8 @@ impl WebMcpServer {
             );
         }
         let path = self.resolve_path(&req.from.file);
-        let idx = self
-            .workspace
+        let workspace = self.workspace.load_full();
+        let idx = workspace
             .files
             .get(&path)
             .ok_or_else(|| format!("file not indexed: {}", req.from.file))?;
@@ -264,14 +264,11 @@ impl WebMcpServer {
 }
 
 impl WebMcpServer {
-    fn resolve_required<'a>(
-        &'a self,
-        query: &str,
-    ) -> Result<&'a web_sitter::symbol_id::SymbolId, String> {
-        resolve_symbol(&self.reverse_index, query)
+    fn resolve_required(&self, query: &str) -> Result<web_sitter::symbol_id::SymbolId, String> {
+        resolve_symbol(&self.reverse_index.load(), query)
             .into_iter()
             .next()
-            .map(|(id, _)| id)
+            .map(|(id, _)| id.clone())
             .ok_or_else(|| format!("no definition found for '{query}'"))
     }
 }

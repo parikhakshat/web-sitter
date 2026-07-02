@@ -118,17 +118,18 @@ impl WebMcpServer {
             None => (*self.security_rules).clone(),
         };
 
-        let scope = self.compute_scan_scope(&req)?;
+        let workspace = self.workspace.load_full();
+        let reverse_index = self.reverse_index.load_full();
+        let scope = self.compute_scan_scope(&workspace, &reverse_index, &req)?;
 
         let raw_findings = match &scope {
-            Some(files) => self.workspace.scan_scoped(&rule_set, files),
-            None => self.workspace.scan(&rule_set),
+            Some(files) => workspace.scan_scoped(&rule_set, files),
+            None => workspace.scan(&rule_set),
         };
 
         let scanned_files: HashSet<String> = match &scope {
             Some(files) => files.iter().map(|f| f.display().to_string()).collect(),
-            None => self
-                .workspace
+            None => workspace
                 .files
                 .keys()
                 .map(|f| f.display().to_string())
@@ -141,7 +142,7 @@ impl WebMcpServer {
         let mut seen_ids: HashSet<String> = HashSet::new();
         let mut enriched = Vec::with_capacity(raw_findings.len());
         for f in raw_findings {
-            let symbol_id = self.resolve_finding_symbol(&f, &mut symbol_cache);
+            let symbol_id = resolve_finding_symbol(&workspace, &f, &mut symbol_cache);
             let finding_id = fingerprint(
                 &f.rule_id,
                 symbol_id.as_ref().map(SymbolId::as_str),
@@ -205,6 +206,8 @@ impl WebMcpServer {
     /// unscoped `scan()` rather than materializing every path into a `HashSet`).
     fn compute_scan_scope(
         &self,
+        workspace: &web_ql::Workspace,
+        reverse_index: &web_ql::symbol_index::ReverseSymbolIndex,
         req: &RunSecurityScanRequest,
     ) -> Result<Option<HashSet<PathBuf>>, String> {
         match req.scope.as_str() {
@@ -212,7 +215,7 @@ impl WebMcpServer {
             "file" => {
                 let path = self.require_path(req)?;
                 let resolved = self.resolve_path(&path);
-                if !self.workspace.files.contains_key(&resolved) {
+                if !workspace.files.contains_key(&resolved) {
                     return Err(format!("file not indexed: {path}"));
                 }
                 Ok(Some(HashSet::from([resolved])))
@@ -220,8 +223,7 @@ impl WebMcpServer {
             "directory" => {
                 let path = self.require_path(req)?;
                 let resolved = self.resolve_path(&path);
-                let files: HashSet<PathBuf> = self
-                    .workspace
+                let files: HashSet<PathBuf> = workspace
                     .files
                     .keys()
                     .filter(|f| f.starts_with(&resolved))
@@ -239,8 +241,7 @@ impl WebMcpServer {
                     .as_deref()
                     .ok_or_else(|| "scope=diff requires new_source".to_string())?;
                 let resolved = self.resolve_path(&path);
-                let idx = self
-                    .workspace
+                let idx = workspace
                     .files
                     .get(&resolved)
                     .ok_or_else(|| format!("file not indexed: {path}"))?;
@@ -259,7 +260,7 @@ impl WebMcpServer {
                 let changed = diff_changed_symbols(&idx.cpg, &old_source, &new_cpg, new_source);
                 let changed_ids: Vec<_> = changed.into_iter().map(|(id, _)| id).collect();
 
-                let mut files = self.reverse_index.affected_files(&changed_ids);
+                let mut files = reverse_index.affected_files(&changed_ids);
                 files.insert(resolved);
                 Ok(Some(files))
             }
@@ -274,27 +275,27 @@ impl WebMcpServer {
             .clone()
             .ok_or_else(|| format!("scope={} requires path", req.scope))
     }
+}
 
-    /// Resolve a finding's enclosing symbol (its primary matched node's `function_id`) to
-    /// a `SymbolId`, for fingerprinting — `None` for findings with no resolvable enclosing
-    /// function (e.g. file-level/global-scope matches), not an error. `symbol_cache` avoids
-    /// rebuilding a file's whole symbol table once per finding when several findings land
-    /// in the same file.
-    fn resolve_finding_symbol(
-        &self,
-        finding: &Finding,
-        symbol_cache: &mut HashMap<PathBuf, BTreeMap<NodeId, SymbolId>>,
-    ) -> Option<SymbolId> {
-        let file = Path::new(&finding.location.file);
-        let idx = self.workspace.files.get(file)?;
-        let node_id = *finding.matched_nodes.first()?;
-        let function_id = idx.cpg.ast.get(&node_id)?.function_id?;
+/// Resolve a finding's enclosing symbol (its primary matched node's `function_id`) to a
+/// `SymbolId`, for fingerprinting — `None` for findings with no resolvable enclosing
+/// function (e.g. file-level/global-scope matches), not an error. `symbol_cache` avoids
+/// rebuilding a file's whole symbol table once per finding when several findings land in
+/// the same file.
+fn resolve_finding_symbol(
+    workspace: &web_ql::Workspace,
+    finding: &Finding,
+    symbol_cache: &mut HashMap<PathBuf, BTreeMap<NodeId, SymbolId>>,
+) -> Option<SymbolId> {
+    let file = Path::new(&finding.location.file);
+    let idx = workspace.files.get(file)?;
+    let node_id = *finding.matched_nodes.first()?;
+    let function_id = idx.cpg.ast.get(&node_id)?.function_id?;
 
-        let table = symbol_cache
-            .entry(file.to_path_buf())
-            .or_insert_with(|| build_symbol_table(&idx.cpg));
-        table.get(&function_id).cloned()
-    }
+    let table = symbol_cache
+        .entry(file.to_path_buf())
+        .or_insert_with(|| build_symbol_table(&idx.cpg));
+    table.get(&function_id).cloned()
 }
 
 #[cfg(test)]

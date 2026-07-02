@@ -117,8 +117,8 @@ impl WebMcpServer {
         Parameters(req): Parameters<ImpactOfChangeRequest>,
     ) -> Result<Json<ImpactOfChangeResponse>, String> {
         let path = self.resolve_path(&req.file);
-        let idx = self
-            .workspace
+        let workspace = self.workspace.load_full();
+        let idx = workspace
             .files
             .get(&path)
             .ok_or_else(|| format!("file not indexed: {}", req.file))?;
@@ -136,15 +136,14 @@ impl WebMcpServer {
 
         let changed = diff_changed_symbols(&idx.cpg, &old_source, &new_cpg, new_source);
 
+        let call_graph = self.call_graph.load_full();
         let mut blast_radius: BTreeSet<String> = BTreeSet::new();
         for (symbol_id, kind) in &changed {
             if *kind == "added" {
                 continue;
             }
             blast_radius.insert(symbol_id.as_str().to_string());
-            for (caller, _depth) in self
-                .call_graph
-                .transitive_callers(symbol_id, req.max_depth as usize)
+            for (caller, _depth) in call_graph.transitive_callers(symbol_id, req.max_depth as usize)
             {
                 blast_radius.insert(caller.as_str().to_string());
             }

@@ -1,14 +1,16 @@
 //! The MCP server: implements `rmcp`'s `ServerHandler` trait over a workspace root.
 //!
-//! `WebMcpServer` holds the batch-built `Workspace`/`ReverseSymbolIndex` (see
-//! `crate::index`) and the combined `ToolRouter` assembled from every `tools/*.rs`
-//! module's own `#[tool_router]` impl block. Phase 1 scope: read-only, single-shard,
-//! built once at startup — no live updates yet (Phase 2).
+//! `WebMcpServer` holds the live `Workspace`/`ReverseSymbolIndex`/`SymbolCallGraph` (see
+//! `crate::index` for the initial batch build, `crate::live_index::LiveIndex` for how
+//! they get atomically republished as file-watcher events come in) and the combined
+//! `ToolRouter` assembled from every `tools/*.rs` module's own `#[tool_router]` impl
+//! block.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use arc_swap::ArcSwap;
 use rmcp::ServerHandler;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
@@ -20,17 +22,21 @@ use web_ql::symbol_index::ReverseSymbolIndex;
 use crate::callgraph::SymbolCallGraph;
 use crate::store::findings::FindingsStore;
 
-/// `workspace`/`reverse_index`/`call_graph` are `Arc`-wrapped so `WebMcpServer` stays
-/// cheaply `Clone` (rmcp clones the handler per connection) without deep-copying the
-/// whole indexed codebase. Phase 1 never mutates them after startup; Phase 2's
-/// live-update system is what will need interior mutability (sharded locks), not this
-/// wrapper.
+/// `workspace`/`reverse_index`/`call_graph` are each `Arc<ArcSwap<T>>`: `WebMcpServer`
+/// stays cheaply `Clone` (rmcp clones the handler per connection) without deep-copying the
+/// whole indexed codebase, *and* a live-update source (`crate::live_index::LiveIndex`,
+/// holding clones of the same `Arc<ArcSwap<T>>`s via `*_handle()` below) can atomically
+/// publish a new snapshot of any of the three independently. A tool method reads via
+/// `self.workspace.load_full()` (etc.) once at the top of its body and uses that owned
+/// `Arc<T>` for the rest of the call — cheap (one refcount bump), and immune to seeing a
+/// torn/inconsistent view even if a publish happens mid-call, since it's holding its own
+/// snapshot rather than re-reading the swap on every field access.
 #[derive(Clone)]
 pub struct WebMcpServer {
     pub(crate) workspace_root: PathBuf,
-    pub(crate) workspace: Arc<Workspace>,
-    pub(crate) reverse_index: Arc<ReverseSymbolIndex>,
-    pub(crate) call_graph: Arc<SymbolCallGraph>,
+    pub(crate) workspace: Arc<ArcSwap<Workspace>>,
+    pub(crate) reverse_index: Arc<ArcSwap<ReverseSymbolIndex>>,
+    pub(crate) call_graph: Arc<ArcSwap<SymbolCallGraph>>,
     /// The built-in CWE rule corpus (`web-ql-queries/`), loaded once at startup —
     /// `run_security_scan` clones out of this `Arc` when no custom `rule_source` is
     /// given, instead of recompiling 52 `.wql` files on every call.
@@ -78,9 +84,9 @@ impl WebMcpServer {
         let call_graph = SymbolCallGraph::build(&workspace, &reverse_index);
         Self {
             workspace_root,
-            workspace: Arc::new(workspace),
-            reverse_index: Arc::new(reverse_index),
-            call_graph: Arc::new(call_graph),
+            workspace: Arc::new(ArcSwap::new(Arc::new(workspace))),
+            reverse_index: Arc::new(ArcSwap::new(Arc::new(reverse_index))),
+            call_graph: Arc::new(ArcSwap::new(Arc::new(call_graph))),
             security_rules: Arc::new(security_rules),
             findings_store: Arc::new(findings_store),
             scan_revision: Arc::new(AtomicU64::new(0)),
@@ -93,6 +99,25 @@ impl WebMcpServer {
                 + Self::findings_tool_router()
                 + Self::variants_tool_router(),
         }
+    }
+
+    /// A clone of the `Arc<ArcSwap<Workspace>>` handle — for `live_index::LiveIndex` (a
+    /// follow-up task, not yet wired in — hence `#[allow(dead_code)]`, expected to be
+    /// dropped once that lands) to publish new snapshots that every clone of this
+    /// `WebMcpServer` picks up on its next read.
+    #[allow(dead_code)]
+    pub(crate) fn workspace_handle(&self) -> Arc<ArcSwap<Workspace>> {
+        Arc::clone(&self.workspace)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn reverse_index_handle(&self) -> Arc<ArcSwap<ReverseSymbolIndex>> {
+        Arc::clone(&self.reverse_index)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn call_graph_handle(&self) -> Arc<ArcSwap<SymbolCallGraph>> {
+        Arc::clone(&self.call_graph)
     }
 }
 

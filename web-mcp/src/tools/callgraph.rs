@@ -77,15 +77,16 @@ impl WebMcpServer {
         &self,
         Parameters(req): Parameters<GetCallersRequest>,
     ) -> Result<Json<CallGraphResponse>, String> {
-        let Some((symbol_id, _def)) = resolve_symbol(&self.reverse_index, &req.symbol)
+        let reverse_index = self.reverse_index.load_full();
+        let call_graph = self.call_graph.load_full();
+        let Some((symbol_id, _def)) = resolve_symbol(&reverse_index, &req.symbol)
             .into_iter()
             .next()
         else {
             return Err(format!("no definition found for '{}'", req.symbol));
         };
 
-        let nodes = self
-            .call_graph
+        let nodes = call_graph
             .transitive_callers(symbol_id, req.max_depth as usize)
             .into_iter()
             .map(|(id, depth)| CallGraphNode {
@@ -108,15 +109,16 @@ impl WebMcpServer {
         &self,
         Parameters(req): Parameters<GetCalleesRequest>,
     ) -> Result<Json<CallGraphResponse>, String> {
-        let Some((symbol_id, _def)) = resolve_symbol(&self.reverse_index, &req.symbol)
+        let reverse_index = self.reverse_index.load_full();
+        let call_graph = self.call_graph.load_full();
+        let Some((symbol_id, _def)) = resolve_symbol(&reverse_index, &req.symbol)
             .into_iter()
             .next()
         else {
             return Err(format!("no definition found for '{}'", req.symbol));
         };
 
-        let nodes = self
-            .call_graph
+        let nodes = call_graph
             .transitive_callees(symbol_id, req.max_depth as usize)
             .into_iter()
             .map(|(id, depth)| CallGraphNode {
@@ -140,22 +142,17 @@ impl WebMcpServer {
         &self,
         Parameters(req): Parameters<CallPathExistsRequest>,
     ) -> Result<Json<CallPathExistsResponse>, String> {
-        let Some((from_id, _)) = resolve_symbol(&self.reverse_index, &req.from)
-            .into_iter()
-            .next()
+        let reverse_index = self.reverse_index.load_full();
+        let call_graph = self.call_graph.load_full();
+        let Some((from_id, _)) = resolve_symbol(&reverse_index, &req.from).into_iter().next()
         else {
             return Err(format!("no definition found for '{}'", req.from));
         };
-        let Some((to_id, _)) = resolve_symbol(&self.reverse_index, &req.to)
-            .into_iter()
-            .next()
-        else {
+        let Some((to_id, _)) = resolve_symbol(&reverse_index, &req.to).into_iter().next() else {
             return Err(format!("no definition found for '{}'", req.to));
         };
 
-        let path = self
-            .call_graph
-            .shortest_path(from_id, to_id, req.max_depth as usize);
+        let path = call_graph.shortest_path(from_id, to_id, req.max_depth as usize);
         Ok(Json(CallPathExistsResponse {
             exists: path.is_some(),
             path: path

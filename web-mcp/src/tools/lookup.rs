@@ -97,10 +97,12 @@ impl WebMcpServer {
         &self,
         Parameters(req): Parameters<FindDefinitionRequest>,
     ) -> Json<FindDefinitionResponse> {
-        let matches = resolve_symbol(&self.reverse_index, &req.symbol);
+        let workspace = self.workspace.load_full();
+        let reverse_index = self.reverse_index.load_full();
+        let matches = resolve_symbol(&reverse_index, &req.symbol);
         let definitions = matches
             .into_iter()
-            .filter_map(|(id, def)| definition_location(&self.workspace, id, def))
+            .filter_map(|(id, def)| definition_location(&workspace, id, def))
             .collect();
         Json(FindDefinitionResponse { definitions })
     }
@@ -116,7 +118,9 @@ impl WebMcpServer {
         &self,
         Parameters(req): Parameters<FindReferencesRequest>,
     ) -> Json<FindReferencesResponse> {
-        let Some((symbol_id, _def)) = resolve_symbol(&self.reverse_index, &req.symbol)
+        let workspace = self.workspace.load_full();
+        let reverse_index = self.reverse_index.load_full();
+        let Some((symbol_id, _def)) = resolve_symbol(&reverse_index, &req.symbol)
             .into_iter()
             .next()
         else {
@@ -126,7 +130,7 @@ impl WebMcpServer {
             });
         };
 
-        let references = call_sites_for(&self.workspace, &self.reverse_index, symbol_id)
+        let references = call_sites_for(&workspace, &reverse_index, symbol_id)
             .into_iter()
             .map(|(file, node)| ReferenceLocation {
                 file: file.display().to_string(),
@@ -150,14 +154,16 @@ impl WebMcpServer {
         &self,
         Parameters(req): Parameters<SymbolSummaryRequest>,
     ) -> Result<Json<SymbolSummaryResponse>, String> {
-        let Some((symbol_id, def)) = resolve_symbol(&self.reverse_index, &req.symbol)
+        let workspace = self.workspace.load_full();
+        let reverse_index = self.reverse_index.load_full();
+        let Some((symbol_id, def)) = resolve_symbol(&reverse_index, &req.symbol)
             .into_iter()
             .next()
         else {
             return Err(format!("no definition found for '{}'", req.symbol));
         };
 
-        build_symbol_summary(&self.workspace, symbol_id, def)
+        build_symbol_summary(&workspace, symbol_id, def)
             .map(Json)
             .ok_or_else(|| format!("definition site for '{}' has no CPG node", req.symbol))
     }

@@ -93,8 +93,8 @@ impl WebMcpServer {
         Parameters(req): Parameters<FindVariantsRequest>,
     ) -> Result<Json<FindVariantsResponse>, String> {
         let example_path = self.resolve_path(&req.location.file);
-        let example_idx = self
-            .workspace
+        let workspace = self.workspace.load_full();
+        let example_idx = workspace
             .files
             .get(&example_path)
             .ok_or_else(|| format!("file not indexed: {}", req.location.file))?;
@@ -122,12 +122,12 @@ impl WebMcpServer {
                 .to_string()
         })?;
 
-        let scope = self.resolve_variant_scope(&req.scope, req.path.as_deref())?;
+        let scope = self.resolve_variant_scope(&workspace, &req.scope, req.path.as_deref())?;
         let rule_set = web_ql::compile_rules(&generalized.rule_source)
             .map_err(|e| format!("generated rule failed to compile: {e:#}"))?;
         let findings = match &scope {
-            Some(files) => self.workspace.scan_scoped(&rule_set, files),
-            None => self.workspace.scan(&rule_set),
+            Some(files) => workspace.scan_scoped(&rule_set, files),
+            None => workspace.scan(&rule_set),
         };
 
         let anchor = example_idx
@@ -147,7 +147,7 @@ impl WebMcpServer {
                     "{}#{}:{}:{}",
                     generalized.rule_id, f.location.file, f.location.line, f.location.column
                 );
-                let callee = self.resolve_finding_callee(&f).unwrap_or_default();
+                let callee = resolve_finding_callee(&workspace, &f).unwrap_or_default();
                 let is_example =
                     (f.location.file.clone(), f.location.line, f.location.column) == example_key;
                 VariantMatch {
@@ -183,8 +183,8 @@ impl WebMcpServer {
             .ok_or_else(|| format!("malformed match_id: '{}'", req.match_id))?;
 
         let path = self.resolve_path(&file);
-        let idx = self
-            .workspace
+        let workspace = self.workspace.load_full();
+        let idx = workspace
             .files
             .get(&path)
             .ok_or_else(|| format!("file not indexed: {file}"))?;
@@ -223,6 +223,7 @@ impl WebMcpServer {
 impl WebMcpServer {
     fn resolve_variant_scope(
         &self,
+        workspace: &web_ql::Workspace,
         scope: &str,
         path: Option<&str>,
     ) -> Result<Option<HashSet<PathBuf>>, String> {
@@ -236,7 +237,7 @@ impl WebMcpServer {
             "file" => {
                 let path = path.ok_or_else(|| "scope=file requires path".to_string())?;
                 let resolved = self.resolve_path(path);
-                if !self.workspace.files.contains_key(&resolved) {
+                if !workspace.files.contains_key(&resolved) {
                     return Err(format!("file not indexed: {path}"));
                 }
                 Ok(Some(HashSet::from([resolved])))
@@ -244,8 +245,7 @@ impl WebMcpServer {
             "directory" => {
                 let path = path.ok_or_else(|| "scope=directory requires path".to_string())?;
                 let resolved = self.resolve_path(path);
-                let files: HashSet<PathBuf> = self
-                    .workspace
+                let files: HashSet<PathBuf> = workspace
                     .files
                     .keys()
                     .filter(|f| f.starts_with(&resolved))
@@ -261,19 +261,22 @@ impl WebMcpServer {
             }
         }
     }
+}
 
-    /// The callee name for a `Finding` produced by a `generalize_call_pattern`-generated
-    /// rule — its primary matched node is always the anchor `Call` node itself, resolved
-    /// back through that node's own file's `KindIndex` (a `Finding`'s `NodeId`s are only
-    /// meaningful relative to the `Cpg` they came from, not portable across files).
-    fn resolve_finding_callee(&self, finding: &web_ql::Finding) -> Option<String> {
-        let file = PathBuf::from(&finding.location.file);
-        let idx = self.workspace.files.get(&file)?;
-        let node_id = *finding.matched_nodes.first()?;
-        idx.kind_index
-            .call_site_for_node(node_id)
-            .map(|cs| cs.callee.clone())
-    }
+/// The callee name for a `Finding` produced by a `generalize_call_pattern`-generated
+/// rule — its primary matched node is always the anchor `Call` node itself, resolved back
+/// through that node's own file's `KindIndex` (a `Finding`'s `NodeId`s are only meaningful
+/// relative to the `Cpg` they came from, not portable across files).
+fn resolve_finding_callee(
+    workspace: &web_ql::Workspace,
+    finding: &web_ql::Finding,
+) -> Option<String> {
+    let file = PathBuf::from(&finding.location.file);
+    let idx = workspace.files.get(&file)?;
+    let node_id = *finding.matched_nodes.first()?;
+    idx.kind_index
+        .call_site_for_node(node_id)
+        .map(|cs| cs.callee.clone())
 }
 
 /// Walk up from `node_id` (inclusive) looking for the nearest enclosing `Call` node —
