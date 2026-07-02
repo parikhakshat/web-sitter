@@ -11,6 +11,7 @@
 //! bolting it on now, before those pieces exist, would just be dead code wearing a
 //! server-shaped costume.
 
+pub mod incremental_file;
 pub mod persistence;
 pub mod revision;
 pub mod shard;
