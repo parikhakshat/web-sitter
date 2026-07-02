@@ -1,6 +1,10 @@
 mod callgraph;
 mod index;
 mod server;
+// Standalone for now — the MCP tools that call into it (find_variants/explain_variant)
+// are follow-up work, same pattern as store/watcher below.
+#[allow(dead_code)]
+mod security;
 // Not wired into WebMcpServer yet: every tool handler still reads from crate::index's
 // batch-built, all-in-memory Workspace. Swapping tools over to LiveWorkspace (so they see
 // live edits) is follow-up integration work beyond this phase's per-piece tasks — store
