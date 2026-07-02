@@ -90,7 +90,8 @@ impl WebMcpServer {
                 + Self::impact_tool_router()
                 + Self::verify_tool_router()
                 + Self::security_tool_router()
-                + Self::findings_tool_router(),
+                + Self::findings_tool_router()
+                + Self::variants_tool_router(),
         }
     }
 }

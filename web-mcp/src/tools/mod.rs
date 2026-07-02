@@ -4,4 +4,5 @@ pub mod findings;
 pub mod impact;
 pub mod lookup;
 pub mod security;
+pub mod variants;
 pub mod verify;
