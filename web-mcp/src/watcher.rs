@@ -156,6 +156,7 @@ mod tests {
                 dir.path().join("store.redb"),
                 dir.path().to_path_buf(),
                 NonZeroUsize::new(64).unwrap(),
+                dir.path().join("snapshots"),
             )
             .unwrap(),
         );

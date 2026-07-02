@@ -16,6 +16,7 @@
 //! this is the primitive they'll both build on.
 
 use std::collections::BTreeSet;
+use std::path::Path;
 
 use anyhow::Result;
 use web_sitter::Cpg;
@@ -82,6 +83,38 @@ impl IncrementalFileState {
             &old_source,
             new_source,
         ))
+    }
+
+    /// The exact source bytes this state was last built/edited against — the warm-restart
+    /// validity check compares this directly to a file's current on-disk bytes rather than
+    /// maintaining a separate hash: `load_snapshot` already has to read this back in full
+    /// to restore the generator's state, so a fresh hash of it buys nothing a direct
+    /// `==` doesn't already give for free.
+    pub fn source_bytes(&self) -> &[u8] {
+        &self.source
+    }
+
+    /// Persist this file's full incremental state (source, `Cpg`, and every derived index
+    /// `IncrementalCpgGenerator` maintains) to `path`, via `IncrementalCpgGenerator::
+    /// save_state`. Pair with `load_snapshot` on the next process start to skip a full
+    /// tree-sitter reparse for files whose on-disk content hasn't changed since the
+    /// snapshot was taken.
+    pub fn save_snapshot(&self, path: impl AsRef<Path>) -> Result<()> {
+        self.generator.save_state(path)
+    }
+
+    /// Load a previously `save_snapshot`-ed state for `language`. Returns `Ok(None)` (not
+    /// an error) when `path` doesn't exist or the snapshot's format version is stale —
+    /// both are ordinary "cold start" outcomes, not failures; the caller falls back to
+    /// `from_source`.
+    pub fn load_snapshot(language: SourceLanguage, path: impl AsRef<Path>) -> Result<Option<Self>> {
+        let mut generator =
+            IncrementalCpgGenerator::new_for_language(language, GraphBuildOptions::default())?;
+        if !generator.load_state(path)? {
+            return Ok(None);
+        }
+        let source = generator.state.source_code.clone();
+        Ok(Some(Self { generator, source }))
     }
 }
 

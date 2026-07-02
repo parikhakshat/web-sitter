@@ -14,10 +14,11 @@
 //! to get a consistent snapshot.
 
 use std::collections::BTreeSet;
+use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use web_sitter::language_from_path;
@@ -47,6 +48,10 @@ pub struct LiveWorkspace {
     /// (it only caches the derived `Cpg`, not the generator that can cheaply extend it).
     files: DashMap<PathBuf, IncrementalFileState>,
     root: PathBuf,
+    /// Where per-file `IncrementalFileState` snapshots (`save_snapshot`/`load_snapshot`)
+    /// live — separate from `store`'s redb file since a snapshot is a full generator
+    /// state blob (source + derived indexes), not just the `Cpg` `WorkspaceStore` caches.
+    snapshot_dir: PathBuf,
 }
 
 impl LiveWorkspace {
@@ -54,14 +59,79 @@ impl LiveWorkspace {
         db_path: impl AsRef<Path>,
         root: PathBuf,
         hot_capacity: NonZeroUsize,
+        snapshot_dir: PathBuf,
     ) -> Result<Self> {
+        std::fs::create_dir_all(&snapshot_dir)
+            .with_context(|| format!("creating snapshot directory {}", snapshot_dir.display()))?;
         Ok(Self {
             store: WorkspaceStore::open(db_path, root.clone(), hot_capacity)?,
             locks: ShardedLocks::new(),
             revisions: Revisions::new(),
             files: DashMap::new(),
             root,
+            snapshot_dir,
         })
+    }
+
+    /// Deterministic per-file snapshot path under `snapshot_dir` — hashed rather than
+    /// mirroring the file's own relative path, so it's insensitive to path length/
+    /// character restrictions on the host filesystem and never collides with the
+    /// directory structure of the codebase being indexed.
+    fn snapshot_path_for(&self, file: &Path) -> PathBuf {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        file.hash(&mut hasher);
+        self.snapshot_dir
+            .join(format!("{:x}.state", hasher.finish()))
+    }
+
+    /// Try a warm restart of `file`: if a snapshot exists and its saved source matches
+    /// `file`'s current on-disk bytes exactly, restore straight from the snapshot —
+    /// skipping a full tree-sitter reparse — and return `Ok(true)`. Otherwise falls back
+    /// to a fresh full parse (`Ok(false)`, a "cold" restart) — a stale or missing snapshot
+    /// is an ordinary, expected outcome (the file changed since last snapshot, or this is
+    /// truly the first time seeing it), not a warning-worthy condition on its own.
+    ///
+    /// Either way, `file` ends up live in `self.files` and persisted in `self.store`
+    /// exactly as if `apply_file_change` had just been called for it — but this method
+    /// does *not* bump any revision or take a shard lock: it's meant for startup
+    /// initialization (before the watcher goes live), not a live edit event.
+    pub fn warm_restart_file(&self, file: &Path) -> Result<bool> {
+        let current_source = std::fs::read(file)
+            .with_context(|| format!("reading {} for warm restart", file.display()))?;
+        let language = language_from_path(&file.to_string_lossy());
+        let snapshot_path = self.snapshot_path_for(file);
+
+        let (state, warm) = match IncrementalFileState::load_snapshot(language, &snapshot_path)? {
+            Some(state) if state.source_bytes() == current_source.as_slice() => (state, true),
+            _ => (
+                IncrementalFileState::from_source(language, &current_source)?,
+                false,
+            ),
+        };
+
+        self.store.put(file, state.cpg().clone())?;
+        self.files.insert(file.to_path_buf(), state);
+        Ok(warm)
+    }
+
+    /// Snapshot `file`'s current live state to disk, for a future `warm_restart_file` to
+    /// find. A no-op (not an error) if `file` has no live state.
+    pub fn snapshot_file(&self, file: &Path) -> Result<()> {
+        let Some(state) = self.files.get(file) else {
+            return Ok(());
+        };
+        state.save_snapshot(self.snapshot_path_for(file))
+    }
+
+    /// Snapshot every file with live state. Returns how many were snapshotted — the
+    /// "whole-store snapshot" operation, meant to be called on a clean shutdown (or
+    /// periodically) so the *next* process start can warm-restart from it.
+    pub fn snapshot_all(&self) -> Result<usize> {
+        let files: Vec<PathBuf> = self.files.iter().map(|entry| entry.key().clone()).collect();
+        for file in &files {
+            self.snapshot_file(file)?;
+        }
+        Ok(files.len())
     }
 
     /// Apply `new_source` as the new full contents of `file`. Creates the file's
@@ -155,6 +225,7 @@ mod tests {
             dir.path().join("store.redb"),
             dir.path().to_path_buf(),
             NonZeroUsize::new(64).unwrap(),
+            dir.path().join("snapshots"),
         )
         .unwrap()
     }
@@ -262,12 +333,14 @@ mod tests {
     async fn a_persisted_cpg_survives_across_workspace_reopens() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("store.redb");
+        let snapshot_dir = dir.path().join("snapshots");
         let file = dir.path().join("a.cpp");
         {
             let workspace = LiveWorkspace::open(
                 db_path.clone(),
                 dir.path().to_path_buf(),
                 NonZeroUsize::new(64).unwrap(),
+                snapshot_dir.clone(),
             )
             .unwrap();
             workspace
@@ -279,8 +352,136 @@ mod tests {
             db_path,
             dir.path().to_path_buf(),
             NonZeroUsize::new(64).unwrap(),
+            snapshot_dir,
         )
         .unwrap();
         assert_eq!(reopened.store.persisted_len().unwrap(), 1);
+    }
+
+    #[test]
+    fn warm_restart_is_a_cold_start_when_no_snapshot_exists_yet() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = open_workspace(&dir);
+        let file = dir.path().join("a.cpp");
+        std::fs::write(&file, "int a() { return 1; }\n").unwrap();
+
+        let warm = workspace.warm_restart_file(&file).unwrap();
+        assert!(!warm, "no snapshot exists yet — must be a cold start");
+        assert_eq!(workspace.live_file_count(), 1);
+    }
+
+    #[test]
+    fn warm_restart_hits_when_content_is_unchanged_since_the_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = open_workspace(&dir);
+        let file = dir.path().join("a.cpp");
+        std::fs::write(&file, "int a() { return 1; }\n").unwrap();
+
+        workspace.warm_restart_file(&file).unwrap();
+        workspace.snapshot_file(&file).unwrap();
+
+        // A fresh LiveWorkspace over the same snapshot directory — simulating a process
+        // restart — must warm-restart instead of re-parsing.
+        let restarted = LiveWorkspace::open(
+            dir.path().join("store2.redb"),
+            dir.path().to_path_buf(),
+            NonZeroUsize::new(64).unwrap(),
+            dir.path().join("snapshots"),
+        )
+        .unwrap();
+        let warm = restarted.warm_restart_file(&file).unwrap();
+        assert!(
+            warm,
+            "content unchanged since the snapshot — must warm-restart"
+        );
+
+        let names: BTreeSet<String> = build_symbol_table(
+            restarted
+                .files
+                .get(&file)
+                .expect("file must be live after warm restart")
+                .cpg(),
+        )
+        .into_values()
+        .map(|s| s.as_str().to_string())
+        .collect();
+        assert_eq!(names, BTreeSet::from(["cpp:a".to_string()]));
+    }
+
+    #[test]
+    fn warm_restart_falls_back_to_cold_when_content_changed_since_the_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = open_workspace(&dir);
+        let file = dir.path().join("a.cpp");
+        std::fs::write(&file, "int a() { return 1; }\n").unwrap();
+        workspace.warm_restart_file(&file).unwrap();
+        workspace.snapshot_file(&file).unwrap();
+
+        // The file changed on disk after the snapshot was taken.
+        std::fs::write(&file, "int a() { return 2; }\nint b() { return 3; }\n").unwrap();
+
+        let restarted = LiveWorkspace::open(
+            dir.path().join("store2.redb"),
+            dir.path().to_path_buf(),
+            NonZeroUsize::new(64).unwrap(),
+            dir.path().join("snapshots"),
+        )
+        .unwrap();
+        let warm = restarted.warm_restart_file(&file).unwrap();
+        assert!(
+            !warm,
+            "content changed since the snapshot — must fall back to cold"
+        );
+
+        let names: BTreeSet<String> = build_symbol_table(
+            restarted
+                .files
+                .get(&file)
+                .expect("file must be live after warm restart")
+                .cpg(),
+        )
+        .into_values()
+        .map(|s| s.as_str().to_string())
+        .collect();
+        assert_eq!(
+            names,
+            BTreeSet::from(["cpp:a".to_string(), "cpp:b".to_string()]),
+            "must reflect the current on-disk content, not the stale snapshot"
+        );
+    }
+
+    #[test]
+    fn snapshot_all_snapshots_every_live_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = open_workspace(&dir);
+        let a = dir.path().join("a.cpp");
+        let b = dir.path().join("b.cpp");
+        std::fs::write(&a, "int a() { return 1; }\n").unwrap();
+        std::fs::write(&b, "int b() { return 2; }\n").unwrap();
+        workspace.warm_restart_file(&a).unwrap();
+        workspace.warm_restart_file(&b).unwrap();
+
+        let count = workspace.snapshot_all().unwrap();
+        assert_eq!(count, 2);
+
+        let restarted = LiveWorkspace::open(
+            dir.path().join("store2.redb"),
+            dir.path().to_path_buf(),
+            NonZeroUsize::new(64).unwrap(),
+            dir.path().join("snapshots"),
+        )
+        .unwrap();
+        assert!(restarted.warm_restart_file(&a).unwrap());
+        assert!(restarted.warm_restart_file(&b).unwrap());
+    }
+
+    #[test]
+    fn snapshot_file_is_a_no_op_for_a_file_with_no_live_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = open_workspace(&dir);
+        // Never touched via warm_restart_file/apply_file_change — must not error.
+        workspace
+            .snapshot_file(&dir.path().join("never_seen.cpp"))
+            .unwrap();
     }
 }
