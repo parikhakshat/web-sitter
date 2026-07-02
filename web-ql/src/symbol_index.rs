@@ -125,13 +125,36 @@ impl ReverseSymbolIndex {
     /// call this only after every file's `register_definitions` has already run (see
     /// `build`) or references to not-yet-registered definitions will be silently missed.
     fn resolve_references(&mut self, path: &Path, cpg: &Cpg) {
+        self.resolve_references_with_fallback(path, cpg, None);
+    }
+
+    /// Same as [`resolve_references`](Self::resolve_references), but when a call site's
+    /// callee can't be resolved against this index's own `name_index`, also tries
+    /// `fallback`'s name index before giving up. This is what lets a thin overlay index
+    /// (only a handful of actively-edited files) resolve calls into symbols that only the
+    /// stable base layer knows about, without copying the base layer's entire name index
+    /// into the overlay — see [`crate::layered_symbol_index::LayeredSymbolIndex`].
+    pub fn resolve_references_with_fallback(
+        &mut self,
+        path: &Path,
+        cpg: &Cpg,
+        fallback: Option<&ReverseSymbolIndex>,
+    ) {
         let mut referenced_here = Vec::new();
         for edge in &cpg.workspace.cross_file_calls {
             let resolved = edge
                 .qualified_callee
                 .as_deref()
                 .and_then(|q| self.name_index.get(q))
-                .or_else(|| self.name_index.get(edge.callee_name.as_str()));
+                .or_else(|| self.name_index.get(edge.callee_name.as_str()))
+                .or_else(|| {
+                    fallback.and_then(|f| {
+                        edge.qualified_callee
+                            .as_deref()
+                            .and_then(|q| f.name_lookup(q))
+                            .or_else(|| f.name_lookup(edge.callee_name.as_str()))
+                    })
+                });
             if let Some(symbol_id) = resolved {
                 self.references
                     .entry(symbol_id.clone())
@@ -142,6 +165,26 @@ impl ReverseSymbolIndex {
         }
         self.referenced_by_file
             .insert(path.to_path_buf(), referenced_here);
+    }
+
+    /// Same as [`upsert_file`](Self::upsert_file), but resolves references against
+    /// `fallback`'s name index too when this index's own doesn't have the callee.
+    pub fn upsert_file_with_fallback(
+        &mut self,
+        path: &Path,
+        cpg: &Cpg,
+        fallback: &ReverseSymbolIndex,
+    ) {
+        self.remove_file(path);
+        self.register_definitions(path, cpg);
+        self.resolve_references_with_fallback(path, cpg, Some(fallback));
+    }
+
+    /// Look up a raw name-index key (simple/qualified name -> defining `SymbolId`).
+    /// Exposed for `LayeredSymbolIndex`'s fallback resolution; not otherwise part of the
+    /// public query surface (prefer `definition`/`referencing_files`).
+    pub fn name_lookup(&self, key: &str) -> Option<&SymbolId> {
+        self.name_index.get(key)
     }
 
     /// Register one symbol's name-index keys, respecting the same "weak keys: first
