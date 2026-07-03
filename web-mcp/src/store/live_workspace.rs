@@ -7,11 +7,23 @@
 //! (`Revisions`, task #12) — returning exactly the `SymbolId`s that changed, ready to feed
 //! into `ReverseSymbolIndex`'s scoped invalidation.
 //!
-//! Concurrency note: the per-shard write lock is held for the *entire* apply (incremental
-//! reparse + persist + revision bump), not released and re-acquired between steps — this
-//! is what makes "the revision I observe corresponds to data I can actually read" hold
-//! without extra coordination. Readers only need `ShardedLocks::read` for the same shard
-//! to get a consistent snapshot.
+//! Concurrency note: `apply_file_change`/`apply_file_removal` are batch-of-one wrappers
+//! around `apply_batch`, which uses a **two-phase** protocol rather than holding one
+//! shard's write lock across the whole apply. Phase 1 (per file: incremental reparse/diff)
+//! takes that file's shard write lock and releases it immediately, before phase 2 persists
+//! every file in the batch as a single redb transaction (`WorkspaceStore::apply_batch`) —
+//! collapsing what used to be N individual write transactions (a measured bottleneck:
+//! `redb::Database` allows only one live write transaction process-wide, so N concurrent
+//! `put`s serialized on that slot regardless of `ShardedLocks` parallelizing the reparse
+//! work) into one. Phase 3 bumps each touched shard's revision after phase 2 commits,
+//! preserving "the revision I observe corresponds to durably-persisted data."
+//!
+//! Accepted trade-off from this change: a concurrent same-shard *reader*
+//! (`ShardedLocks::read`) can now briefly observe a file's new `Cpg` in the live `files`
+//! map before phase 2 has durably persisted it (previously impossible, since the write
+//! lock used to span persist too). This is safe for this type's own callers (they only
+//! read after the whole `apply_batch`/`apply_file_change` call returns), but is a real,
+//! deliberate semantic change worth calling out explicitly rather than leaving it implicit.
 
 use std::collections::BTreeSet;
 use std::hash::{Hash, Hasher};
@@ -24,6 +36,7 @@ use dashmap::mapref::entry::Entry;
 use web_sitter::language_from_path;
 use web_sitter::symbol_id::{SymbolId, build_symbol_table};
 
+use super::StoreOp;
 use super::WorkspaceStore;
 use super::incremental_file::IncrementalFileState;
 use super::revision::Revisions;
@@ -38,6 +51,14 @@ pub struct AppliedChange {
     pub global_revision: u64,
     pub shard_revision: u64,
     pub shard: ShardId,
+}
+
+/// One entry in an `apply_batch` call: either new full source bytes for a file, or a
+/// removal. Re-exported for `LiveIndex`/`watcher` to reuse rather than duplicating an
+/// equivalent enum.
+pub enum FileChangeKind {
+    Changed(Vec<u8>),
+    Removed,
 }
 
 pub struct LiveWorkspace {
@@ -137,60 +158,117 @@ impl LiveWorkspace {
     /// Apply `new_source` as the new full contents of `file`. Creates the file's
     /// `IncrementalFileState` on first sight (every symbol in the initial parse counts as
     /// "changed" — there's nothing to diff against yet) or incrementally reparses it
-    /// against the previous state.
+    /// against the previous state. A batch-of-one wrapper around `apply_batch`.
     pub async fn apply_file_change(&self, file: &Path, new_source: &[u8]) -> Result<AppliedChange> {
-        let shard = self.store.shard_of(file);
-        let _write_guard = self.locks.write(&shard).await;
-
-        let changed_symbols = match self.files.entry(file.to_path_buf()) {
-            Entry::Occupied(mut occupied) => occupied.get_mut().apply_edit(new_source)?,
-            Entry::Vacant(vacant) => {
-                let language = language_from_path(&file.to_string_lossy());
-                let state = IncrementalFileState::from_source(language, new_source)?;
-                let initial_symbols = build_symbol_table(state.cpg()).into_values().collect();
-                vacant.insert(state);
-                initial_symbols
-            }
-        };
-
-        let cpg = self
-            .files
-            .get(file)
-            .expect("just inserted or updated above")
-            .cpg()
-            .clone();
-        self.store.put(file, cpg)?;
-
-        let (global_revision, shard_revision) = self.revisions.record_edit(&shard);
-        Ok(AppliedChange {
-            changed_symbols,
-            global_revision,
-            shard_revision,
-            shard,
-        })
+        let changes = vec![(
+            file.to_path_buf(),
+            FileChangeKind::Changed(new_source.to_vec()),
+        )];
+        let mut results = self.apply_batch(changes).await?;
+        Ok(results
+            .pop()
+            .expect("batch of one always yields one result"))
     }
 
     /// Remove `file` from live state, the on-disk store, and bump its shard's revision.
     /// Returns the symbols that were defined in the file just before removal (the "now
     /// gone" set, for the same cross-file-invalidation purpose `apply_file_change`'s
-    /// return value serves).
+    /// return value serves). A batch-of-one wrapper around `apply_batch`.
     pub async fn apply_file_removal(&self, file: &Path) -> Result<AppliedChange> {
-        let shard = self.store.shard_of(file);
-        let _write_guard = self.locks.write(&shard).await;
+        let changes = vec![(file.to_path_buf(), FileChangeKind::Removed)];
+        let mut results = self.apply_batch(changes).await?;
+        Ok(results
+            .pop()
+            .expect("batch of one always yields one result"))
+    }
 
-        let changed_symbols = match self.files.remove(file) {
-            Some((_, state)) => build_symbol_table(state.cpg()).into_values().collect(),
-            None => BTreeSet::new(),
-        };
-        self.store.remove(file)?;
+    /// Apply every `(file, kind)` pair in `changes` as one batch — see the module doc
+    /// comment for the two-phase protocol and its accepted trade-off versus the old
+    /// single-item locking discipline. Returns one `AppliedChange` per input, in the same
+    /// order. If `changes` contains more than one entry for the same file, they're applied
+    /// in order against that file's `IncrementalFileState` (phase 1 iterates sequentially).
+    ///
+    /// Phase 1 (reparse) runs sequentially over `changes` in this implementation — the
+    /// reparse itself is synchronous CPU-bound work, and genuine intra-batch parallelism
+    /// across different files' reparses would need spawning `'static` tasks (an
+    /// `Arc<Self>`-threading change not made here). The fix this batching exists for —
+    /// collapsing N redb write transactions into one — is fully realized by phase 2
+    /// regardless of phase 1's own concurrency.
+    pub async fn apply_batch(
+        &self,
+        changes: Vec<(PathBuf, FileChangeKind)>,
+    ) -> Result<Vec<AppliedChange>> {
+        struct Phase1Result {
+            shard: ShardId,
+            changed_symbols: BTreeSet<SymbolId>,
+            op: StoreOp,
+        }
 
-        let (global_revision, shard_revision) = self.revisions.record_edit(&shard);
-        Ok(AppliedChange {
-            changed_symbols,
-            global_revision,
-            shard_revision,
-            shard,
-        })
+        let mut phase1_results = Vec::with_capacity(changes.len());
+        for (file, kind) in changes {
+            let shard = self.store.shard_of(&file);
+            let write_guard = self.locks.write(&shard).await;
+
+            let (changed_symbols, op) = match kind {
+                FileChangeKind::Changed(new_source) => {
+                    let changed_symbols = match self.files.entry(file.clone()) {
+                        Entry::Occupied(mut occupied) => {
+                            occupied.get_mut().apply_edit(&new_source)?
+                        }
+                        Entry::Vacant(vacant) => {
+                            let language = language_from_path(&file.to_string_lossy());
+                            let state = IncrementalFileState::from_source(language, &new_source)?;
+                            let initial_symbols =
+                                build_symbol_table(state.cpg()).into_values().collect();
+                            vacant.insert(state);
+                            initial_symbols
+                        }
+                    };
+                    let cpg = self
+                        .files
+                        .get(&file)
+                        .expect("just inserted or updated above")
+                        .cpg()
+                        .clone();
+                    (changed_symbols, StoreOp::Put(file, Box::new(cpg)))
+                }
+                FileChangeKind::Removed => {
+                    let changed_symbols = match self.files.remove(&file) {
+                        Some((_, state)) => build_symbol_table(state.cpg()).into_values().collect(),
+                        None => BTreeSet::new(),
+                    };
+                    (changed_symbols, StoreOp::Remove(file))
+                }
+            };
+            // Released here, before phase 2's persist — see the module doc comment's
+            // accepted-trade-off note.
+            drop(write_guard);
+
+            phase1_results.push(Phase1Result {
+                shard,
+                changed_symbols,
+                op,
+            });
+        }
+
+        let (metas, ops): (Vec<(ShardId, BTreeSet<SymbolId>)>, Vec<StoreOp>) = phase1_results
+            .into_iter()
+            .map(|r| ((r.shard, r.changed_symbols), r.op))
+            .unzip();
+
+        self.store.apply_batch(ops)?;
+
+        let mut out = Vec::with_capacity(metas.len());
+        for (shard, changed_symbols) in metas {
+            let (global_revision, shard_revision) = self.revisions.record_edit(&shard);
+            out.push(AppliedChange {
+                changed_symbols,
+                global_revision,
+                shard_revision,
+                shard,
+            });
+        }
+        Ok(out)
     }
 
     pub fn shard_of(&self, file: &Path) -> ShardId {
@@ -490,5 +568,118 @@ mod tests {
         workspace
             .snapshot_file(&dir.path().join("never_seen.cpp"))
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn apply_batch_persists_all_files_via_one_call_and_returns_one_applied_change_each() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("a")).unwrap();
+        std::fs::create_dir(dir.path().join("b")).unwrap();
+        std::fs::create_dir(dir.path().join("c")).unwrap();
+        let workspace = open_workspace(&dir);
+
+        let results = workspace
+            .apply_batch(vec![
+                (
+                    dir.path().join("a/x.cpp"),
+                    FileChangeKind::Changed(b"int x() { return 1; }\n".to_vec()),
+                ),
+                (
+                    dir.path().join("b/y.cpp"),
+                    FileChangeKind::Changed(b"int y() { return 2; }\n".to_vec()),
+                ),
+                (
+                    dir.path().join("c/z.cpp"),
+                    FileChangeKind::Changed(b"int z() { return 3; }\n".to_vec()),
+                ),
+            ])
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 3);
+        let symbol_names: Vec<&str> = results
+            .iter()
+            .map(|r| {
+                r.changed_symbols
+                    .iter()
+                    .next()
+                    .expect("each file has one symbol")
+                    .as_str()
+            })
+            .collect();
+        assert_eq!(symbol_names, vec!["cpp:x", "cpp:y", "cpp:z"]);
+        assert_eq!(workspace.store.persisted_len().unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn apply_batch_bumps_each_touched_shards_revision_independently() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("a")).unwrap();
+        std::fs::create_dir(dir.path().join("b")).unwrap();
+        let workspace = open_workspace(&dir);
+
+        let results = workspace
+            .apply_batch(vec![
+                (
+                    dir.path().join("a/one.cpp"),
+                    FileChangeKind::Changed(b"int one() { return 1; }\n".to_vec()),
+                ),
+                (
+                    dir.path().join("a/two.cpp"),
+                    FileChangeKind::Changed(b"int two() { return 2; }\n".to_vec()),
+                ),
+                (
+                    dir.path().join("b/three.cpp"),
+                    FileChangeKind::Changed(b"int three() { return 3; }\n".to_vec()),
+                ),
+            ])
+            .await
+            .unwrap();
+
+        assert_eq!(results[0].shard_revision, 1);
+        assert_eq!(results[1].shard_revision, 2, "second edit to shard a");
+        assert_eq!(results[2].shard_revision, 1, "fresh shard b starts at 1");
+        assert_eq!(results[2].global_revision, 3);
+    }
+
+    #[tokio::test]
+    async fn apply_batch_mixing_changes_and_removals() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = open_workspace(&dir);
+        let existing = dir.path().join("existing.cpp");
+        let fresh = dir.path().join("fresh.cpp");
+
+        workspace
+            .apply_file_change(&existing, b"int existing_fn() { return 0; }\n")
+            .await
+            .unwrap();
+        assert_eq!(workspace.live_file_count(), 1);
+
+        let results = workspace
+            .apply_batch(vec![
+                (existing.clone(), FileChangeKind::Removed),
+                (
+                    fresh.clone(),
+                    FileChangeKind::Changed(b"int fresh_fn() { return 1; }\n".to_vec()),
+                ),
+            ])
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 2);
+        let removed_names: BTreeSet<&str> = results[0]
+            .changed_symbols
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        assert_eq!(removed_names, BTreeSet::from(["cpp:existing_fn"]));
+        assert_eq!(
+            workspace.live_file_count(),
+            1,
+            "fresh.cpp is now the only live file"
+        );
+        assert_eq!(workspace.store.persisted_len().unwrap(), 1);
+        assert!(workspace.store.get(&fresh).unwrap().is_some());
+        assert!(workspace.store.get(&existing).unwrap().is_none());
     }
 }
