@@ -53,6 +53,13 @@ struct StoredCpg {
     cpg: Cpg,
 }
 
+/// One entry in a batched write: persist `cpg` under a path, or (for `Remove`) delete
+/// any existing entry under that path. See `PersistentStore::apply_batch`.
+pub enum BatchOp<'a> {
+    Put(&'a str, &'a Cpg),
+    Remove(&'a str),
+}
+
 /// Embedded on-disk fact store, keyed by absolute file path. Safe to share across threads
 /// (`redb::Database` is internally synchronized); callers needing coordinated multi-shard
 /// transactions still need their own locking (see `store/shard.rs`, wired in a later task).
@@ -85,25 +92,46 @@ impl PersistentStore {
 
     /// Persist `cpg` under `file_path`, overwriting any prior entry.
     pub fn put(&self, file_path: &str, cpg: &Cpg) -> Result<()> {
-        let stored = StoredCpg {
-            format_version: STORE_FORMAT_VERSION,
-            cpg: cpg.clone(),
-        };
-        let encoded = bincode::serde::encode_to_vec(&stored, bincode::config::standard())
-            .context("encoding Cpg for on-disk storage")?;
-        let payload = lz4_flex::compress_prepend_size(&encoded);
+        self.apply_batch(&[BatchOp::Put(file_path, cpg)])
+    }
 
+    /// Apply every op in `ops` inside a single write transaction — the fix for the
+    /// single-writer-transaction serialization documented above. Order within the batch is
+    /// preserved (a later op for the same key wins), matching what an equivalent sequence
+    /// of individual `put`/`remove` calls would have produced.
+    pub fn apply_batch(&self, ops: &[BatchOp<'_>]) -> Result<()> {
         let mut write_txn = self.db.begin_write().context("opening write transaction")?;
         write_txn.set_durability(Durability::Eventual);
         {
             let mut table = write_txn
                 .open_table(CPG_TABLE)
                 .context("opening cpg_by_path table")?;
-            table
-                .insert(file_path, payload.as_slice())
-                .with_context(|| format!("writing {file_path} to fact store"))?;
+            for op in ops {
+                match op {
+                    BatchOp::Put(file_path, cpg) => {
+                        let stored = StoredCpg {
+                            format_version: STORE_FORMAT_VERSION,
+                            cpg: (*cpg).clone(),
+                        };
+                        let encoded =
+                            bincode::serde::encode_to_vec(&stored, bincode::config::standard())
+                                .context("encoding Cpg for on-disk storage")?;
+                        let payload = lz4_flex::compress_prepend_size(&encoded);
+                        table
+                            .insert(*file_path, payload.as_slice())
+                            .with_context(|| format!("writing {file_path} to fact store"))?;
+                    }
+                    BatchOp::Remove(file_path) => {
+                        table
+                            .remove(*file_path)
+                            .with_context(|| format!("removing {file_path} from fact store"))?;
+                    }
+                }
+            }
         }
-        write_txn.commit().context("committing fact store write")?;
+        write_txn
+            .commit()
+            .context("committing fact store batch write")?;
         Ok(())
     }
 
@@ -133,20 +161,7 @@ impl PersistentStore {
 
     /// Remove any entry stored under `file_path`. Safe to call when absent (no-op).
     pub fn remove(&self, file_path: &str) -> Result<()> {
-        let mut write_txn = self.db.begin_write().context("opening write transaction")?;
-        write_txn.set_durability(Durability::Eventual);
-        {
-            let mut table = write_txn
-                .open_table(CPG_TABLE)
-                .context("opening cpg_by_path table")?;
-            table
-                .remove(file_path)
-                .with_context(|| format!("removing {file_path} from fact store"))?;
-        }
-        write_txn
-            .commit()
-            .context("committing fact store removal")?;
-        Ok(())
+        self.apply_batch(&[BatchOp::Remove(file_path)])
     }
 
     /// Number of entries currently persisted.
@@ -248,6 +263,70 @@ mod tests {
 
         store.remove("a.cpp").unwrap();
         assert_eq!(store.len().unwrap(), 1);
+    }
+
+    #[test]
+    fn apply_batch_persists_multiple_puts_in_one_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PersistentStore::open(dir.path().join("store.redb")).unwrap();
+        let a = sample_cpg("int a() { return 1; }");
+        let b = sample_cpg("int b() { return 2; }");
+        let c = sample_cpg("int c() { return 3; }");
+
+        store
+            .apply_batch(&[
+                BatchOp::Put("a.cpp", &a),
+                BatchOp::Put("b.cpp", &b),
+                BatchOp::Put("c.cpp", &c),
+            ])
+            .unwrap();
+
+        assert!(store.get("a.cpp").unwrap().is_some());
+        assert!(store.get("b.cpp").unwrap().is_some());
+        assert!(store.get("c.cpp").unwrap().is_some());
+        assert_eq!(store.len().unwrap(), 3);
+    }
+
+    #[test]
+    fn apply_batch_mixes_put_and_remove() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PersistentStore::open(dir.path().join("store.redb")).unwrap();
+        store
+            .put("existing.cpp", &sample_cpg("int existing() { return 0; }"))
+            .unwrap();
+        let new_cpg = sample_cpg("int fresh() { return 1; }");
+
+        store
+            .apply_batch(&[
+                BatchOp::Remove("existing.cpp"),
+                BatchOp::Put("fresh.cpp", &new_cpg),
+            ])
+            .unwrap();
+
+        assert!(store.get("existing.cpp").unwrap().is_none());
+        assert!(store.get("fresh.cpp").unwrap().is_some());
+    }
+
+    #[test]
+    fn apply_batch_same_key_twice_last_write_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PersistentStore::open(dir.path().join("store.redb")).unwrap();
+        let first = sample_cpg("int one() { return 1; }");
+        let second = sample_cpg("int two() { return 2; }\nint three() { return 3; }");
+
+        store
+            .apply_batch(&[
+                BatchOp::Put("a.cpp", &first),
+                BatchOp::Put("a.cpp", &second),
+            ])
+            .unwrap();
+
+        let loaded = store.get("a.cpp").unwrap().unwrap();
+        let names: std::collections::BTreeSet<_> =
+            loaded.ast.values().filter_map(|n| n.name.clone()).collect();
+        assert!(names.contains("two"));
+        assert!(names.contains("three"));
+        assert!(!names.contains("one"));
     }
 
     #[test]
